@@ -2,15 +2,15 @@
 # bench.sh — compare tuna vs KMC on a given file-of-files
 #
 # Usage:
-#   bash bench.sh <fof_file> <run_name> [K=<int>] [THREADS=<int>]
+#   bash bench.sh <fof_file> <run_name> [K=<int>] [THREADS=<int>] [PARTS=<int>]
 #
 # Examples:
 #   bash bench.sh /data/ecoli_fof_10.list ecoli10
-#   bash bench.sh /data/human.list human K=21 THREADS=4
-#   K=21 THREADS=4 bash bench.sh /data/human.list human
+#   bash bench.sh /data/human.list human K=31 THREADS=4 PARTS=128
+#   K=31 THREADS=4 PARTS=128 bash bench.sh /data/human.list human
 #
 # Path overrides (export before calling, e.g. on a cluster):
-#   TUNA_BIN=<path>       tuna binary       [default: ../build/tuna/tuna]
+#   TUNA_BIN=<path>       tuna binary       [default: ../build/tuna]
 #   KMC_BIN=<path>        kmc binary        [default: ../../kmc/bin/kmc]
 #   KMC_TOOLS_BIN=<path>  kmc_tools binary  [default: ../../kmc/bin/kmc_tools]
 #   GNU_TIME=<path>       GNU time binary   [default: /usr/bin/time]
@@ -25,7 +25,7 @@ set -euo pipefail
 
 # ── Paths (override via env vars if needed) ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TUNA="${TUNA_BIN:-$SCRIPT_DIR/../build/tuna/tuna}"
+TUNA="${TUNA_BIN:-$SCRIPT_DIR/../build/tuna}"
 KMC="${KMC_BIN:-$SCRIPT_DIR/../../kmc/bin/kmc}"
 KMC_TOOLS="${KMC_TOOLS_BIN:-$SCRIPT_DIR/../../kmc/bin/kmc_tools}"
 GNU_TIME="${GNU_TIME:-/usr/bin/time}"
@@ -33,7 +33,7 @@ TIMECMD="$GNU_TIME -v"
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <fof_file> <run_name> [K=<int>] [THREADS=<int>]" >&2
+    echo "Usage: $0 <fof_file> <run_name> [K=<int>] [THREADS=<int>] [PARTS=<int>]" >&2
     exit 1
 fi
 
@@ -46,6 +46,7 @@ for arg in "$@"; do
     case "$arg" in
         K=*)      K="${arg#K=}" ;;
         THREADS=*) THREADS="${arg#THREADS=}" ;;
+        PARTS=*)  PARTS="${arg#PARTS=}" ;;
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -53,6 +54,7 @@ done
 # ── Parameters (env vars as fallback) ─────────────────────────────────────────
 K=${K:-31}
 THREADS=${THREADS:-1}
+PARTS=${PARTS:-32}
 
 # ── Output directories ────────────────────────────────────────────────────────
 RUN_DIR="$SCRIPT_DIR/results/$RUN_NAME"
@@ -85,7 +87,7 @@ parse_time() {
 
 echo "============================================================"
 echo "  Benchmark: $RUN_NAME"
-echo "  k=$K   threads=$THREADS"
+echo "  k=$K   threads=$THREADS   partitions=$PARTS"
 echo "  input list: $FOF"
 if $HAS_SUDO; then
     echo "  cache drops: enabled (fair comparison)"
@@ -97,7 +99,7 @@ echo "============================================================"
 # ── tuna ─────────────────────────────────────────────────────────────────────
 echo ""
 drop_caches
-TUNA_CMD=("$TUNA" -k "$K" -t "$THREADS" -hp @"$FOF" "$RUN_DIR/tuna_out.tsv")
+TUNA_CMD=("$TUNA" -k "$K" -n "$PARTS" -t "$THREADS" -hp @"$FOF" "$RUN_DIR/tuna_out.tsv")
 echo "[tuna] cmd: ${TUNA_CMD[*]}"
 $TIMECMD "${TUNA_CMD[@]}" \
     2>"$RUN_DIR/tuna_time.log"
@@ -160,7 +162,7 @@ kmc_kmers=$(wc -l  < "$RUN_DIR/kmc_out.tsv")
 
 echo ""
 echo "============================================================"
-echo "  Results  (k=$K, t=$THREADS)"
+echo "  Results  (k=$K, t=$THREADS, n=$PARTS)"
 echo "============================================================"
 printf "  k-mers written:  tuna=%-12s  kmc=%s\n" "$tuna_kmers" "$kmc_kmers"
 echo ""

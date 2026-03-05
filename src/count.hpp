@@ -22,6 +22,7 @@
 #include <thread>
 #include <atomic>
 #include <utility>
+#include <filesystem>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -128,7 +129,17 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            table_t table(1u << 20, 1); // private table, no locking
+            // Pre-size the hash table from the partition file size to avoid
+            // costly resize cascades on large genomes.  Each byte in the
+            // superkmer file encodes roughly one nucleotide, and there are
+            // (len - k + 1) k-mers per superkmer of length len.  We use
+            // file_bytes / 4 as a conservative upper bound on unique k-mers.
+            const std::string part_path = cfg.work_dir + cfg.partition_prefix()
+                                          + "_" + std::to_string(p) + ".superkmers";
+            const size_t file_bytes = static_cast<size_t>(
+                std::filesystem::file_size(part_path));
+            const size_t init_sz = std::max(size_t(1) << 20, file_bytes / 4);
+            table_t table(init_sz, 1); // private table, no locking
 
             const uint64_t ins = count_partition<k, l>(p, cfg, table, token);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);

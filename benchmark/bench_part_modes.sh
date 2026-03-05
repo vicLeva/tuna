@@ -27,7 +27,7 @@
 #   • passwordless sudo recommended for page-cache drops
 #
 # Path overrides (export before calling, e.g. on a cluster):
-#   TUNA_BIN=<path>   tuna binary      [default: ../build/tuna/tuna]
+#   TUNA_BIN=<path>   tuna binary      [default: ../build/tuna]
 #   GNU_TIME=<path>   GNU time binary  [default: /usr/bin/time]
 #
 # Usage:
@@ -49,7 +49,7 @@ set -euo pipefail
 
 # ── Paths (override via env vars if needed) ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TUNA="${TUNA_BIN:-$SCRIPT_DIR/../build/tuna/tuna}"
+TUNA="${TUNA_BIN:-$SCRIPT_DIR/../build/tuna}"
 GNU_TIME="${GNU_TIME:-/usr/bin/time}"
 
 # ── Parse positional arguments ────────────────────────────────────────────────
