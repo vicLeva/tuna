@@ -161,18 +161,15 @@ Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographica
 
 ## Benchmarks
 
-Results on 200 *E. coli* K-12 genomes (~940 MB total input), k=31, 4 threads, compared to [KMC 3.2.4](https://github.com/refresh-bio/KMC):
+Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 8 threads, default partition strategy (`-kmc`).
 
-| tool | phase | time (s) | peak RSS |
-|------|-------|----------|----------|
-| tuna | total (wall) | 25 | 220 MB |
-| tuna | phase0 — pre-scan (KMC sig) | 1.4 | |
-| tuna | phase1 — partition | 1.6 | |
-| tuna | phase2 — count + write | 19 | |
-| | | | |
-| kmc | total (count + dump) | 25 | 9.9 GB |
-| kmc | stage1 — partition (incl. pre-scan) | 3.2 | |
-| kmc | stage2 — radix-sort + count | 19 | |
-| kmc | dump binary → TSV | 2 | 57 MB |
+| dataset | tuna wall | tuna RSS | KMC wall | KMC RSS | time ratio | mem ratio |
+|---------|-----------|----------|----------|---------|------------|-----------|
+| *E. coli* ×10 (~47 MB) | 0:02 | 0.4 GB | 0:02 | 0.8 GB | 1.0× | **0.5×** |
+| *E. coli* ×3682 (~17 GB) | 3:48 | 59.4 GB | 2:01 | 11.2 GB | 1.9× | 5.3× |
+| human ×1 (~3 GB) | 2:12 | 10.1 GB | 2:20 | 11.2 GB | **0.9×** | **0.9×** |
+| human ×10 (~30 GB) | 6:52 | 70.5 GB | 5:45 | 11.2 GB | 1.2× | 6.3× |
 
-tuna uses **~45× less memory** than KMC (220 MB vs 9.9 GB) with comparable runtime. Both tools produce identical k-mer sets and counts (verified on all three partition strategies).
+tuna's memory usage scales with input size (streaming approach — hash tables grow with the number of distinct k-mers per partition). KMC uses a roughly constant ~11 GB regardless of input size thanks to its on-disk intermediate representation. tuna is competitive on small-to-medium datasets and performs better than KMC on a single human genome.
+
+Both tools produce identical k-mer sets and counts (verified on all three partition strategies).

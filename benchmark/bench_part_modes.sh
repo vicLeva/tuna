@@ -60,6 +60,8 @@ fi
 
 FOF="$1"
 OUT_DIR="$2"
+# If OUT_DIR has no path separator and is not absolute, place it under results/
+[[ "$OUT_DIR" != */* && "$OUT_DIR" != /* ]] && OUT_DIR="$SCRIPT_DIR/results/$OUT_DIR"
 shift 2
 
 # ── Defaults (overridable via KEY=VALUE args or environment) ──────────────────
@@ -142,9 +144,9 @@ parse_gnu_time() {
 parse_tuna_phases() {
     local log="$1"
     local p0 p1 p2 tot
-    p0=$(grep  "^phase0:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}')
-    p1=$(grep  "^phase1:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}')
-    p2=$(grep  "^phase2:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}')
+    p0=$(grep  "^phase0:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}' || true)
+    p1=$(grep  "^phase1:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}' || true)
+    p2=$(grep  "^phase2:" "$log" 2>/dev/null | awk '{gsub(/s$/,"",$2); print $2}' || true)
     tot=$(grep '\[done\] total:' "$log" 2>/dev/null \
         | grep -oP '[\d.]+(?=s)' || echo "0")
     p0="${p0:-0}"; p1="${p1:-0}"; p2="${p2:-0}"
