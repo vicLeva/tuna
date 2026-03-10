@@ -4,7 +4,7 @@
 //
 // Drop-in replacement for the old FastFastaReader (now supports FASTQ and .gz).
 //
-// Design: one instance per worker thread, kept alive across files.  call load()
+// Design: one instance per worker thread, kept alive across files.  Call load()
 // for each new file; the internal buffers only grow, eliminating per-file
 // allocation overhead.  Sequences are returned via seq() / seq_len() and are
 // valid until the next call to read_next_seq() or load().
@@ -13,12 +13,10 @@
 //   FASTA : .fa  .fna  .fasta  (and any other extension)
 //   FASTQ : .fq  .fastq
 //
-// Gzip decompression: zlib gzFile — the compressed file is fully decompressed
-// into buf_ on load(), then parsed in place.  This keeps the hot parse loop
-// identical to the uncompressed path.
-//
-// FASTQ: single-line sequence format (standard illumina output).  Quality lines
-// are skipped with a single memchr each — no per-base overhead.
+// Gzip decompression: streaming chunked reads — at most GZ_CHUNK bytes are
+// held in buf_ at any time.  This avoids OOM on large compressed files (e.g.
+// 30 GB decompressed FASTQ).  The sliding-window refill is transparent to the
+// FASTA/FASTQ parsers via gz_slide_and_refill().
 
 #include <zlib.h>
 #include <fstream>
@@ -41,11 +39,15 @@ struct SeqReader
         seq_.reserve(6 << 20);
     }
 
+    ~SeqReader() { close(); }
+
     // Load a new file.  Auto-detects format and compression from extension.
     // Reuses existing buffer capacity.  Returns false if the file cannot be
     // opened or yields no data.
     bool load(const std::string& path)
     {
+        close(); // close any previously open gz handle
+
         // Strip .gz suffix to reveal inner extension.
         std::string inner = path;
         bool gz = false;
@@ -63,20 +65,35 @@ struct SeqReader
     // Returns false when no more sequences are available.
     bool read_next_seq()
     {
+        // For FASTQ streaming: proactively refill before parsing each record
+        // so that the read_fastq() parser always sees a complete record.
+        if (gz_ && !gz_eof_ && fmt_ == SeqFormat::FASTQ) {
+            if (buf_.size() - rpos_ < (4u << 20)) // < 4 MB remaining
+                gz_slide_and_refill();
+        }
         seq_.clear();
         return fmt_ == SeqFormat::FASTQ ? read_fastq() : read_fasta();
     }
 
     const char* seq()     const { return seq_.data(); }
     size_t      seq_len() const { return seq_.size(); }
-    void        close()         {} // no-op; kept for drop-in compatibility
+
+    void close()
+    {
+        if (gz_) { gzclose(gz_); gz_ = nullptr; gz_eof_ = false; }
+    }
 
 private:
 
     SeqFormat         fmt_ = SeqFormat::FASTA;
-    std::vector<char> buf_;   // raw (or decompressed) file content; reused
-    std::vector<char> seq_;   // current stripped sequence; reused
+    std::vector<char> buf_;      // raw (or decompressed window) file content
+    std::vector<char> seq_;      // current stripped sequence; reused
     size_t            rpos_ = 0; // read cursor in buf_
+
+    // Streaming gz state
+    gzFile gz_     = nullptr;
+    bool   gz_eof_ = false;
+    static constexpr size_t GZ_CHUNK = 64u << 20; // 64 MB window
 
 
     // ── Loaders ───────────────────────────────────────────────────────────────
@@ -96,60 +113,133 @@ private:
 
     bool load_gz(const std::string& path)
     {
-        gzFile f = gzopen(path.c_str(), "rb");
-        if (!f) return false;
-        gzbuffer(f, 256u << 10); // 256 KB zlib internal buffer
-
-        // Decompress into buf_ using a doubling-resize strategy.
-        buf_.resize(1u << 20); // start at 1 MB
-        size_t total = 0;
-        int n;
-        while ((n = gzread(f, buf_.data() + total,
-                           static_cast<unsigned>(buf_.size() - total))) > 0) {
-            total += static_cast<size_t>(n);
-            if (total == buf_.size())
-                buf_.resize(buf_.size() * 2);
-        }
-        gzclose(f);
-        buf_.resize(total);
-        if (total == 0) return false;
+        gz_ = gzopen(path.c_str(), "rb");
+        if (!gz_) return false;
+        gzbuffer(gz_, 256u << 10); // 256 KB zlib internal buffer
+        gz_eof_ = false;
+        buf_.clear();
         rpos_ = 0;
-        return true;
+
+        // Fill first chunk
+        buf_.resize(GZ_CHUNK);
+        const size_t got = gz_read_into(0, GZ_CHUNK);
+        buf_.resize(got);
+        return got > 0;
+    }
+
+    // Read up to `ask` bytes from gz_ into buf_[offset..].
+    // buf_ must already be sized to at least offset + ask.
+    // Returns bytes actually read; sets gz_eof_ on stream end.
+    size_t gz_read_into(size_t offset, size_t ask)
+    {
+        size_t got = 0;
+        while (got < ask && !gz_eof_) {
+            const unsigned chunk = static_cast<unsigned>(
+                std::min(ask - got, size_t(1u << 30)));
+            const int n = gzread(gz_, buf_.data() + offset + got, chunk);
+            if (n <= 0) { gz_eof_ = true; break; }
+            got += static_cast<size_t>(n);
+        }
+        return got;
+    }
+
+    // Slide [rpos_, buf_.size()) to the front of buf_ and append up to
+    // GZ_CHUNK more bytes from the gz stream.  Called when the parser is
+    // running low on data.
+    void gz_slide_and_refill()
+    {
+        if (!gz_ || gz_eof_) return;
+        const size_t rem = (rpos_ < buf_.size()) ? buf_.size() - rpos_ : 0;
+        if (rem > 0 && rpos_ > 0)
+            std::memmove(buf_.data(), buf_.data() + rpos_, rem);
+        rpos_ = 0;
+        buf_.resize(rem + GZ_CHUNK);
+        const size_t got = gz_read_into(rem, GZ_CHUNK);
+        buf_.resize(rem + got);
     }
 
 
     // ── Parsers ───────────────────────────────────────────────────────────────
 
     // FASTA: collect sequence lines between '>' headers, stripping newlines.
+    // Handles streaming gz files: refills the window when the buffer is
+    // exhausted mid-record.
     bool read_fasta()
     {
         // Seek to the next '>'
         while (rpos_ < buf_.size() && buf_[rpos_] != '>') ++rpos_;
-        if (rpos_ >= buf_.size()) return false;
+        if (rpos_ >= buf_.size()) {
+            if (!gz_ || gz_eof_) return false;
+            gz_slide_and_refill();
+            while (rpos_ < buf_.size() && buf_[rpos_] != '>') ++rpos_;
+            if (rpos_ >= buf_.size()) return false;
+        }
         ++rpos_; // consume '>'
 
         // Skip header line
-        const char* nl = static_cast<const char*>(
-            std::memchr(buf_.data() + rpos_, '\n', buf_.size() - rpos_));
-        if (!nl) return false;
-        rpos_ = static_cast<size_t>(nl - buf_.data()) + 1;
+        while (true) {
+            const char* nl = static_cast<const char*>(
+                std::memchr(buf_.data() + rpos_, '\n', buf_.size() - rpos_));
+            if (nl) {
+                rpos_ = static_cast<size_t>(nl - buf_.data()) + 1;
+                break;
+            }
+            if (!gz_ || gz_eof_) return false; // malformed: no newline in header
+            gz_slide_and_refill();
+            if (rpos_ >= buf_.size()) return false;
+        }
 
-        // Collect sequence bytes line by line until the next '>' or EOF.
-        while (rpos_ < buf_.size() && buf_[rpos_] != '>') {
-            const char*  start     = buf_.data() + rpos_;
-            const size_t remaining = buf_.size() - rpos_;
+        // Accumulate sequence lines until the next '>' or EOF.
+        while (true) {
+            // Refill if we have exhausted the current window.
+            if (rpos_ >= buf_.size()) {
+                if (!gz_ || gz_eof_) break; // EOF — last sequence
+                gz_slide_and_refill();
+                if (rpos_ >= buf_.size()) break; // still empty → EOF
+            }
 
-            nl = static_cast<const char*>(std::memchr(start, '\n', remaining));
-            size_t line_len = nl ? static_cast<size_t>(nl - start) : remaining;
+            if (buf_[rpos_] == '>') break; // next sequence starts here
+
+            const char*  start = buf_.data() + rpos_;
+            const size_t rem   = buf_.size() - rpos_;
+            const char*  nl    = static_cast<const char*>(std::memchr(start, '\n', rem));
+
+            if (!nl) {
+                // No newline visible in the current window.
+                if (gz_ && !gz_eof_) {
+                    // Append the partial line fragment then slide-refill.
+                    size_t line_len = rem;
+                    if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
+                    if (line_len > 0) {
+                        const size_t old_sz = seq_.size();
+                        seq_.resize(old_sz + line_len);
+                        std::memcpy(seq_.data() + old_sz, start, line_len);
+                    }
+                    rpos_ = buf_.size(); // mark as consumed before slide
+                    gz_slide_and_refill();
+                    continue;
+                }
+                // Plain file or gz at EOF — last line without newline.
+                size_t line_len = rem;
+                if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
+                if (line_len > 0) {
+                    const size_t old_sz = seq_.size();
+                    seq_.resize(old_sz + line_len);
+                    std::memcpy(seq_.data() + old_sz, start, line_len);
+                }
+                rpos_ = buf_.size();
+                break;
+            }
+
+            // Normal case: found a newline within the current window.
+            size_t line_len = static_cast<size_t>(nl - start);
             if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
-
             if (line_len > 0) {
                 const size_t old_sz = seq_.size();
                 seq_.resize(old_sz + line_len);
                 std::memcpy(seq_.data() + old_sz, start, line_len);
             }
-
-            rpos_ += nl ? static_cast<size_t>(nl - start) + 1 : remaining;
+            rpos_ += static_cast<size_t>(nl - start) + 1;
         }
 
         return !seq_.empty();
@@ -157,6 +247,8 @@ private:
 
     // FASTQ: 4-line records — @header / sequence / +ignored / quality.
     // Only the sequence line is kept; quality is skipped with a single memchr.
+    // For gz files, gz_slide_and_refill() is called from read_next_seq() before
+    // each record, so a complete record is always available in buf_.
     bool read_fastq()
     {
         if (rpos_ >= buf_.size()) return false;
