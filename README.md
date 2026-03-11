@@ -4,6 +4,7 @@
 It partitions k-mers by minimizer into superkmer files, then counts them using a streaming hash table — keeping memory usage low and throughput high.
 
 It uses [kache-hash](https://github.com/vicLeva/kache-hash) as its streaming k-mer hash table.
+Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (SIMD FASTA/FASTQ, ~5 GB/s), and minimizer hashing uses a C++ port of [simd-minimizers](https://github.com/Daniel-Liu-c0deb0t/simd-minimizers) (canonical ntHash, two-stack sliding window minimum).
 
 ---
 
@@ -39,9 +40,9 @@ tuna supports three strategies for assigning k-mers to partitions, selected at r
 
 | Flag | Strategy | Pre-scan | Description |
 |------|----------|----------|-------------|
-| *(none / `-kmc`)* | **KMC signature** (default) | Yes | Partition scheme from [KMC](https://github.com/refresh-bio/KMC). Uses KMC's norm-filtered canonical m-mer signature (lexicographic order + validity filter). Pre-scans input to build a load-balanced signature→partition table. |
+| *(none / `-hash`)* | **Hash** (default) | No | `minimizer_hash % num_partitions`. Uses canonical ntHash (fwd XOR rev). No pre-scan; produces well-balanced partitions in practice. |
 | `-kmtricks` | **kmtricks repart** | Yes | Partition scheme from [kmtricks](https://github.com/tlemane/kmtricks). Pre-scans input to count minimizer frequencies, then builds a load-balanced minimizer→partition table using LPT greedy assignment. |
-| `-hash` | **Hash** | No | Inspired by [Cuttlefish](https://github.com/COMBINE-lab/cuttlefish)'s minimizer-based partitioning. `minimizer_hash % num_partitions`. No pre-scan, but may produce unbalanced partitions when minimizer frequencies are skewed (e.g. repeats). |
+| `-kmc` | **KMC signature** | Yes | Partition scheme from [KMC](https://github.com/refresh-bio/KMC). Uses KMC's norm-filtered canonical m-mer signature (lexicographic order + validity filter). Pre-scans input to build a load-balanced signature→partition table. |
 
 All three strategies produce identical k-mer sets and counts.
 
@@ -114,9 +115,9 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files |
-| `-kmc` | — | (default) | KMC signature partition strategy — default, no flag needed |
+| `-hash` | — | (default) | Hash partition strategy: `minimizer_hash % num_partitions`, no pre-scan |
 | `-kmtricks` | — | off | kmtricks load-balanced partition strategy (requires Phase 0 pre-scan) |
-| `-hash` | — | off | Hash partition strategy: `minimizer_hash % num_partitions`, no pre-scan |
+| `-kmc` | — | off | KMC signature partition strategy (requires Phase 0 pre-scan) |
 | `-s` | `<int>` | `9` | KMC signature length (`-kmc` only). Range: `[5, 11]` and must be < k |
 | `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
 | `-kt` | — | off | Keep temporary partition files after the run (useful for benchmarking) |
@@ -161,7 +162,7 @@ Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographica
 
 ## Benchmarks
 
-Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 8 threads, default partition strategy (`-kmc`).
+Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 8 threads, `-kmc` partition strategy.
 
 | dataset | tuna wall | tuna RSS | KMC wall | KMC RSS | time ratio | mem ratio |
 |---------|-----------|----------|----------|---------|------------|-----------|

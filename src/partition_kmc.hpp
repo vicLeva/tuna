@@ -33,7 +33,6 @@
 #include "Config.hpp"
 #include "superkmer_io.hpp"
 #include "fast_fasta.hpp"
-#include "DNA_Utility.hpp"
 
 #include <vector>
 #include <fstream>

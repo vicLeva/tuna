@@ -186,7 +186,7 @@ public:
         if (buf_fill_ == 0) throw std::runtime_error("Empty file: " + path);
         first_byte_ = buf_[0];
     }
-    explicit FileInput(FILE* fp) : buf_(BUF_SIZE), fp_(fp), owns_(false) {
+    explicit FileInput(FILE* fp) : fp_(fp), owns_(false), buf_(BUF_SIZE) {
         buf_fill_ = std::fread(buf_.data(), 1, buf_.size(), fp_);
         if (buf_fill_ > 0) first_byte_ = buf_[0];
     }

@@ -45,7 +45,6 @@ int run(const Config& cfg)
                   << " partitions  (" << p1_threads << " thread"
                   << (p1_threads > 1 ? "s" : "") << ")...\n";
 
-    const auto t1 = std::chrono::steady_clock::now();
 
     // Phase 0 (optional): pre-scan to build a load-balanced partition table.
     std::optional<RepartitionTable> rt;

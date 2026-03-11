@@ -5,13 +5,8 @@
 // Three independently modifiable bricks:
 //
 //   count_partition<k,l>   — read one partition file, fill a hash table.
-//                            Swap to change the counting structure.
-//
 //   write_counts<k,l>      — drain one table to the output stream.
-//                            Swap to change the output format.
-//
-//   count_and_write<k,l>   — parallel harness that calls both per partition.
-//                            Swap to change the threading / scheduling strategy.
+//   count_and_write<k,l>   — parallel harness (threading / scheduling).
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
@@ -31,6 +26,12 @@
 //
 // Drain an already-open SuperkmerReader into the caller-provided hash table.
 // The table must be private to the calling thread (mt_=false, no locking).
+//
+// Prefetch strategy: all k-mers in a superkmer share the same minimizer →
+// the same primary bucket.  A single table.prefetch() at the start of each
+// superkmer pre-loads that bucket before the first upsert, hiding one LLC miss
+// (~200 ns) behind win.init() work (~100 cycles).  No extra advance() calls.
+//
 // Returns the total number of k-mer insertions (with multiplicity).
 
 template <uint16_t k, uint16_t l>
@@ -39,18 +40,27 @@ uint64_t count_partition(
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token)
 {
+    auto inc = [](uint32_t v) { return v + 1; };
     uint64_t inserted = 0;
+
     while (reader.next()) {
-        if (reader.size() < k) continue;
+        const char*  seq = reader.data();
+        const size_t len = reader.size();
+        if (len < k) continue;
 
         kache_hash::Kmer_Window<k, l> win;
-        win.init(reader.data());
-        table.upsert(win, [](uint32_t v) { return v + 1; }, uint32_t(1), token);
+        win.init(seq);
+
+        // All k-mers in this superkmer share the same minimizer → same primary
+        // bucket.  Prefetch it now to overlap the LLC miss with win.init() work.
+        table.prefetch(win);
+
+        table.upsert(win, inc, uint32_t(1), token);
         ++inserted;
 
-        for (size_t i = k; i < reader.size(); ++i) {
-            win.advance(reader[i]);
-            table.upsert(win, [](uint32_t v) { return v + 1; }, uint32_t(1), token);
+        for (size_t i = k; i < len; ++i) {
+            win.advance(seq[i]);
+            table.upsert(win, inc, uint32_t(1), token);
             ++inserted;
         }
     }
@@ -59,13 +69,6 @@ uint64_t count_partition(
 
 
 // ─── Output brick ─────────────────────────────────────────────────────────────
-//
-// Iterate the table, apply ci/cx filters, and write "<kmer>\t<count>\n" lines
-// in 1 MB batches under out_mutex.  chunk is a reusable per-thread buffer.
-// Returns the number of k-mers written.
-//
-// Swap this function to change the output format (binary, CSV, different
-// columns, post-processing, etc.) without touching counting logic.
 
 template <uint16_t k, uint16_t l>
 uint64_t write_counts(
@@ -104,9 +107,13 @@ uint64_t write_counts(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// Spawns min(num_threads, num_partitions) threads.  Each thread processes its
-// assigned partitions round-robin: count_partition fills a private table, then
-// write_counts drains it.  Returns {total_inserted, total_written}.
+// init_sz is fixed at 1<<22 (4M k-mer slots).  Rationale:
+//   - For high-coverage data (e.g. 200 E. coli × 32 partitions → ~1.5M unique
+//     k-mers/partition): 1.5M << 3.2M resize threshold → no resize, table is
+//     8× smaller than the old file_size/4 heuristic → better L3 utilisation.
+//   - For low-coverage data (e.g. human 1 file × 128 partitions → ~23M unique
+//     k-mers/partition): table resizes 2-3× but amortised cost is small
+//     compared to the counting time.
 
 template <uint16_t k, uint16_t l>
 std::pair<uint64_t, uint64_t> count_and_write(
@@ -126,16 +133,10 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            // Open the partition file via mmap (SuperkmerReader maps on construction).
-            // Use reader.file_size() to pre-size the hash table — avoids a separate
-            // stat() call and reuses the already-mapped metadata.
-            // Each byte encodes roughly one nucleotide; file_bytes / 4 is a
-            // conservative upper bound on unique k-mers for this partition.
             const std::string part_path = cfg.work_dir + cfg.partition_prefix()
                                           + "_" + std::to_string(p) + ".superkmers";
             SuperkmerReader reader(part_path);
-            const size_t init_sz = std::max(size_t(1) << 20, reader.file_size() / 4);
-            table_t table(init_sz, 1); // private table, no locking
+            table_t table(1u << 22, 1); // 4M k-mers, 1 resize worker
 
             const uint64_t ins = count_partition<k, l>(reader, table, token);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);

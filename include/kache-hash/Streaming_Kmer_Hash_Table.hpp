@@ -289,6 +289,17 @@ public:
     // table.
     find_ret_t find(const Kmer_Window<k, l>& w) const;
 
+    // Issues a non-blocking L1 prefetch for the primary bucket of the k-mer
+    // defined by `w`.  Call this PREFETCH_DIST iterations before the matching
+    // upsert to hide LLC miss latency (~200 ns) behind useful computation.
+    void prefetch(const Kmer_Window<k, l>& w) const
+    {
+        // Prefetch the metadata cache line (cs[32] + min_coord[32] = 64 bytes).
+        // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
+        // touched on a checksum match, which is rare at low load factors.
+        __builtin_prefetch(&M[w.minimizer_hash() & (cap_ - 1)], 0, 3);
+    }
+
     // Registers a new user and returns a unique token for it.
     Token register_user() { return Token(registered_thread_count++); }
 
