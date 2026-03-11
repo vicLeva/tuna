@@ -23,8 +23,7 @@
 
 #include "Config.hpp"
 #include "fast_fasta.hpp"
-#include "DNA_Utility.hpp"
-#include "Minimizer_Iterator.hpp"
+#include "minimizer_window.hpp"
 
 #include <vector>
 #include <cstdint>
@@ -135,7 +134,7 @@ std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REP
 
     auto worker = [&](size_t tid) {
         auto& local = thr_counts[tid];
-        cuttlefish::Min_Iterator<k> min_it(cfg.l);
+        MinimizerWindow<k> min_it(cfg.l);
 
         SeqReader parser;
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
@@ -151,7 +150,7 @@ std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REP
                 for (size_t pos = 0; pos < seq_len; ++pos) {
                     const char ch = seq[pos];
 
-                    if (cuttlefish::DNA_Utility::is_placeholder(ch)) {
+                    if (!nt_hash::is_dna(ch)) {
                         in_run = false;
                         continue;
                     }
@@ -161,7 +160,7 @@ std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REP
 
                         bool ok = true;
                         for (size_t t = 1; t < k; ++t)
-                            if (cuttlefish::DNA_Utility::is_placeholder(seq[pos + t])) {
+                            if (!nt_hash::is_dna(seq[pos + t])) {
                                 pos += t; ok = false; break;
                             }
                         if (!ok) continue;

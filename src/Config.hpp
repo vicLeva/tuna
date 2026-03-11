@@ -6,9 +6,9 @@
 #include <limits>
 
 enum class PartitionStrategy {
-    KMC,       // KMC norm-filtered signature + load-balanced table (default)
+    HASH,      // simple minimizer-hash % num_partitions — no pre-scan (default)
     KMTRICKS,  // kmtricks-style: rolling minimizer hash + load-balanced table
-    HASH,      // simple hash % num_partitions — no pre-scan
+    KMC,       // KMC norm-filtered signature + load-balanced table
 };
 
 struct Config {
@@ -22,7 +22,7 @@ struct Config {
     uint32_t     ci             = 1;  // minimum count to report
     uint64_t     cx             = std::numeric_limits<uint64_t>::max(); // maximum count
     bool         hide_progress  = false;
-    PartitionStrategy strategy  = PartitionStrategy::KMC;
+    PartitionStrategy strategy  = PartitionStrategy::HASH;
     uint16_t     kmc_sig_len   = 9;    // KMC signature length (5–11, default 9)
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
@@ -34,6 +34,6 @@ struct Config {
             case PartitionStrategy::KMTRICKS: return "kmtricks";
             case PartitionStrategy::HASH:     return "hash";
         }
-        return "kmc";
+        return "hash";
     }
 };

@@ -29,17 +29,15 @@ void print_usage(const char* prog)
         "  -w  <dir>   working directory for temp files\n"
         "              [default: tuna_tmp/ next to output file]\n"
         "\n"
-        "Partition strategy (default: KMC signature):\n"
-        "  -kmc        KMC signature strategy (default — no flag needed):\n"
-        "              uses a norm-filtered canonical m-mer signature\n"
-        "              (lex order + validity filter). Pre-scans input to build\n"
-        "              a load-balanced signature->partition table (Phase 0).\n"
+        "Partition strategy (default: hash):\n"
+        "  -hash       hash strategy (default — no flag needed):\n"
+        "              minimizer_hash %% num_partitions. Fast, no pre-scan.\n"
         "  -kmtricks   kmtricks strategy: pre-scans input to build a\n"
         "              load-balanced minimizer->partition table (Phase 0),\n"
         "              then uses table lookup instead of hash %% num_partitions.\n"
-        "  -hash       hash strategy: minimizer_hash %% num_partitions.\n"
-        "              Fast, no pre-scan, but may produce unbalanced partitions\n"
-        "              when minimizer frequencies are skewed (e.g. repeats).\n"
+        "  -kmc        KMC signature strategy: uses a norm-filtered canonical\n"
+        "              m-mer signature. Pre-scans input to build a\n"
+        "              load-balanced signature->partition table (Phase 0).\n"
         "  -s  <int>   KMC signature length (KMC strategy only) [default: 9, range 5-11]\n"
         "\n"
         "  -hp         hide progress messages\n"
@@ -93,7 +91,7 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             const char* v = next_val("-w"); if (!v) return false;
             cfg.work_dir = v;
         } else if (arg == "-kmc") {
-            cfg.strategy = PartitionStrategy::KMC;   // already the default; accepted for clarity
+            cfg.strategy = PartitionStrategy::KMC;
         } else if (arg == "-kmtricks") {
             cfg.strategy = PartitionStrategy::KMTRICKS;
         } else if (arg == "-hash") {
