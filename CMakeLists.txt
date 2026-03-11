@@ -70,6 +70,7 @@ add_executable(tuna src/main.cpp src/CLI.cpp)
 target_include_directories(tuna PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/external/helicase_cpp
 )
 
 target_compile_options(tuna PRIVATE ${TUNA_COMPILE_FLAGS})

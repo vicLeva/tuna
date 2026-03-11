@@ -22,26 +22,23 @@
 #include <thread>
 #include <atomic>
 #include <utility>
-#include <filesystem>
+#include <algorithm>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
 //
-// Read partition file p and upsert every k-mer into the caller-provided table.
+// Drain an already-open SuperkmerReader into the caller-provided hash table.
 // The table must be private to the calling thread (mt_=false, no locking).
 // Returns the total number of k-mer insertions (with multiplicity).
 
 template <uint16_t k, uint16_t l>
 uint64_t count_partition(
-    const size_t                                                          p,
-    const Config&                                                         cfg,
+    SuperkmerReader&                                                      reader,
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token)
 {
-    SuperkmerReader reader(cfg.work_dir + cfg.partition_prefix() + "_" + std::to_string(p) + ".superkmers");
-
     uint64_t inserted = 0;
     while (reader.next()) {
         if (reader.size() < k) continue;
@@ -129,19 +126,18 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            // Pre-size the hash table from the partition file size to avoid
-            // costly resize cascades on large genomes.  Each byte in the
-            // superkmer file encodes roughly one nucleotide, and there are
-            // (len - k + 1) k-mers per superkmer of length len.  We use
-            // file_bytes / 4 as a conservative upper bound on unique k-mers.
+            // Open the partition file via mmap (SuperkmerReader maps on construction).
+            // Use reader.file_size() to pre-size the hash table — avoids a separate
+            // stat() call and reuses the already-mapped metadata.
+            // Each byte encodes roughly one nucleotide; file_bytes / 4 is a
+            // conservative upper bound on unique k-mers for this partition.
             const std::string part_path = cfg.work_dir + cfg.partition_prefix()
                                           + "_" + std::to_string(p) + ".superkmers";
-            const size_t file_bytes = static_cast<size_t>(
-                std::filesystem::file_size(part_path));
-            const size_t init_sz = std::max(size_t(1) << 20, file_bytes / 4);
+            SuperkmerReader reader(part_path);
+            const size_t init_sz = std::max(size_t(1) << 20, reader.file_size() / 4);
             table_t table(init_sz, 1); // private table, no locking
 
-            const uint64_t ins = count_partition<k, l>(p, cfg, table, token);
+            const uint64_t ins = count_partition<k, l>(reader, table, token);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
             const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
