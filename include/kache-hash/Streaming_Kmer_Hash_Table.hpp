@@ -985,7 +985,7 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
     char buf[k];
     for (uint16_t i = 0; i < k; ++i)
         buf[i] = B2C[key.base_at(k - 1 - i)];
-    MinimizerWindow<k> tmp_win(l);
+    static thread_local MinimizerWindow<k> tmp_win(l);
     tmp_win.reset(buf);
     const auto nt_h = tmp_win.hash();
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
