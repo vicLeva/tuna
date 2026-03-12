@@ -326,7 +326,7 @@ void extract_superkmers_kmc(
             if (end_val < cur_val) {
                 // New minimum — superkmer boundary.
                 if (len >= k) {
-                    writers[pm[cur_val]].append(seq + sk_start, len);
+                    writers[pm[cur_val]].append(seq + sk_start, static_cast<uint8_t>(len), 0xFFu);
                     kmer_count += len - k + 1;
                     sk_start = pos - (k - 1);
                     len      = k - 1;
@@ -343,7 +343,7 @@ void extract_superkmers_kmc(
                 // Current minimizer has fallen out of the k-mer window.
                 // Emit the current superkmer, then rescan the window.
                 if (len >= k) {
-                    writers[pm[cur_val]].append(seq + sk_start, len);
+                    writers[pm[cur_val]].append(seq + sk_start, static_cast<uint8_t>(len), 0xFFu);
                     kmer_count += len - k + 1;
                     sk_start = pos - (k - 1);
                     len      = k - 1;
@@ -370,7 +370,7 @@ void extract_superkmers_kmc(
 
     // Emit the last superkmer.
     if (len >= k) {
-        writers[pm[cur_val]].append(seq + sk_start, len);
+        writers[pm[cur_val]].append(seq + sk_start, static_cast<uint8_t>(len), 0xFFu);
         kmer_count += len - k + 1;
     }
 }

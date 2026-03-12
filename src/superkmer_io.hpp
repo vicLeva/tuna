@@ -1,14 +1,18 @@
 #pragma once
 
-// On-disk superkmer format: [uint16_t len_bases][ceil(len/4) packed bytes]
+// On-disk superkmer format: [uint8_t len_bases][uint8_t min_pos][ceil(len/4) packed bytes]
 //
-// Each superkmer is stored as a 2-byte length prefix (number of bases, native
-// endian) followed by the bases packed 4 per byte in kache-hash encoding
-// (A=0, C=1, G=2, T=3), MSB-first (base i is at bits 7-2*(i%4) of byte i/4).
+// Each superkmer is stored as two header bytes followed by the bases packed 4
+// per byte in kache-hash encoding (A=0, C=1, G=2, T=3), MSB-first.
 //
-// This is 4x smaller than ASCII and avoids the ASCII↔base conversion in
-// Phase 2: the unpacked value is a DNA::Base (kache-hash encoding) directly,
-// consumable by Kmer_Window::advance(DNA::Base) without remapping.
+//   len_bases — number of bases (max 255; superkmers are at most 2k−l bases).
+//   min_pos   — 0-indexed start position of the minimizer l-mer within the
+//               superkmer.  Stored so Phase 2 can compute ntHash(minimizer)
+//               in O(l) without running MinimizerWindow::reset() in O(k).
+//
+// Packed encoding: base i is at bits 7-2*(i%4) of byte i/4.
+// This is 4x smaller than ASCII.  Phase 2 unpacks directly to DNA::Base
+// (kache encoding) without any ASCII round-trip.
 //
 // SuperkmerWriter — per-thread per-bucket buffered write.
 //   Converts ASCII → packed on the fly; flushes to the shared ofstream under
@@ -16,8 +20,8 @@
 //
 // SuperkmerReader — zero-copy sequential reader backed by mmap (Linux/POSIX).
 //   Construction maps the entire file into the virtual address space.
-//   next() reads the length prefix and advances the cursor; packed_data() and
-//   size() return a pointer into the mapped region and the base count.
+//   next() reads the two header bytes and advances the cursor; packed_data(),
+//   size(), and min_pos() expose the current superkmer.
 
 #include <fstream>
 #include <mutex>
@@ -43,21 +47,22 @@ struct SuperkmerWriter
     static constexpr size_t FLUSH_THRESHOLD = 512u << 10; // 512 KB
 
     // Serialise one superkmer.
-    // `data` is ASCII DNA (ACGT, any case); `len` is the number of bases.
-    void append(const char* data, uint32_t len)
+    // `data` is ASCII DNA (ACGT, any case); `len` is the number of bases;
+    // `min_pos` is the 0-indexed start of the minimizer l-mer within the superkmer.
+    void append(const char* data, uint8_t len, uint8_t min_pos)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
         const size_t off = buf.size();
-        buf.resize(off + sizeof(uint16_t) + packed_bytes);
+        buf.resize(off + 2u + packed_bytes);
 
-        // Length prefix.
-        const uint16_t len16 = static_cast<uint16_t>(len);
-        std::memcpy(buf.data() + off, &len16, sizeof(uint16_t));
+        // Two header bytes: length then minimizer position.
+        buf[off]     = static_cast<char>(len);
+        buf[off + 1] = static_cast<char>(min_pos);
 
         // Pack 4 bases per byte, kache encoding: ((c>>2)^(c>>1))&3 = A=0,C=1,G=2,T=3.
-        uint8_t* packed = reinterpret_cast<uint8_t*>(buf.data() + off + sizeof(uint16_t));
+        uint8_t* packed = reinterpret_cast<uint8_t*>(buf.data() + off + 2u);
         std::memset(packed, 0, packed_bytes);
-        for (uint32_t i = 0; i < len; ++i) {
+        for (uint8_t i = 0; i < len; ++i) {
             const uint8_t b = ((uint8_t(data[i]) >> 2) ^ (uint8_t(data[i]) >> 1)) & 3u;
             packed[i >> 2] |= static_cast<uint8_t>(b << (6u - 2u * (i & 3u)));
         }
@@ -113,17 +118,17 @@ struct SuperkmerReader
     // Advance to the next superkmer.  Returns false at EOF.
     bool next()
     {
-        if (cur_ + static_cast<ptrdiff_t>(sizeof(uint16_t)) > end_) return false;
-        uint16_t len16;
-        std::memcpy(&len16, cur_, sizeof(uint16_t));
-        if (len16 == 0) return false;
-        cur_ += sizeof(uint16_t);
+        if (cur_ + 2 > end_) return false;
+        const uint8_t len8 = static_cast<uint8_t>(*cur_);
+        if (len8 == 0) return false;
+        min_pos_ = static_cast<uint8_t>(cur_[1]);
+        cur_ += 2;
 
-        const size_t packed_bytes = (static_cast<size_t>(len16) + 3u) / 4u;
+        const size_t packed_bytes = (static_cast<size_t>(len8) + 3u) / 4u;
         if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
 
         ptr_ = reinterpret_cast<const uint8_t*>(cur_);
-        len_ = len16;
+        len_ = len8;
         cur_ += packed_bytes;
         return true;
     }
@@ -134,6 +139,9 @@ struct SuperkmerReader
 
     // Number of bases in the current superkmer.
     size_t size() const { return len_; }
+
+    // 0-indexed start position of the minimizer l-mer within the current superkmer.
+    uint8_t min_pos() const { return min_pos_; }
 
     // Total mapped bytes — available for diagnostics / capacity estimation.
     size_t file_size() const { return size_; }
@@ -147,5 +155,6 @@ private:
     const char* cur_  = nullptr;
     const char* end_  = nullptr;
     const uint8_t* ptr_ = nullptr;
-    size_t      len_  = 0;
+    size_t      len_     = 0;
+    uint8_t     min_pos_ = 0;
 };

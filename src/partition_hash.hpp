@@ -37,10 +37,31 @@ struct PartitionStats { uint64_t seqs = 0, kmers = 0; };
 // detect superkmer boundaries with the minimizer iterator, and append each
 // superkmer to the corresponding writer.
 //
-// Because the input is guaranteed ACTG, there is no placeholder check and no
-// need for the in_run / skip-k-ahead startup; the window opens immediately.
+// Splits on every minimizer HASH change (not merely partition change) so that
+// every superkmer has a single well-defined minimizer whose position can be
+// stored in the 1-byte min_pos header field.  Superkmers that cross a minimizer
+// boundary but stay in the same partition are thus split into two shorter pieces;
+// each piece is routed to the same partition file — correctness is unchanged.
+//
+// find_minimizer_pos: O(superkmer_len) scan returning the 0-indexed start of
+// the leftmost l-mer with minimum canonical ntHash in seq[0..len-1].
 
-template <uint16_t k, typename PartitionFn>
+template <uint16_t l>
+static uint8_t find_minimizer_pos(const char* seq, uint8_t len) noexcept
+{
+    nt_hash::Roller roller(l);
+    roller.init(seq);
+    uint64_t min_h = roller.canonical();
+    uint8_t  min_p = 0;
+    for (uint8_t i = l; i < len; ++i) {
+        roller.roll(nt_hash::to_2bit(seq[i - l]), nt_hash::to_2bit(seq[i]));
+        const uint64_t h = roller.canonical();
+        if (h < min_h) { min_h = h; min_p = static_cast<uint8_t>(i - l + 1); }
+    }
+    return min_p;
+}
+
+template <uint16_t k, uint16_t l, typename PartitionFn>
 void extract_superkmers_from_actg(
     const char* const             seq,
     const size_t                  seq_len,
@@ -52,25 +73,32 @@ void extract_superkmers_from_actg(
     if (seq_len < k) return;
 
     min_it.reset(seq);
-    size_t pid     = partition_fn(min_it.hash());
-    size_t sk_start = 0;
-    size_t sk_end   = k;
+    uint64_t prev_hash = min_it.hash();
+    size_t   pid       = partition_fn(prev_hash);
+    size_t   sk_start  = 0;
+    size_t   sk_end    = k;
 
     for (size_t pos = k; pos < seq_len; ++pos) {
         min_it.advance(seq[pos]);
-        const size_t new_pid = partition_fn(min_it.hash());
-        if (new_pid != pid) {
-            writers[pid].append(seq + sk_start,
-                                static_cast<uint32_t>(sk_end - sk_start));
-            kmer_count += sk_end - sk_start - k + 1;
-            pid      = new_pid;
-            sk_start = pos - (k - 1);
+        const uint64_t new_hash = min_it.hash();
+        // Flush on minimizer change OR when sk_len is about to exceed uint8_t max.
+        // At flush time sk_end == pos, so sk_len = pos - sk_start ≤ 255 always.
+        if (new_hash != prev_hash || pos - sk_start >= 255u) {
+            const auto sk_len = static_cast<uint8_t>(sk_end - sk_start);
+            writers[pid].append(seq + sk_start, sk_len,
+                                find_minimizer_pos<l>(seq + sk_start, sk_len));
+            kmer_count += sk_len - k + 1;
+            prev_hash = new_hash;
+            pid       = partition_fn(new_hash);
+            sk_start  = pos - (k - 1);
         }
         sk_end = pos + 1;
     }
 
-    writers[pid].append(seq + sk_start, static_cast<uint32_t>(sk_end - sk_start));
-    kmer_count += sk_end - sk_start - k + 1;
+    const auto sk_len = static_cast<uint8_t>(sk_end - sk_start);
+    writers[pid].append(seq + sk_start, sk_len,
+                        find_minimizer_pos<l>(seq + sk_start, sk_len));
+    kmer_count += sk_len - k + 1;
 }
 
 
@@ -108,7 +136,7 @@ PartitionStats partition_kmers_impl(
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                 ++local_seqs;
-                extract_superkmers_from_actg<k>(
+                extract_superkmers_from_actg<k, l>(
                     chunk, len, partition_fn, min_it, writers, local_kmers);
                 flush_if_needed();
             });

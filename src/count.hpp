@@ -10,6 +10,7 @@
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
+#include "nt_hash.hpp"
 
 #include <fstream>
 #include <string>
@@ -27,10 +28,11 @@
 // Drain an already-open SuperkmerReader into the caller-provided hash table.
 // The table must be private to the calling thread (mt_=false, no locking).
 //
-// Prefetch strategy: all k-mers in a superkmer share the same minimizer →
-// the same primary bucket.  A single table.prefetch() at the start of each
-// superkmer pre-loads that bucket before the first upsert, hiding one LLC miss
-// (~200 ns) behind win.init() work (~100 cycles).  No extra advance() calls.
+// The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(l)
+// instead of running MinimizerWindow::reset() in O(k).  All k-mers in the
+// superkmer share the same minimizer, so init_packed_with_hash sets the bucket
+// hash once and advance() skips nt_min entirely.  A single prefetch() hides
+// the LLC miss (~200 ns) behind the O(l) lmer hash computation.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
@@ -40,19 +42,40 @@ uint64_t count_partition(
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token)
 {
+    // Compute canonical ntHash of the l-mer at position min_pos in packed data.
+    // Decodes l bases (kache→ASCII) then runs nt_hash::Roller.  O(l) work —
+    // replaces O(k) MinimizerWindow::reset() in init_packed.
+    auto lmer_nt_hash = [](const uint8_t* packed, uint8_t pos) -> uint64_t {
+        static constexpr char KACHE2ASCII[4] = {'A', 'C', 'G', 'T'};
+        char buf[l];
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint8_t p = static_cast<uint8_t>(pos + i);
+            buf[i] = KACHE2ASCII[(packed[p >> 2] >> (6u - 2u * (p & 3u))) & 3u];
+        }
+        nt_hash::Roller roller(l);
+        roller.init(buf);
+        return roller.canonical();
+    };
+
     auto inc = [](uint32_t v) { return v + 1; };
     uint64_t inserted = 0;
 
     while (reader.next()) {
-        const uint8_t* packed = reader.packed_data();
-        const size_t   len    = reader.size();
+        const uint8_t* packed   = reader.packed_data();
+        const size_t   len      = reader.size();
+        const uint8_t  min_pos  = reader.min_pos();
         if (len < k) continue;
 
+        // min_pos == 0xFF is a sentinel (KMC mode: multiple ntHash minimizers
+        // possible within one superkmer) — fall back to MinimizerWindow::reset().
+        // Otherwise use the stored position to compute ntHash in O(l) vs O(k).
         kache_hash::Kmer_Window<k, l> win;
-        win.init_packed(packed);
+        if (min_pos != 0xFF)
+            win.init_packed_with_hash(packed, lmer_nt_hash(packed, min_pos));
+        else
+            win.init_packed(packed);
 
-        // All k-mers in this superkmer share the same minimizer → same primary
-        // bucket.  Prefetch it now to overlap the LLC miss with init_packed() work.
+        // Prefetch the primary bucket before the first upsert.
         table.prefetch(win);
 
         table.upsert(win, inc, uint32_t(1), token);

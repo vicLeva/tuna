@@ -367,6 +367,8 @@ class Kmer_Window
     Directed_Vertex<k>    v;
     Rolling_Hash<k, true> rh;
     MinimizerWindow<k>    nt_min{static_cast<uint16_t>(l)};
+    uint64_t              precomp_nt_h_ = 0;
+    bool                  use_precomp_  = false;
 
 public:
 
@@ -376,6 +378,7 @@ public:
         v = Directed_Vertex<k>(Kmer<k>(s));
         rh.init(s);
         nt_min.reset(s);
+        use_precomp_ = false;
     }
 
     // Initializes the k-mer window from 2-bit packed DNA in kache encoding
@@ -390,6 +393,22 @@ public:
         init(buf);
     }
 
+    // Initializes the k-mer window from packed data with a precomputed canonical
+    // ntHash of the minimizer l-mer (from the stored min_pos header byte).
+    // Skips MinimizerWindow::reset() — nt_h is reused for all k-mers in the
+    // superkmer since they all share the same minimizer.
+    void init_packed_with_hash(const uint8_t* packed, uint64_t nt_h)
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
+        v = Directed_Vertex<k>(Kmer<k>(buf));
+        rh.init(buf);
+        precomp_nt_h_ = nt_h;
+        use_precomp_  = true;
+    }
+
     // Initializes the k-mer window from a packed super-kmer word array.
     void init(const uint64_t* super_kmer, const std::size_t word_count)
     {
@@ -401,13 +420,14 @@ public:
         for (uint16_t i = 0; i < k; ++i)
             buf[i] = B2C[v.kmer().base_at(k - 1 - i)];
         nt_min.reset(buf);
+        use_precomp_ = false;
     }
 
     // Advances the window by one nucleobase `b` (kache encoding: A=0,C=1,G=2,T=3).
     void advance(const DNA::Base b)
     {
         v.roll_forward(b);
-        nt_min.advance_kache(static_cast<uint8_t>(b));
+        if (!use_precomp_) nt_min.advance_kache(static_cast<uint8_t>(b));
         rh.advance(b);
     }
 
@@ -417,12 +437,20 @@ public:
         assert(!DNA_Utility::is_placeholder(ch));
         const DNA::Base b = DNA_Utility::map_base(ch);
         v.roll_forward(b);
-        nt_min.advance_kache(static_cast<uint8_t>(b));
+        if (!use_precomp_) nt_min.advance_kache(static_cast<uint8_t>(b));
         rh.advance(b);
     }
 
     // Returns the ntHash of the l-minimizer of the current k-mer.
-    auto minimizer_hash() const { return nt_min.hash(); }
+    // Returns precomputed hash if provided at init.
+    auto minimizer_hash() const { return use_precomp_ ? precomp_nt_h_ : nt_min.hash(); }
+
+    // Same as minimizer_hash() with min_coord output (used by upsert/insert).
+    uint64_t minimizer_nt_hash(uint8_t& m) const
+    {
+        if (use_precomp_) { m = 0; return precomp_nt_h_; }
+        return nt_min.hash(m);
+    }
 
     // Returns the hash of the current k-mer in the forward-strand.
     auto hash_fwd() const { return rh.hash_fwd(); }
@@ -791,7 +819,7 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.nt_min.hash(m);
+    const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
@@ -819,7 +847,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.nt_min.hash(m);
+    const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
@@ -848,7 +876,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     (void)token;
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.nt_min.hash(m);
+    const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
@@ -1147,7 +1175,7 @@ template <uint16_t k, bool mt_, typename T_, uint16_t l>
 inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
 {
     const auto key = w.v.canonical();
-    const auto nt_h = w.nt_min.hash();
+    const auto nt_h = w.minimizer_hash();
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
     const auto idx_mask = cap_ - 1;
 
