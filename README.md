@@ -108,8 +108,8 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
-| `-k` | `<int>` | `31` | k-mer length. Supported values: `17 21 27 31` |
-| `-m` | `<int>` | `17` | Minimizer length. Supported values: `11 13 15 17` (must be < k) |
+| `-k` | `<int>` | `31` | k-mer length. Any odd value in `[11,31]` (fits in 64-bit word) |
+| `-m` | `<int>` | `17` | Minimizer length. Any odd value in `[9, k-2]` (must be odd and < k) |
 | `-n` | `<int>` | `32` | Number of partitions (superkmer buckets written to disk) |
 | `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files (capped at number of files); Phase 2 parallelises over partitions (capped at `-n`) |
 | `-ci` | `<int>` | `1` | Minimum count to report |
