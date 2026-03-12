@@ -1,4 +1,4 @@
-// tuna — streaming k-mer counter built on cuttlefish + kache-hash
+// tuna — streaming k-mer counter built on helicase + kache-hash
 //
 // Pipeline:
 //   Phase 1 — stream FASTA/Q through a minimizer iterator, cut superkmers at

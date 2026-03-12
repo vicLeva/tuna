@@ -28,9 +28,6 @@
 #include <atomic>
 
 
-struct PartitionStats { uint64_t seqs = 0, kmers = 0; };
-
-
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
 //
 // Walk one ACTG-only DNA chunk (no N, no newlines — pre-filtered by helicase),

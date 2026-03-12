@@ -52,7 +52,7 @@
 
 static constexpr uint32_t KMC_INVALID = 4u;
 
-inline uint32_t kmc_enc(char c)
+static inline uint32_t kmc_enc(char c)
 {
     switch (c) {
         case 'A': case 'a': return 0;
@@ -96,9 +96,9 @@ struct KmcNormTable
         norm.resize(special + 1u);
 
         for (uint32_t i = 0; i < special; ++i) {
-            const uint32_t rc   = kmc_rc(i);
-            const uint32_t fval = kmc_is_allowed(i)  ? i  : special;
-            const uint32_t rval = kmc_is_allowed(rc) ? rc : special;
+            const uint32_t r    = rc(i);
+            const uint32_t fval = is_allowed(i)  ? i  : special;
+            const uint32_t rval = is_allowed(r)  ? r  : special;
             norm[i] = std::min(fval, rval);
         }
         norm[special] = special; // SPECIAL maps to itself
@@ -108,7 +108,7 @@ struct KmcNormTable
 
     // Validity filter, ported verbatim from KMC mmer.h CMmer::is_allowed().
     // Public so KmcPartMap::from_counts can iterate over all allowed raw values.
-    bool kmc_is_allowed(uint32_t mmer) const
+    bool is_allowed(uint32_t mmer) const
     {
         if ((mmer & 0x3fu) == 0x3fu) return false; // TTT suffix
         if ((mmer & 0x3fu) == 0x3bu) return false; // TGT suffix
@@ -130,7 +130,7 @@ private:
 
     // Reverse complement of a 2-bit-encoded m-mer.
     // Complement: 3-x swaps A↔T, C↔G.  Then reverse the order.
-    uint32_t kmc_rc(uint32_t mmer) const
+    uint32_t rc(uint32_t mmer) const
     {
         uint32_t rev   = 0;
         uint32_t shift = 2 * (m - 1);
@@ -198,7 +198,7 @@ struct KmcPartMap
         using Entry = std::pair<uint32_t, uint64_t>; // (raw_val, count)
         std::list<Entry> stats;
         for (uint32_t r = 0; r < nt.special; ++r)
-            if (nt.kmc_is_allowed(r))
+            if (nt.is_allowed(r))
                 stats.push_back({r, counts[r]});
 
         stats.sort([](const Entry& a, const Entry& b){ return a.second > b.second; });

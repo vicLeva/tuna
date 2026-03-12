@@ -111,7 +111,7 @@ struct RepartitionTable
 
 // ─── Phase 0: minimizer frequency scan ───────────────────────────────────────
 //
-// Walk all input sequences with Min_Iterator<k> and count, for every k-mer
+// Walk all input sequences with MinimizerWindow<k> and count, for every k-mer
 // window, how many times each table key (= minimizer hash >> (64 - 2*nb_bits))
 // is seen.  Returns a vector of 4^nb_bits counts.
 //
