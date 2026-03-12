@@ -2,22 +2,25 @@
 
 // MinimizerWindow<k> — streaming l-minimizer iterator using canonical ntHash.
 //
-// Drop-in replacement for cuttlefish::Min_Iterator<k> in Phase 1 (partition_hash.hpp)
-// and Phase 0 (partition_kmtricks.hpp).
+// Used in:
+//   Phase 1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
+//   Phase 2 (kache-hash Kmer_Window) — replaces Min_Iterator<k,l> (XXH3).
 //
 // Algorithm: two-stack (prefix/suffix) sliding window minimum over ntHash values.
-// O(k) space, O(1) amortised per advance() call, identical to the data structure
-// used by cuttlefish::Min_Iterator<k> — only the hash function changes:
-//   OLD: min(wyhash(lmer), wyhash(lmer_bar))
-//   NEW: nt_hash::Roller::canonical() = fwd_hash XOR rev_hash
-//        (same convention as simd-minimizers, seq-hash crate, NtHasher<true>)
+// O(k) space, O(1) amortised per advance() call.
+//
+// Two input encodings are supported:
+//   ASCII  — advance(char ch)         uses nt_hash::to_2bit() (A=0,C=1,T=2,G=3)
+//   kache  — advance_kache(uint8_t b) accepts kache encoding (A=0,C=1,G=2,T=3),
+//            converts to nt via b ^ (b >> 1), then calls advance_impl().
 //
 // Public interface:
 //   MinimizerWindow<k> win(l);
-//   win.reset(seq);           // initialise to first k characters
-//   uint64_t h = win.hash();  // canonical ntHash of the l-minimizer
-//   win.advance(ch);          // slide by one character
-//   h = win.hash();
+//   win.reset(seq);              // initialise to first k ASCII characters
+//   uint64_t h = win.hash();     // canonical ntHash of the l-minimizer
+//   win.advance(ch);             // slide by one ASCII character
+//   win.advance_kache(b);        // slide by one kache-encoded base
+//   win.hash(min_coord);         // hash + dummy min_coord (for kache-hash API)
 
 #include "nt_hash.hpp"
 
@@ -32,7 +35,7 @@ class MinimizerWindow {
     const uint64_t clear_msn_;  // mask to clear the top 2 bits of the 2*l-bit l-mer
 
     // 2-bit packed l-mer (forward and RC), tracked to extract the outgoing
-    // base cheaply when rolling the ntHash.
+    // base cheaply when rolling the ntHash.  nt encoding (A=0,C=1,T=2,G=3).
     uint64_t lmer_     = 0;
     uint64_t lmer_bar_ = 0;
 
@@ -60,8 +63,6 @@ class MinimizerWindow {
     static constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
     static constexpr auto umin = [](uint64_t a, uint64_t b) noexcept { return a < b ? a : b; };
 
-    // Recompute prefix mins from the current H array, reset M_suf, restore pivot.
-    // Called when the suffix half has been filled (pivot reached 0).
     void reset_windows() noexcept {
         const std::size_t w = k - l_;
         M_pre[0] = H[0];
@@ -71,50 +72,9 @@ class MinimizerWindow {
         pivot  = w;
     }
 
-public:
-
-    explicit MinimizerWindow(uint16_t l) noexcept
-        : l_(l)
-        , clear_msn_(~(uint64_t(0b11) << (2 * (l - 1))))
-        , hasher_(l)
-    {
-        assert(l < k);
-    }
-
-    // Initialise to the first k characters of `seq`.
-    // `seq` must contain at least k ACGT characters (no N, no newlines).
-    void reset(const char* seq) noexcept {
-        // Build the first l-mer from seq[0..l-1].
-        lmer_     = 0;
-        lmer_bar_ = 0;
-        for (uint16_t i = 0; i < l_; ++i) {
-            const uint8_t b = nt_hash::to_2bit(seq[i]);
-            lmer_     |= (uint64_t(b)               << (2 * (l_ - 1 - i)));
-            lmer_bar_ |= (uint64_t(b ^ 2u)           << (2 * i));
-        }
-        hasher_.init(seq);
-
-        // Fill H in reversed order: H[w] = hash(lmer@0), …, H[0] = hash(lmer@w).
-        pivot    = k - l_;
-        H[pivot] = hasher_.canonical();
-
-        for (uint16_t i = l_; i < k; ++i) {
-            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
-            const uint8_t in_2bit  = nt_hash::to_2bit(seq[i]);
-            lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
-            hasher_.roll(out_2bit, in_2bit);
-            H[--pivot] = hasher_.canonical();
-        }
-        // pivot == 0 after the loop; set up prefix-min arrays.
-        reset_windows();
-    }
-
-    // Slide the window one position to the right by consuming `ch`.
-    // `ch` must be an ACGT character.
-    void advance(char ch) noexcept {
+    // Core slide: `in_2bit` is nt-encoded (A=0,C=1,T=2,G=3).
+    void advance_impl(uint8_t in_2bit) noexcept {
         const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
-        const uint8_t in_2bit  = nt_hash::to_2bit(ch);
         lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
         lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
         hasher_.roll(out_2bit, in_2bit);
@@ -128,8 +88,62 @@ public:
             reset_windows();
     }
 
+public:
+
+    explicit MinimizerWindow(uint16_t l) noexcept
+        : l_(l)
+        , clear_msn_(~(uint64_t(0b11) << (2 * (l - 1))))
+        , hasher_(l)
+    {
+        assert(l < k);
+    }
+
+    // Initialise to the first k characters of `seq` (ASCII ACGT, any case).
+    // `seq` must contain at least k valid DNA characters.
+    void reset(const char* seq) noexcept {
+        lmer_     = 0;
+        lmer_bar_ = 0;
+        for (uint16_t i = 0; i < l_; ++i) {
+            const uint8_t b = nt_hash::to_2bit(seq[i]);
+            lmer_     |= (uint64_t(b)       << (2 * (l_ - 1 - i)));
+            lmer_bar_ |= (uint64_t(b ^ 2u)  << (2 * i));
+        }
+        hasher_.init(seq);
+
+        pivot    = k - l_;
+        H[pivot] = hasher_.canonical();
+
+        for (uint16_t i = l_; i < k; ++i) {
+            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
+            const uint8_t in_2bit  = nt_hash::to_2bit(seq[i]);
+            lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
+            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
+            hasher_.roll(out_2bit, in_2bit);
+            H[--pivot] = hasher_.canonical();
+        }
+        reset_windows();
+    }
+
+    // Slide by one ASCII character.
+    void advance(char ch) noexcept {
+        advance_impl(nt_hash::to_2bit(ch));
+    }
+
+    // Slide by one base in kache encoding (A=0, C=1, G=2, T=3).
+    // Converts to nt encoding via b ^ (b >> 1) before processing.
+    void advance_kache(uint8_t kache_b) noexcept {
+        advance_impl(kache_b ^ (kache_b >> 1));
+    }
+
     // Canonical ntHash of the l-minimizer of the current k-mer window.
     uint64_t hash() const noexcept {
         return umin(M_pre[pivot], M_suf);
+    }
+
+    // Same as hash(), but also sets min_coord = 0 (position/orientation not
+    // tracked; provided for compatibility with the kache-hash Kmer_Window API).
+    uint64_t hash(uint8_t& min_coord) const noexcept {
+        min_coord = 0;
+        return hash();
     }
 };

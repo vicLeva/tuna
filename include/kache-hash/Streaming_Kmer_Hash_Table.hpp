@@ -9,11 +9,11 @@
 #include "Kmer_Utility.hpp"
 #include "Directed_Vertex.hpp"
 #include "Rolling_Hash.hpp"
-#include "Minimizer_Iterator.hpp"
 #include "Concurrent_Hash_Table.hpp"
 #include "RW_Lock.hpp"
 #include "kache-hash/DNA.hpp"
 #include "utility.hpp"
+#include "minimizer_window.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -70,7 +70,13 @@ private:
     static constexpr auto& key(const flat_t& e) { if constexpr(is_map_) return e.first; else return e; }    // Returns the key from a table-element `e`.
     static constexpr auto& val(const flat_t& e) { if constexpr(is_map_) return e.second; else return e; }   // Returns the value from a table-element `e`.
 
-    static constexpr auto min_orientation_mask = Min_Iterator<k, l>::min_orientation_mask();
+    static constexpr uint8_t min_orientation_mask = 0b0100'0000;
+
+    // Seed used to derive bucket routing hash from the minimizer's ntHash value.
+    // Distinct from the cuckoo probe seeds (0 and 1<<63) used for secondary/tertiary buckets.
+    // ntHash is used only for minimizer *selection* (min comparison); bucket placement
+    // uses XXH3(ntHash, kBucketSeed) so that the two concerns are decoupled.
+    static constexpr uint64_t kBucketSeed = 0x9e3779b97f4a7c15ULL;
 
     const double lf;    // Load factor.
 
@@ -297,7 +303,9 @@ public:
         // Prefetch the metadata cache line (cs[32] + min_coord[32] = 64 bytes).
         // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
         // touched on a checksum match, which is rare at low load factors.
-        __builtin_prefetch(&M[w.minimizer_hash() & (cap_ - 1)], 0, 3);
+        const auto pf_nt_h = w.minimizer_hash();
+        const auto pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
     // Registers a new user and returns a unique token for it.
@@ -348,25 +356,26 @@ public:
 };
 
 
-// A window definining a k-mer with its associated metadata: its hash and
-// minimizer.
+// A window defining a k-mer with its associated metadata: its hash and
+// minimizer.  The minimizer uses canonical ntHash (MinimizerWindow<k>),
+// replacing the earlier XXH3-based Min_Iterator<k,l>.
 template <uint16_t k, uint16_t l>
 class Kmer_Window
 {
     template <uint16_t k_, bool mt_, typename T_, uint16_t l_> friend class Streaming_Kmer_Hash_Table;
 
-    Directed_Vertex<k> v;
+    Directed_Vertex<k>    v;
     Rolling_Hash<k, true> rh;
-    Min_Iterator<k, l> min_it;
+    MinimizerWindow<k>    nt_min{static_cast<uint16_t>(l)};
 
 public:
 
-    // Initializes the k-mer window at the beginning of the sequence `s`.
+    // Initializes the k-mer window at the beginning of the ASCII sequence `s`.
     void init(const char* const s)
     {
         v = Directed_Vertex<k>(Kmer<k>(s));
         rh.init(s);
-        min_it.reset(s);
+        nt_min.reset(s);
     }
 
     // Initializes the k-mer window from 2-bit packed DNA in kache encoding
@@ -381,35 +390,39 @@ public:
         init(buf);
     }
 
-    // Initializes the k-mer window at the beginning of the super k-mer encoding
-    // `label` that has `word_count` many words and is MSB-aligned.
+    // Initializes the k-mer window from a packed super-kmer word array.
     void init(const uint64_t* super_kmer, const std::size_t word_count)
     {
         v.from_super_kmer(super_kmer, word_count);
         rh.init(v.kmer());
-        min_it.reset(v.kmer());
+        // Decode kmer to ASCII for nt_min (front-to-back order).
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[v.kmer().base_at(k - 1 - i)];
+        nt_min.reset(buf);
     }
 
-    // Advances the window by one k-mer, by the nucelobase `b`.
+    // Advances the window by one nucleobase `b` (kache encoding: A=0,C=1,G=2,T=3).
     void advance(const DNA::Base b)
     {
         v.roll_forward(b);
-        min_it.advance(b);
+        nt_min.advance_kache(static_cast<uint8_t>(b));
         rh.advance(b);
     }
 
-    // Advances the window by one k-mer, by the character `ch`.
+    // Advances the window by one ASCII character `ch`.
     void advance(const char ch)
     {
         assert(!DNA_Utility::is_placeholder(ch));
-
-        v.roll_forward(DNA_Utility::map_base(ch));
-        min_it.advance(ch);
-        rh.advance(ch);
+        const DNA::Base b = DNA_Utility::map_base(ch);
+        v.roll_forward(b);
+        nt_min.advance_kache(static_cast<uint8_t>(b));
+        rh.advance(b);
     }
 
-    // Returns the minimizer-hash.
-    auto minimizer_hash() const { return min_it.hash(); }
+    // Returns the ntHash of the l-minimizer of the current k-mer.
+    auto minimizer_hash() const { return nt_min.hash(); }
 
     // Returns the hash of the current k-mer in the forward-strand.
     auto hash_fwd() const { return rh.hash_fwd(); }
@@ -778,8 +791,9 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto h = w.min_it.hash(m);
+    const auto nt_h = w.nt_min.hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
+    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(w.v.canonical(), c, h, m);
@@ -805,8 +819,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto h = w.min_it.hash(m);
+    const auto nt_h = w.nt_min.hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
+    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(std::make_pair(w.v.canonical(), val), c, h, m);
@@ -833,8 +848,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     (void)token;
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto h = w.min_it.hash(m);
+    const auto nt_h = w.nt_min.hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
+    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = upsert(w.v.canonical(), c, h, m, f, val);
@@ -936,11 +952,15 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
     const auto idx_mask = cap_ - 1;
 
     const auto key = this->key(x);
-    const uint8_t min_idx = m & Min_Iterator<k, l>::min_index_mask();
-    const bool in_fwd = m & Min_Iterator<k, l>::min_orientation_mask();
-    const auto min = in_fwd ?
-                        key.template lmer_at<l>(min_idx) : Kmer_Utility::reverse_complement<l>(key.template lmer_at<l>(k - min_idx - l));
-    const auto h = Min_Iterator<k, l>::lmer_hash(min);
+    // Recompute minimizer hash via MinimizerWindow<k> (canonical ntHash).
+    static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+    char buf[k];
+    for (uint16_t i = 0; i < k; ++i)
+        buf[i] = B2C[key.base_at(k - 1 - i)];
+    MinimizerWindow<k> tmp_win(l);
+    tmp_win.reset(buf);
+    const auto nt_h = tmp_win.hash();
+    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
     const auto b = h & idx_mask;
     if(try_insert_at_resize(x, c, m, b))
@@ -1127,7 +1147,8 @@ template <uint16_t k, bool mt_, typename T_, uint16_t l>
 inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
 {
     const auto key = w.v.canonical();
-    const auto h = w.min_it.hash();
+    const auto nt_h = w.nt_min.hash();
+    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
     const auto idx_mask = cap_ - 1;
 
     const auto b = h & idx_mask;
