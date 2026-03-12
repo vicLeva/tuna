@@ -79,10 +79,12 @@ STRATEGY="${STRATEGY:-hash}"
 FORMAT="${FORMAT:-fa}"
 
 # ── Validate ──────────────────────────────────────────────────────────────────
-[[ -x "$TUNA"      ]] || { echo "ERROR: tuna not found at $TUNA"           >&2; exit 1; }
-[[ -x "$KMC"       ]] || { echo "ERROR: kmc not found at $KMC"             >&2; exit 1; }
-[[ -x "$KMC_TOOLS" ]] || { echo "ERROR: kmc_tools not found at $KMC_TOOLS" >&2; exit 1; }
-[[ -f "$FOF"       ]] || { echo "ERROR: file-of-files not found: $FOF"     >&2; exit 1; }
+# Use command -v so bare names (e.g. KMC_BIN=kmc) are resolved via PATH.
+require_bin() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $2 not found: $1" >&2; exit 1; }; }
+require_bin "$TUNA"      "tuna"
+require_bin "$KMC"       "kmc"
+require_bin "$KMC_TOOLS" "kmc_tools"
+[[ -f "$FOF" ]] || { echo "ERROR: file-of-files not found: $FOF" >&2; exit 1; }
 "$GNU_TIME" -v true 2>/dev/null \
     || { echo "ERROR: $GNU_TIME -v not available (need GNU time, not bash builtin)" >&2; exit 1; }
 

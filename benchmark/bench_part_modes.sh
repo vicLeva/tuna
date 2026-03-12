@@ -85,8 +85,8 @@ for arg in "$@"; do
 done
 
 # ── Validate prerequisites ─────────────────────────────────────────────────────
-[[ -x "$TUNA" ]]       || { echo "ERROR: tuna not found at $TUNA"          >&2; exit 1; }
-[[ -f "$FOF"  ]]       || { echo "ERROR: file-of-files not found: $FOF"    >&2; exit 1; }
+command -v "$TUNA" >/dev/null 2>&1 || { echo "ERROR: tuna not found: $TUNA"       >&2; exit 1; }
+[[ -f "$FOF"  ]]                   || { echo "ERROR: file-of-files not found: $FOF" >&2; exit 1; }
 "$GNU_TIME" -v true 2>/dev/null \
     || { echo "ERROR: $GNU_TIME -v not available (need GNU time)" >&2; exit 1; }
 
