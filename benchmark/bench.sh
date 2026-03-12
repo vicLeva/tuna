@@ -79,6 +79,10 @@ STRATEGY="${STRATEGY:-hash}"
 FORMAT="${FORMAT:-fa}"
 
 # ── Validate ──────────────────────────────────────────────────────────────────
+# Resolve bare command names (e.g. KMC_BIN=kmc) to full paths via PATH lookup.
+TUNA=$(command -v "$TUNA" 2>/dev/null || echo "$TUNA")
+KMC=$(command -v "$KMC" 2>/dev/null || echo "$KMC")
+KMC_TOOLS=$(command -v "$KMC_TOOLS" 2>/dev/null || echo "$KMC_TOOLS")
 [[ -x "$TUNA"      ]] || { echo "ERROR: tuna not found at $TUNA"           >&2; exit 1; }
 [[ -x "$KMC"       ]] || { echo "ERROR: kmc not found at $KMC"             >&2; exit 1; }
 [[ -x "$KMC_TOOLS" ]] || { echo "ERROR: kmc_tools not found at $KMC_TOOLS" >&2; exit 1; }
