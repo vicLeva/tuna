@@ -32,7 +32,7 @@
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
-#include "fast_fasta.hpp"
+#include "seq_source.hpp"
 
 #include <vector>
 #include <fstream>
@@ -305,48 +305,22 @@ void extract_superkmers_kmc(
         return s;
     };
 
-    size_t i = 0;
-    while (i + k <= seq_len) {
+    // Initialise with the first m-mer at position 0.
+    uint32_t cur_str = build_str(0);
+    uint32_t cur_val = nt[cur_str];
+    uint32_t end_str = cur_str;
+    uint32_t end_val = cur_val;
 
-        // Find the next position with m consecutive valid (non-N) bases.
-        bool found_n = false;
-        for (uint32_t j = 0; j < m; ++j) {
-            if (kmc_enc(seq[i + j]) == KMC_INVALID) {
-                i += j + 1;
-                found_n = true;
-                break;
-            }
-        }
-        if (found_n) continue;
-        if (i + k > seq_len) break;
+    size_t sig_start = 0; // where current_sig starts in the sequence
+    size_t sk_start  = 0; // start of the current superkmer
+    size_t len       = m; // accumulated superkmer length
+    size_t pos       = m;
 
-        // Initialise with the first m-mer at position i.
-        uint32_t cur_str = build_str(i);
-        uint32_t cur_val = nt[cur_str];
-        uint32_t end_str = cur_str;
-        uint32_t end_val = cur_val;
+    while (pos < seq_len) {
+        const uint32_t base = kmc_enc(seq[pos]);
 
-        size_t sig_start = i;  // where current_sig starts in the sequence
-        size_t sk_start  = i;  // start of the current superkmer
-        size_t len       = m;  // accumulated superkmer length
-        size_t pos       = i + m;
-
-        while (pos < seq_len) {
-            const uint32_t base = kmc_enc(seq[pos]);
-
-            if (base == KMC_INVALID) {
-                // Sequence break — emit and restart from after the N.
-                if (len >= k) {
-                    writers[pm[cur_val]].append(seq + sk_start, len);
-                    kmer_count += len - k + 1;
-                }
-                len = 0;
-                ++pos;
-                break;
-            }
-
-            // Slide end m-mer one base to the right.
-            end_str = ((end_str << 2) | base) & mask;
+        // Slide end m-mer one base to the right.
+        end_str = ((end_str << 2) | base) & mask;
             end_val = nt[end_str];
 
             if (end_val < cur_val) {
@@ -391,16 +365,13 @@ void extract_superkmers_kmc(
             }
 
             ++len;
-            ++pos;
-        }
+        ++pos;
+    }
 
-        // Emit the last superkmer of this run.
-        if (len >= k) {
-            writers[pm[cur_val]].append(seq + sk_start, len);
-            kmer_count += len - k + 1;
-        }
-
-        i = pos;
+    // Emit the last superkmer.
+    if (len >= k) {
+        writers[pm[cur_val]].append(seq + sk_start, len);
+        kmer_count += len - k + 1;
     }
 }
 
@@ -439,93 +410,64 @@ std::vector<uint64_t> scan_kmc_sig_counts(
             return v;
         };
 
-        SeqReader parser; // one reader per thread, reused across files
+        SeqSource source;
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            if (!parser.load(cfg.input_files[fi])) continue;
+            source.process(cfg.input_files[fi], [&](const char* seq, size_t seq_len) {
+                if (seq_len < k) return;
 
-            while (parser.read_next_seq()) {
-                const char*  seq     = parser.seq();
-                const size_t seq_len = parser.seq_len();
-                if (seq_len < k) continue;
+                uint32_t cur_str = build_str(seq);
+                uint32_t cur_val = nt[cur_str];
+                uint32_t end_str = cur_str;
+                uint32_t end_val = cur_val;
 
-                size_t i = 0;
-                while (i + k <= seq_len) {
-                    bool found_n = false;
-                    for (uint32_t j = 0; j < m; ++j) {
-                        if (kmc_enc(seq[i + j]) == KMC_INVALID) {
-                            i += j + 1;
-                            found_n = true;
-                            break;
+                size_t sig_start = 0;
+                size_t len       = m;
+                size_t pos       = m;
+
+                while (pos < seq_len) {
+                    const uint32_t base = kmc_enc(seq[pos]);
+
+                    end_str = ((end_str << 2) | base) & mask;
+                    end_val = nt[end_str];
+
+                    if (end_val < cur_val) {
+                        if (len >= k) {
+                            local[cur_val] += len - k + 1;
+                            len = k - 1;
                         }
-                    }
-                    if (found_n) continue;
-                    if (i + k > seq_len) break;
+                        cur_str = end_str; cur_val = end_val;
+                        sig_start = pos - m + 1;
 
-                    uint32_t cur_str = build_str(seq + i);
-                    uint32_t cur_val = nt[cur_str];
-                    uint32_t end_str = cur_str;
-                    uint32_t end_val = cur_val;
+                    } else if (end_val == cur_val) {
+                        cur_str = end_str; cur_val = end_val;
+                        sig_start = pos - m + 1;
 
-                    size_t sig_start = i;
-                    size_t len       = m;
-                    size_t pos       = i + m;
-
-                    while (pos < seq_len) {
-                        const uint32_t base = kmc_enc(seq[pos]);
-
-                        if (base == KMC_INVALID) {
-                            if (len >= k)
-                                local[cur_val] += len - k + 1;
-                            len = 0;
-                            ++pos;
-                            break;
+                    } else if (sig_start + k - 1 < pos) {
+                        if (len >= k) {
+                            local[cur_val] += len - k + 1;
+                            len = k - 1;
                         }
-
-                        end_str = ((end_str << 2) | base) & mask;
+                        ++sig_start;
+                        end_str = build_str(seq + sig_start);
                         end_val = nt[end_str];
-
-                        if (end_val < cur_val) {
-                            if (len >= k) {
-                                local[cur_val] += len - k + 1;
-                                len = k - 1;
-                            }
-                            cur_str = end_str; cur_val = end_val;
-                            sig_start = pos - m + 1;
-
-                        } else if (end_val == cur_val) {
-                            cur_str = end_str; cur_val = end_val;
-                            sig_start = pos - m + 1;
-
-                        } else if (sig_start + k - 1 < pos) {
-                            if (len >= k) {
-                                local[cur_val] += len - k + 1;
-                                len = k - 1;
-                            }
-                            ++sig_start;
-                            end_str = build_str(seq + sig_start);
+                        cur_str = end_str; cur_val = end_val;
+                        for (size_t j = sig_start + m; j <= pos; ++j) {
+                            end_str = ((end_str << 2) | kmc_enc(seq[j])) & mask;
                             end_val = nt[end_str];
-                            cur_str = end_str; cur_val = end_val;
-                            for (size_t j = sig_start + m; j <= pos; ++j) {
-                                end_str = ((end_str << 2) | kmc_enc(seq[j])) & mask;
-                                end_val = nt[end_str];
-                                if (end_val <= cur_val) {
-                                    cur_str = end_str; cur_val = end_val;
-                                    sig_start = j - m + 1;
-                                }
+                            if (end_val <= cur_val) {
+                                cur_str = end_str; cur_val = end_val;
+                                sig_start = j - m + 1;
                             }
                         }
-
-                        ++len;
-                        ++pos;
                     }
 
-                    if (len >= k)
-                        local[cur_val] += len - k + 1;
-
-                    i = pos;
+                    ++len;
+                    ++pos;
                 }
-            }
 
+                if (len >= k)
+                    local[cur_val] += len - k + 1;
+            });
         }
     };
 
@@ -570,23 +512,15 @@ PartitionStats partition_kmers_kmc(
         std::vector<SuperkmerWriter> writers(cfg.num_partitions);
         uint64_t local_seqs = 0, local_kmers = 0;
 
-        SeqReader parser; // one reader per thread, reused across files
+        SeqSource source;
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            if (!parser.load(cfg.input_files[fi])) continue;
-
-            while (parser.read_next_seq()) {
+            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                 ++local_seqs;
-
-                extract_superkmers_kmc<k>(
-                    parser.seq(), parser.seq_len(),
-                    nt, pm, writers, local_kmers);
-
+                extract_superkmers_kmc<k>(chunk, len, nt, pm, writers, local_kmers);
                 for (size_t p = 0; p < cfg.num_partitions; ++p)
                     if (writers[p].needs_flush())
                         writers[p].flush_to(buckets[p], bucket_mutexes[p]);
-            }
-
-            parser.close();
+            });
         }
 
         for (size_t p = 0; p < cfg.num_partitions; ++p)

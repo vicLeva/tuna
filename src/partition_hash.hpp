@@ -8,9 +8,8 @@
 //   partition_kmers_hash<k,l>(cfg, buckets)           — hash % num_partitions
 //   partition_kmers_kmtricks<k,l>(cfg, buckets, rt)   — RepartitionTable lookup
 //
-// Parsing is done with helicase (SIMD FASTA/FASTQ, ~5-7 GB/s).
-// helicase with SPLIT_NON_ACTG delivers ACTG-only chunks (N-free, newline-free)
-// straight to extract_superkmers_from_actg — no placeholder checks needed.
+// Parsing is delegated to SeqSource, which delivers ACTG-only chunks regardless
+// of file format or compression (helicase for plain files, SeqReader+split for gz).
 //
 // Shared internals:
 //   extract_superkmers_from_actg<k, PartitionFn>  — pure ACTG sequence logic,
@@ -21,38 +20,15 @@
 #include "superkmer_io.hpp"
 #include "partition_kmtricks.hpp"
 #include "minimizer_window.hpp"
+#include "seq_source.hpp"
 
-#include <helicase.hpp>
-#include "fast_fasta.hpp"
-
-#include <zlib.h>
-#include <fstream>
 #include <vector>
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <cstring>
 
 
 struct PartitionStats { uint64_t seqs = 0, kmers = 0; };
-
-
-// ─── helicase config ──────────────────────────────────────────────────────────
-//
-// DNA string + split at non-ACTG + return each chunk separately.
-// One next() call per ACTG-only run (newline-free, N-free).
-
-static constexpr helicase::Config HELICASE_ACTG =
-    helicase::ParserOptions()
-        .ignore_headers()
-        .dna_string()
-        .split_non_actg()
-        .config()
-    & ~helicase::advanced::RETURN_RECORD;
-
-
-// FileBuffer removed: gz files are now streamed via SeqReader (64 MB window)
-// to avoid OOM on large compressed inputs (e.g. 5.9 GB gz → ~20 GB decompressed).
 
 
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
@@ -98,77 +74,11 @@ void extract_superkmers_from_actg(
 }
 
 
-// ─── Legacy: placeholder-aware version (kept for reference / non-helicase paths) ─
-
-template <uint16_t k, typename PartitionFn>
-void extract_superkmers_from_seq(
-    const char* const             seq,
-    const size_t                  seq_len,
-    PartitionFn&&                 partition_fn,
-    MinimizerWindow<k>&           min_it,
-    std::vector<SuperkmerWriter>& writers,
-    uint64_t&                     kmer_count)
-{
-    if (seq_len < k) return;
-
-    bool   in_run   = false;
-    size_t sk_start = 0, sk_end = 0;
-    size_t pid      = 0;
-
-    const auto emit_superkmer = [&]() {
-        const auto len = static_cast<uint32_t>(sk_end - sk_start);
-        writers[pid].append(seq + sk_start, len);
-        kmer_count += len - k + 1;
-    };
-
-    for (size_t pos = 0; pos < seq_len; ++pos) {
-        const char ch = seq[pos];
-
-        if (!nt_hash::is_dna(ch)) {
-            if (in_run) { emit_superkmer(); in_run = false; }
-            continue;
-        }
-
-        if (!in_run) {
-            if (pos + k > seq_len) break;
-
-            bool ok = true;
-            for (size_t t = 1; t < k; ++t) {
-                if (!nt_hash::is_dna(seq[pos + t])) {
-                    pos += t; ok = false; break;
-                }
-            }
-            if (!ok) continue;
-
-            min_it.reset(seq + pos);
-            pid      = partition_fn(min_it.hash());
-            sk_start = pos;
-            sk_end   = pos + k;
-            in_run   = true;
-            pos     += k - 1;
-            continue;
-        }
-
-        min_it.advance(ch);
-        const size_t new_pid = partition_fn(min_it.hash());
-
-        if (new_pid != pid) {
-            emit_superkmer();
-            pid      = new_pid;
-            sk_start = pos - (k - 1);
-        }
-        sk_end = pos + 1;
-    }
-
-    if (in_run) emit_superkmer();
-}
-
-
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
 // Spawns min(num_threads, n_files) threads. Each thread processes its assigned
-// input files round-robin. helicase delivers ACTG-only chunks via SliceInput;
-// extract_superkmers_from_actg maps each chunk to superkmers + partition writers.
+// input files round-robin. SeqSource delivers ACTG-only chunks regardless of
+// format or compression; extract_superkmers_from_actg maps each to superkmers.
 
 template <uint16_t k, uint16_t l, typename PartitionFn>
 PartitionStats partition_kmers_impl(
@@ -185,7 +95,7 @@ PartitionStats partition_kmers_impl(
     auto worker = [&](size_t tid) {
         MinimizerWindow<k> min_it(l);
         std::vector<SuperkmerWriter> writers(cfg.num_partitions);
-        SeqReader sreader; // reused across gz files; only grows, never shrinks
+        SeqSource source; // reused across files; internal gz buffer only grows
 
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -196,45 +106,12 @@ PartitionStats partition_kmers_impl(
         };
 
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            const auto& path = cfg.input_files[fi];
-            const bool is_gz = path.size() > 3 &&
-                               path.compare(path.size() - 3, 3, ".gz") == 0;
-
-            if (is_gz) {
-                // Streaming gz: SeqReader (64 MB sliding window, O(1) memory).
-                // Use placeholder-aware extract_superkmers_from_seq to handle N's.
-                if (!sreader.load(path)) continue;
-                while (sreader.read_next_seq()) {
-                    ++local_seqs;
-                    extract_superkmers_from_seq<k>(
-                        sreader.seq(), sreader.seq_len(),
-                        partition_fn, min_it, writers, local_kmers);
-                    flush_if_needed();
-                }
-            } else {
-                // Plain file: zero-copy mmap + helicase SIMD (ACTG-only chunks).
-                helicase::MmapInput inp(path);
-                const uint8_t fb = inp.first_byte();
-                if (fb == '@') {
-                    helicase::FastqParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
-                    while (p.next()) {
-                        auto [ptr, len] = p.get_dna_raw();
-                        ++local_seqs;
-                        extract_superkmers_from_actg<k>(
-                            ptr, len, partition_fn, min_it, writers, local_kmers);
-                        flush_if_needed();
-                    }
-                } else {
-                    helicase::FastaParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
-                    while (p.next()) {
-                        auto [ptr, len] = p.get_dna_raw();
-                        ++local_seqs;
-                        extract_superkmers_from_actg<k>(
-                            ptr, len, partition_fn, min_it, writers, local_kmers);
-                        flush_if_needed();
-                    }
-                }
-            }
+            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
+                ++local_seqs;
+                extract_superkmers_from_actg<k>(
+                    chunk, len, partition_fn, min_it, writers, local_kmers);
+                flush_if_needed();
+            });
         }
 
         // Final flush of any remaining buffered data.

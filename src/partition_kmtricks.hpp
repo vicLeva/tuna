@@ -22,7 +22,7 @@
 //   scan_minimizer_counts — the pre-scan; swap to change what gets counted.
 
 #include "Config.hpp"
-#include "fast_fasta.hpp"
+#include "seq_source.hpp"
 #include "minimizer_window.hpp"
 
 #include <vector>
@@ -136,47 +136,17 @@ std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REP
         auto& local = thr_counts[tid];
         MinimizerWindow<k> min_it(cfg.l);
 
-        SeqReader parser;
+        SeqSource source;
         for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            if (!parser.load(cfg.input_files[fi])) continue;
-
-            while (parser.read_next_seq()) {
-                const char*  seq     = parser.seq();
-                const size_t seq_len = parser.seq_len();
-                if (seq_len < k) continue;
-
-                bool in_run = false;
-
-                for (size_t pos = 0; pos < seq_len; ++pos) {
-                    const char ch = seq[pos];
-
-                    if (!nt_hash::is_dna(ch)) {
-                        in_run = false;
-                        continue;
-                    }
-
-                    if (!in_run) {
-                        if (pos + k > seq_len) break;
-
-                        bool ok = true;
-                        for (size_t t = 1; t < k; ++t)
-                            if (!nt_hash::is_dna(seq[pos + t])) {
-                                pos += t; ok = false; break;
-                            }
-                        if (!ok) continue;
-
-                        min_it.reset(seq + pos);
-                        local[static_cast<size_t>(min_it.hash() >> shift)]++;
-                        in_run = true;
-                        pos   += k - 1;  // for-loop will ++pos to pos+k
-                        continue;
-                    }
-
-                    min_it.advance(ch);
+            source.process(cfg.input_files[fi], [&](const char* seq, size_t seq_len) {
+                if (seq_len < k) return;
+                min_it.reset(seq);
+                local[static_cast<size_t>(min_it.hash() >> shift)]++;
+                for (size_t pos = k; pos < seq_len; ++pos) {
+                    min_it.advance(seq[pos]);
                     local[static_cast<size_t>(min_it.hash() >> shift)]++;
                 }
-            }
-
+            });
         }
     };
 
