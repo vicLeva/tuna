@@ -44,22 +44,30 @@ uint64_t count_partition(
     uint64_t inserted = 0;
 
     while (reader.next()) {
-        const char*  seq = reader.data();
-        const size_t len = reader.size();
+        const uint8_t* packed = reader.packed_data();
+        const size_t   len    = reader.size();
         if (len < k) continue;
 
         kache_hash::Kmer_Window<k, l> win;
-        win.init(seq);
+        win.init_packed(packed);
 
         // All k-mers in this superkmer share the same minimizer → same primary
-        // bucket.  Prefetch it now to overlap the LLC miss with win.init() work.
+        // bucket.  Prefetch it now to overlap the LLC miss with init_packed() work.
         table.prefetch(win);
 
         table.upsert(win, inc, uint32_t(1), token);
         ++inserted;
 
+        // Unpack subsequent bases directly as DNA::Base (kache encoding), no
+        // ASCII round-trip.  Maintain byte pointer + shift counter to avoid
+        // division/modulo in the hot loop.
+        const uint8_t* byte_ptr = packed + (k >> 2);
+        int shift = static_cast<int>(6u - 2u * (k & 3u));
         for (size_t i = k; i < len; ++i) {
-            win.advance(seq[i]);
+            const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
+            shift -= 2;
+            if (shift < 0) { shift = 6; ++byte_ptr; }
+            win.advance(b);
             table.upsert(win, inc, uint32_t(1), token);
             ++inserted;
         }

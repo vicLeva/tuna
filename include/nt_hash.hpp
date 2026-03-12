@@ -19,21 +19,23 @@
 
 namespace nt_hash {
 
-// ── Per-nucleotide seeds (A=0, C=1, G=2, T=3) ────────────────────────────────
+// ── Per-nucleotide seeds (A=0, C=1, T=2, G=3) ────────────────────────────────
 // Taken from the ntHash reference implementation.
+// Encoding matches the raw bit trick (c >> 1) & 3 on ASCII ACGT.
 static constexpr uint64_t FWD[4] = {
     0x3c8bfbb395c60474ULL, // A
     0x3193c18562a02b4cULL, // C
-    0x20323ed082572324ULL, // G
     0x295549f54be24456ULL, // T
+    0x20323ed082572324ULL, // G
 };
 
-// Reverse-complement seeds: REV[b] = FWD[complement(b)], where A↔T, C↔G.
+// Reverse-complement seeds: REV[b] = FWD[complement(b)], where A(0)↔T(2), C(1)↔G(3).
+// complement = b ^ 2.
 static constexpr uint64_t REV[4] = {
     0x295549f54be24456ULL, // complement(A) = T
     0x20323ed082572324ULL, // complement(C) = G
-    0x3193c18562a02b4cULL, // complement(G) = C
     0x3c8bfbb395c60474ULL, // complement(T) = A
+    0x3193c18562a02b4cULL, // complement(G) = C
 };
 
 
@@ -45,16 +47,14 @@ inline uint64_t ror64(uint64_t x, int s) noexcept { return (x >> s) | (x << (64 
 
 // ── DNA helpers ───────────────────────────────────────────────────────────────
 
-// Map ASCII DNA (ACGT, upper or lower case) to 2-bit (A=0, C=1, G=2, T=3).
+// Map ASCII DNA (ACGT, upper or lower case) to 2-bit (A=0, C=1, T=2, G=3).
 // Behaviour is undefined for non-ACGT input.
-// Bit trick: (c >> 1) & 3 maps A→0, C→1, T→2, G→3; a 4-entry table fixes G↔T.
 inline uint8_t to_2bit(char c) noexcept {
-    static constexpr uint8_t T[4] = {0, 1, 3, 2}; // indexed by (c >> 1) & 3
-    return T[(static_cast<uint8_t>(c) >> 1) & 3];
+    return (static_cast<uint8_t>(c) >> 1) & 3u;
 }
 
-// 2-bit complement: A(0)↔T(3), C(1)↔G(2).
-inline uint8_t complement_2bit(uint8_t b) noexcept { return 3u - b; }
+// 2-bit complement: A(0)↔T(2), C(1)↔G(3).
+inline uint8_t complement_2bit(uint8_t b) noexcept { return b ^ 2u; }
 
 // Returns true iff c is one of ACGT (upper or lower case).
 // Used to detect placeholder/ambiguous characters (N, gaps, …).

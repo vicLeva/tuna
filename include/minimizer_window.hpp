@@ -90,7 +90,7 @@ public:
         for (uint16_t i = 0; i < l_; ++i) {
             const uint8_t b = nt_hash::to_2bit(seq[i]);
             lmer_     |= (uint64_t(b)               << (2 * (l_ - 1 - i)));
-            lmer_bar_ |= (uint64_t(3u - b)           << (2 * i));
+            lmer_bar_ |= (uint64_t(b ^ 2u)           << (2 * i));
         }
         hasher_.init(seq);
 
@@ -102,7 +102,7 @@ public:
             const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
             const uint8_t in_2bit  = nt_hash::to_2bit(seq[i]);
             lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(3u - in_2bit) << (2 * (l_ - 1)));
+            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
             hasher_.roll(out_2bit, in_2bit);
             H[--pivot] = hasher_.canonical();
         }
@@ -116,7 +116,7 @@ public:
         const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
         const uint8_t in_2bit  = nt_hash::to_2bit(ch);
         lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(3u - in_2bit) << (2 * (l_ - 1)));
+        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
         hasher_.roll(out_2bit, in_2bit);
 
         H[pivot] = hasher_.canonical();

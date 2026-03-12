@@ -369,6 +369,18 @@ public:
         min_it.reset(s);
     }
 
+    // Initializes the k-mer window from 2-bit packed DNA in kache encoding
+    // (A=0, C=1, G=2, T=3), 4 bases/byte MSB-first.
+    // `packed` must contain at least k bases.
+    void init_packed(const uint8_t* packed)
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
+        init(buf);
+    }
+
     // Initializes the k-mer window at the beginning of the super k-mer encoding
     // `label` that has `word_count` many words and is MSB-aligned.
     void init(const uint64_t* super_kmer, const std::size_t word_count)
@@ -444,11 +456,11 @@ public:
         }
     }
 
-    const ht_t::flat_t& operator*() { assert(b < ht.cap_ && 0 <= slot && slot < B); return ht.T[b * B + slot]; }
+    const ht_t::flat_t& operator*() { assert(b < ht.cap_ && 0 <= slot && slot < static_cast<int8_t>(B)); return ht.T[b * B + slot]; }
 
-    auto checksum() const { assert(b < ht.cap_ && 0 <= slot && slot < B); return ht.M[b].cs[slot]; }
+    auto checksum() const { assert(b < ht.cap_ && 0 <= slot && slot < static_cast<int8_t>(B)); return ht.M[b].cs[slot]; }
 
-    auto min_coord() const { assert(b < ht.cap_ && 0 <= slot && slot < B); return ht.M[b].min_coord[slot]; }
+    auto min_coord() const { assert(b < ht.cap_ && 0 <= slot && slot < static_cast<int8_t>(B)); return ht.M[b].min_coord[slot]; }
 
     bool operator==(const Iterator& rhs) const { return &ht == &rhs.ht && b == rhs.b && slot == rhs.slot; }
 };
