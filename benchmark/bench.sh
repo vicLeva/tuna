@@ -79,12 +79,10 @@ STRATEGY="${STRATEGY:-hash}"
 FORMAT="${FORMAT:-fa}"
 
 # ── Validate ──────────────────────────────────────────────────────────────────
-# Use command -v so bare names (e.g. KMC_BIN=kmc) are resolved via PATH.
-require_bin() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $2 not found: $1" >&2; exit 1; }; }
-require_bin "$TUNA"      "tuna"
-require_bin "$KMC"       "kmc"
-require_bin "$KMC_TOOLS" "kmc_tools"
-[[ -f "$FOF" ]] || { echo "ERROR: file-of-files not found: $FOF" >&2; exit 1; }
+[[ -x "$TUNA"      ]] || { echo "ERROR: tuna not found at $TUNA"           >&2; exit 1; }
+[[ -x "$KMC"       ]] || { echo "ERROR: kmc not found at $KMC"             >&2; exit 1; }
+[[ -x "$KMC_TOOLS" ]] || { echo "ERROR: kmc_tools not found at $KMC_TOOLS" >&2; exit 1; }
+[[ -f "$FOF"       ]] || { echo "ERROR: file-of-files not found: $FOF"     >&2; exit 1; }
 "$GNU_TIME" -v true 2>/dev/null \
     || { echo "ERROR: $GNU_TIME -v not available (need GNU time, not bash builtin)" >&2; exit 1; }
 
@@ -132,7 +130,7 @@ drop_caches() {
 
 # Convert h:mm:ss or m:ss.cc to fractional seconds
 to_sec() {
-    awk -F: '{
+    LC_NUMERIC=C awk -F: '{
         if (NF == 3) printf "%.3f", ($1*3600 + $2*60 + $3)
         else         printf "%.3f", ($1*60  + $2)
     }'
@@ -215,7 +213,7 @@ kmc_count_wall=$(gnu_time_val "$RUN_DIR/kmc_count_time.log" wall)
 kmc_count_rss=$(gnu_time_val  "$RUN_DIR/kmc_count_time.log" rss)
 kmc_dump_wall=$(gnu_time_val  "$RUN_DIR/kmc_dump_time.log"  wall)
 kmc_dump_rss=$(gnu_time_val   "$RUN_DIR/kmc_dump_time.log"  rss)
-kmc_total=$(awk "BEGIN{printf \"%.3f\", $kmc_count_wall + $kmc_dump_wall}")
+kmc_total=$(LC_NUMERIC=C awk "BEGIN{printf \"%.3f\", $kmc_count_wall + $kmc_dump_wall}")
 
 tuna_kmers=$(wc -l < "$RUN_DIR/tuna_out.tsv")
 kmc_kmers=$(wc -l  < "$RUN_DIR/kmc_out.tsv")
@@ -224,20 +222,20 @@ echo ""
 echo "============================================================"
 echo "  Results  (k=$K, m=$M, t=$THREADS, n=$PARTS, strategy=$STRATEGY)"
 echo "============================================================"
-printf "  k-mers written:  tuna=%-12s  kmc=%s\n" "$tuna_kmers" "$kmc_kmers"
+LC_NUMERIC=C printf "  k-mers written:  tuna=%-12s  kmc=%s\n" "$tuna_kmers" "$kmc_kmers"
 echo ""
-printf "  %-8s  %-26s  %9s  %10s\n" "tool" "phase" "time (s)" "peak RSS"
-printf "  %-8s  %-26s  %9s  %10s\n" "--------" "--------------------------" "---------" "----------"
-printf "  %-8s  %-26s  %9.3f  %7s kB\n" "tuna" "total (wall)"          "$tuna_wall"       "$tuna_rss"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s  %10s\n" "tool" "phase" "time (s)" "peak RSS"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s  %10s\n" "--------" "--------------------------" "---------" "----------"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9.3f  %7s kB\n" "tuna" "total (wall)"          "$tuna_wall"       "$tuna_rss"
 if [[ -n "${tuna_p0:-}" ]]; then
-printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase0 (pre-scan)"    "$tuna_p0"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase0 (pre-scan)"    "$tuna_p0"
 fi
-printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase1 (partition)"   "${tuna_p1:-N/A}"
-printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase2 (count+write)" "${tuna_p2:-N/A}"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase1 (partition)"   "${tuna_p1:-N/A}"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s\n"           "tuna" "  phase2 (count+write)" "${tuna_p2:-N/A}"
 echo ""
-printf "  %-8s  %-26s  %9.3f  %7s kB\n" "kmc" "total (count+dump)"        "$kmc_total"       "$kmc_count_rss"
-printf "  %-8s  %-26s  %9s\n"           "kmc" "  stage1 (partition)"       "${kmc_s1:-N/A}"
-printf "  %-8s  %-26s  %9s\n"           "kmc" "  stage2 (count)"           "${kmc_s2:-N/A}"
-printf "  %-8s  %-26s  %9.3f  %7s kB\n" "kmc" "  dump (binary→TSV)"        "$kmc_dump_wall"   "$kmc_dump_rss"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9.3f  %7s kB\n" "kmc" "total (count+dump)"        "$kmc_total"       "$kmc_count_rss"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s\n"           "kmc" "  stage1 (partition)"       "${kmc_s1:-N/A}"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9s\n"           "kmc" "  stage2 (count)"           "${kmc_s2:-N/A}"
+LC_NUMERIC=C printf "  %-8s  %-26s  %9.3f  %7s kB\n" "kmc" "  dump (binary→TSV)"        "$kmc_dump_wall"   "$kmc_dump_rss"
 echo ""
 echo "  Logs: $RUN_DIR/"

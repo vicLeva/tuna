@@ -23,8 +23,11 @@
 #include "seq_source.hpp"
 
 #include <vector>
+#include <deque>
+#include <memory>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 
 
@@ -101,9 +104,15 @@ void extract_superkmers_from_actg(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// Spawns min(num_threads, n_files) threads. Each thread processes its assigned
-// input files round-robin. SeqSource delivers ACTG-only chunks regardless of
-// format or compression; extract_superkmers_from_actg maps each to superkmers.
+// Producer/consumer design: the calling thread reads all input files and pushes
+// ACTG-only chunks onto a bounded queue; num_threads workers drain the queue in
+// parallel.  Each worker owns its MinimizerWindow and SuperkmerWriters, flushing
+// to the shared bucket ofstreams under per-bucket mutexes.
+//
+// Chunks are copied into the queue so their lifetime is independent of the
+// parser / mmap.  For a 3 GB human genome the copy adds ~300 ms at ~10 GB/s
+// memcpy bandwidth — negligible against the processing time.  The queue cap
+// (QUEUE_CAP tasks) bounds peak memory to a few hundred MB at most.
 
 template <uint16_t k, uint16_t l, typename PartitionFn>
 PartitionStats partition_kmers_impl(
@@ -111,36 +120,49 @@ PartitionStats partition_kmers_impl(
     std::vector<std::ofstream>& buckets,
     PartitionFn                 partition_fn)
 {
-    const size_t n_files   = cfg.input_files.size();
-    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_files);
+    const size_t n_threads = static_cast<size_t>(cfg.num_threads);
+    const size_t n_parts   = cfg.num_partitions;
 
-    std::vector<std::mutex> bucket_mutexes(cfg.num_partitions);
+    // ── Work queue ────────────────────────────────────────────────────
+    static constexpr size_t QUEUE_CAP = 128;
+    struct Task { std::vector<char> data; };
+
+    std::mutex              q_mtx;
+    std::condition_variable q_not_empty, q_not_full;
+    std::deque<std::unique_ptr<Task>> q;
+    bool q_done = false;
+
+    std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
 
-    auto worker = [&](size_t tid) {
-        MinimizerWindow<k> min_it(l);
-        std::vector<SuperkmerWriter> writers(cfg.num_partitions);
-        SeqSource source; // reused across files; internal gz buffer only grows
-
+    // ── Workers ───────────────────────────────────────────────────────
+    auto worker = [&]() {
+        MinimizerWindow<k>           min_it(l);
+        std::vector<SuperkmerWriter> writers(n_parts);
         uint64_t local_seqs = 0, local_kmers = 0;
 
-        const auto flush_if_needed = [&]() {
-            for (size_t p = 0; p < cfg.num_partitions; ++p)
+        while (true) {
+            std::unique_ptr<Task> task;
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_not_empty.wait(lk, [&]{ return !q.empty() || q_done; });
+                if (q.empty()) break;
+                task = std::move(q.front());
+                q.pop_front();
+            }
+            q_not_full.notify_one();
+
+            extract_superkmers_from_actg<k, l>(
+                task->data.data(), task->data.size(),
+                partition_fn, min_it, writers, local_kmers);
+            ++local_seqs;
+
+            for (size_t p = 0; p < n_parts; ++p)
                 if (writers[p].needs_flush())
                     writers[p].flush_to(buckets[p], bucket_mutexes[p]);
-        };
-
-        for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                ++local_seqs;
-                extract_superkmers_from_actg<k, l>(
-                    chunk, len, partition_fn, min_it, writers, local_kmers);
-                flush_if_needed();
-            });
         }
 
-        // Final flush of any remaining buffered data.
-        for (size_t p = 0; p < cfg.num_partitions; ++p)
+        for (size_t p = 0; p < n_parts; ++p)
             writers[p].flush_to(buckets[p], bucket_mutexes[p]);
 
         total_seqs .fetch_add(local_seqs,  std::memory_order_relaxed);
@@ -150,7 +172,29 @@ PartitionStats partition_kmers_impl(
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
     for (size_t t = 0; t < n_threads; ++t)
-        threads.emplace_back(worker, t);
+        threads.emplace_back(worker);
+
+    // ── Producer (calling thread) ──────────────────────────────────────
+    SeqSource source;
+    for (const auto& path : cfg.input_files) {
+        source.process(path, [&](const char* chunk, size_t len) {
+            auto task = std::make_unique<Task>();
+            task->data.assign(chunk, chunk + len);
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_not_full.wait(lk, [&]{ return q.size() < QUEUE_CAP; });
+                q.push_back(std::move(task));
+            }
+            q_not_empty.notify_one();
+        });
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(q_mtx);
+        q_done = true;
+    }
+    q_not_empty.notify_all();
+
     for (auto& th : threads) th.join();
 
     return { total_seqs.load(), total_kmers.load() };

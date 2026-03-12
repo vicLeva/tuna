@@ -38,8 +38,7 @@ int run(const Config& cfg)
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
-    const size_t p1_threads = std::min(static_cast<size_t>(cfg.num_threads),
-                                       cfg.input_files.size());
+    const size_t p1_threads = static_cast<size_t>(cfg.num_threads);
     if (!cfg.hide_progress)
         std::cerr << "[1/2] Partitioning into " << cfg.num_partitions
                   << " partitions  (" << p1_threads << " thread"

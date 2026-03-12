@@ -35,8 +35,11 @@
 #include "seq_source.hpp"
 
 #include <vector>
+#include <deque>
+#include <memory>
 #include <fstream>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <cassert>
@@ -488,12 +491,9 @@ std::vector<uint64_t> scan_kmc_sig_counts(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// Spawns min(num_threads, n_files) threads, round-robin file assignment.
-// Each thread runs extract_superkmers_kmc per sequence, flushing per-bucket
-// SuperkmerWriters to the shared ofstreams under per-bucket mutexes.
-//
-// The template parameter l is carried for interface consistency with the other
-// partition_kmers variants; the KMC signature length comes from cfg.kmc_sig_len.
+// Producer/consumer design (same as partition_hash.hpp): the calling thread
+// reads all input files and pushes ACTG-only chunks onto a bounded queue;
+// num_threads workers drain the queue in parallel.
 
 template <uint16_t k, uint16_t /* l */>
 PartitionStats partition_kmers_kmc(
@@ -502,28 +502,45 @@ PartitionStats partition_kmers_kmc(
     const KmcNormTable&         nt,
     const KmcPartMap&           pm)
 {
-    const size_t n_files   = cfg.input_files.size();
-    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_files);
+    const size_t n_threads = static_cast<size_t>(cfg.num_threads);
+    const size_t n_parts   = cfg.num_partitions;
 
-    std::vector<std::mutex> bucket_mutexes(cfg.num_partitions);
+    static constexpr size_t QUEUE_CAP = 128;
+    struct Task { std::vector<char> data; };
+
+    std::mutex              q_mtx;
+    std::condition_variable q_not_empty, q_not_full;
+    std::deque<std::unique_ptr<Task>> q;
+    bool q_done = false;
+
+    std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
 
-    auto worker = [&](size_t tid) {
-        std::vector<SuperkmerWriter> writers(cfg.num_partitions);
+    auto worker = [&]() {
+        std::vector<SuperkmerWriter> writers(n_parts);
         uint64_t local_seqs = 0, local_kmers = 0;
 
-        SeqSource source;
-        for (size_t fi = tid; fi < n_files; fi += n_threads) {
-            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                ++local_seqs;
-                extract_superkmers_kmc<k>(chunk, len, nt, pm, writers, local_kmers);
-                for (size_t p = 0; p < cfg.num_partitions; ++p)
-                    if (writers[p].needs_flush())
-                        writers[p].flush_to(buckets[p], bucket_mutexes[p]);
-            });
+        while (true) {
+            std::unique_ptr<Task> task;
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_not_empty.wait(lk, [&]{ return !q.empty() || q_done; });
+                if (q.empty()) break;
+                task = std::move(q.front());
+                q.pop_front();
+            }
+            q_not_full.notify_one();
+
+            extract_superkmers_kmc<k>(task->data.data(), task->data.size(),
+                                     nt, pm, writers, local_kmers);
+            ++local_seqs;
+
+            for (size_t p = 0; p < n_parts; ++p)
+                if (writers[p].needs_flush())
+                    writers[p].flush_to(buckets[p], bucket_mutexes[p]);
         }
 
-        for (size_t p = 0; p < cfg.num_partitions; ++p)
+        for (size_t p = 0; p < n_parts; ++p)
             writers[p].flush_to(buckets[p], bucket_mutexes[p]);
 
         total_seqs .fetch_add(local_seqs,  std::memory_order_relaxed);
@@ -533,7 +550,28 @@ PartitionStats partition_kmers_kmc(
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
     for (size_t t = 0; t < n_threads; ++t)
-        threads.emplace_back(worker, t);
+        threads.emplace_back(worker);
+
+    SeqSource source;
+    for (const auto& path : cfg.input_files) {
+        source.process(path, [&](const char* chunk, size_t len) {
+            auto task = std::make_unique<Task>();
+            task->data.assign(chunk, chunk + len);
+            {
+                std::unique_lock<std::mutex> lk(q_mtx);
+                q_not_full.wait(lk, [&]{ return q.size() < QUEUE_CAP; });
+                q.push_back(std::move(task));
+            }
+            q_not_empty.notify_one();
+        });
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(q_mtx);
+        q_done = true;
+    }
+    q_not_empty.notify_all();
+
     for (auto& th : threads) th.join();
 
     return { total_seqs.load(), total_kmers.load() };
