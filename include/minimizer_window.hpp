@@ -3,11 +3,14 @@
 // MinimizerWindow<k> — streaming l-minimizer iterator using canonical ntHash.
 //
 // Used in:
-//   Phase 1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
-//   Phase 2 (kache-hash Kmer_Window) — replaces Min_Iterator<k,l> (XXH3).
+//   Phase 0+1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
+//   Phase 2   (kache-hash Kmer_Window) — field replaces Min_Iterator<k,l> (XXH3),
+//             but bypassed for hash/kmtricks superkmers (min_pos byte used instead);
+//             only active for KMC-mode superkmers (min_pos == 0xFF fallback).
 //
 // Algorithm: two-stack (prefix/suffix) sliding window minimum over ntHash values.
-// O(k) space, O(1) amortised per advance() call.
+// O(k-l) active entries (arrays sized k for compile-time template sizing),
+// O(1) amortised per advance() call.
 //
 // Two input encodings are supported:
 //   ASCII  — advance(char ch)         uses nt_hash::to_2bit() (A=0,C=1,T=2,G=3)
@@ -43,17 +46,25 @@ class MinimizerWindow {
 
     // ── Two-stack sliding window minimum ─────────────────────────────────────
     //
-    // H[0..w] stores canonical l-mer hashes in REVERSED position order:
-    //   H[w-1] = hash of the FIRST (leftmost) l-mer in the current k-mer
-    //   H[0]   = hash of the LAST  (rightmost) l-mer in the current k-mer
-    // where w = k - l (= number of l-mer positions per k-mer minus 1).
+    // H[0..w] is a circular overwrite buffer, w = k - l.
+    // pivot is the index where the NEXT hash will be written (= current leftmost,
+    // the l-mer that will be evicted on the next advance).
     //
-    // M_pre[i] = min(H[0..i])   — prefix minimums from the right end.
-    // M_suf    = running min of the current suffix (left) half.
+    // Invariant when pivot = p (0 < p < w):
+    //   H[p]   = leftmost l-mer of the current window (will be evicted next)
+    //   H[p+1] = rightmost l-mer (just written)
+    //   H[p+2..w], H[0..p-1] = the w-1 intermediate l-mers
+    //
+    // After reset_windows() (pivot reset to w):
+    //   H[w]   = leftmost l-mer  (will be evicted on the first advance)
+    //   H[0]   = rightmost l-mer (most recently written before the reset)
+    //
+    // M_pre[i] = min(H[0..i])   — prefix minimums from the rightmost end.
+    // M_suf    = running min of the suffix (rightmost/newer) half since last reset.
     // pivot    = index into H[] where the next new hash will be written.
     //
     // hash() = min(M_pre[pivot], M_suf).
-    // When pivot wraps to 0 the suffix becomes the new prefix (reset_windows).
+    // When pivot reaches 0 the suffix becomes the new prefix (reset_windows).
 
     uint64_t    H[k];
     uint64_t    M_pre[k];
