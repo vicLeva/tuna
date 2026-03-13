@@ -68,7 +68,7 @@ int run(const Config& cfg)
         if (!cfg.hide_progress)
             std::cerr << "    [0/2] Scanning minimizer frequencies (kmtricks)...\n";
         const auto t_scan = std::chrono::steady_clock::now();
-        auto counts = scan_minimizer_counts<k>(cfg);
+        auto counts = scan_minimizer_counts<k, l>(cfg);
         rt.emplace(RepartitionTable::from_counts(counts, cfg.num_partitions));
         t_phase0 = elapsed_s(t_scan);
     }

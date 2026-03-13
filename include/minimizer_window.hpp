@@ -1,6 +1,6 @@
 #pragma once
 
-// MinimizerWindow<k> — streaming l-minimizer iterator using canonical ntHash.
+// MinimizerWindow<k, l> — streaming l-minimizer iterator using canonical ntHash.
 //
 // Used in:
 //   Phase 0+1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
@@ -9,7 +9,7 @@
 //             only active for KMC-mode superkmers (min_pos == 0xFF fallback).
 //
 // Algorithm: two-stack (prefix/suffix) sliding window minimum over ntHash values.
-// O(k-l) active entries (arrays sized k for compile-time template sizing),
+// Window size w = k - l; arrays sized exactly w+1 for compact cache footprint.
 // O(1) amortised per advance() call.
 //
 // Two input encodings are supported:
@@ -18,7 +18,7 @@
 //            converts to nt via b ^ (b >> 1), then calls advance_impl().
 //
 // Public interface:
-//   MinimizerWindow<k> win(l);
+//   MinimizerWindow<k, l> win;
 //   win.reset(seq);              // initialise to first k ASCII characters
 //   uint64_t h = win.hash();     // canonical ntHash of the l-minimizer
 //   win.advance(ch);             // slide by one ASCII character
@@ -28,25 +28,28 @@
 #include "nt_hash.hpp"
 
 #include <cstdint>
-#include <cassert>
 #include <limits>
 
-template <uint16_t k>
+template <uint16_t k, uint16_t l>
 class MinimizerWindow {
+    static_assert(l < k, "minimizer length l must be strictly less than k-mer length k");
 
-    uint16_t l_;
-    const uint64_t clear_msn_;  // mask to clear the top 2 bits of the 2*l-bit l-mer
+    // Window size: number of l-mers in a k-mer window.
+    static constexpr uint16_t w = k - l;
+
+    // Mask to clear the top 2 bits of the 2*l-bit l-mer (used in advance_impl).
+    static constexpr uint64_t clear_msn_ = ~(uint64_t(0b11) << (2 * (l - 1)));
 
     // 2-bit packed l-mer (forward and RC), tracked to extract the outgoing
     // base cheaply when rolling the ntHash.  nt encoding (A=0,C=1,T=2,G=3).
     uint64_t lmer_     = 0;
     uint64_t lmer_bar_ = 0;
 
-    nt_hash::Roller hasher_;
+    nt_hash::Roller<l> hasher_;
 
     // ── Two-stack sliding window minimum ─────────────────────────────────────
     //
-    // H[0..w] is a circular overwrite buffer, w = k - l.
+    // H[0..w] is a circular overwrite buffer of w+1 entries.
     // pivot is the index where the NEXT hash will be written (= current leftmost,
     // the l-mer that will be evicted on the next advance).
     //
@@ -66,8 +69,8 @@ class MinimizerWindow {
     // hash() = min(M_pre[pivot], M_suf).
     // When pivot reaches 0 the suffix becomes the new prefix (reset_windows).
 
-    uint64_t    H[k];
-    uint64_t    M_pre[k];
+    uint64_t    H[w + 1];
+    uint64_t    M_pre[w + 1];
     uint64_t    M_suf  = 0;
     std::size_t pivot  = 0;
 
@@ -75,7 +78,6 @@ class MinimizerWindow {
     static constexpr auto umin = [](uint64_t a, uint64_t b) noexcept { return a < b ? a : b; };
 
     void reset_windows() noexcept {
-        const std::size_t w = k - l_;
         M_pre[0] = H[0];
         for (std::size_t i = 1; i <= w; ++i)
             M_pre[i] = umin(M_pre[i - 1], H[i]);
@@ -85,9 +87,9 @@ class MinimizerWindow {
 
     // Core slide: `in_2bit` is nt-encoded (A=0,C=1,T=2,G=3).
     void advance_impl(uint8_t in_2bit) noexcept {
-        const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
+        const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l - 1))) & 0x3u;
         lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
+        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
         hasher_.roll(out_2bit, in_2bit);
 
         H[pivot] = hasher_.canonical();
@@ -101,34 +103,28 @@ class MinimizerWindow {
 
 public:
 
-    explicit MinimizerWindow(uint16_t l) noexcept
-        : l_(l)
-        , clear_msn_(~(uint64_t(0b11) << (2 * (l - 1))))
-        , hasher_(l)
-    {
-        assert(l < k);
-    }
+    MinimizerWindow() noexcept = default;
 
     // Initialise to the first k characters of `seq` (ASCII ACGT, any case).
     // `seq` must contain at least k valid DNA characters.
     void reset(const char* seq) noexcept {
         lmer_     = 0;
         lmer_bar_ = 0;
-        for (uint16_t i = 0; i < l_; ++i) {
+        for (uint16_t i = 0; i < l; ++i) {
             const uint8_t b = nt_hash::to_2bit(seq[i]);
-            lmer_     |= (uint64_t(b)       << (2 * (l_ - 1 - i)));
-            lmer_bar_ |= (uint64_t(b ^ 2u)  << (2 * i));
+            lmer_     |= (uint64_t(b)      << (2 * (l - 1 - i)));
+            lmer_bar_ |= (uint64_t(b ^ 2u) << (2 * i));
         }
         hasher_.init(seq);
 
-        pivot    = k - l_;
+        pivot    = w;
         H[pivot] = hasher_.canonical();
 
-        for (uint16_t i = l_; i < k; ++i) {
-            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l_ - 1))) & 0x3u;
+        for (uint16_t i = l; i < k; ++i) {
+            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l - 1))) & 0x3u;
             const uint8_t in_2bit  = nt_hash::to_2bit(seq[i]);
             lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l_ - 1)));
+            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
             hasher_.roll(out_2bit, in_2bit);
             H[--pivot] = hasher_.canonical();
         }

@@ -119,7 +119,7 @@ struct RepartitionTable
 // assignment, per-thread local uint32_t counts merged to uint64_t at the end.
 // Per-thread memory: 4^nb_bits × 4 bytes (≈4 MB for nb_bits=10).
 
-template <uint16_t k>
+template <uint16_t k, uint16_t l>
 std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REPART_BITS)
 {
     const uint64_t table_sz = uint64_t(1) << (2 * nb_bits);
@@ -134,7 +134,7 @@ std::vector<uint64_t> scan_minimizer_counts(const Config& cfg, int nb_bits = REP
 
     auto worker = [&](size_t tid) {
         auto& local = thr_counts[tid];
-        MinimizerWindow<k> min_it(cfg.l);
+        MinimizerWindow<k, l> min_it;
 
         SeqSource source;
         for (size_t fi = tid; fi < n_files; fi += n_threads) {

@@ -126,6 +126,17 @@ private:
 
     std::atomic_uint16_t registered_thread_count;   // Number of threads registered to use the table.
     std::atomic_uint64_t approx_sz; // Approximate size (lower bound) of the hash table.
+    std::atomic_uint64_t ov_approx_sz_; // Approximate count of new overflow inserts.
+    uint64_t ov_resize_th_;             // Overflow insert count at which to trigger resize.
+
+    // Histogram of overflow inserts by minimizer hash (top 16 bits of nt_h → 65536 bins).
+    // Populated by the public upsert when a new k-mer goes to overflow.
+    static constexpr std::size_t OV_HIST_BITS = 16;
+    static constexpr std::size_t OV_HIST_SIZE = std::size_t(1) << OV_HIST_BITS;
+    std::vector<std::atomic_uint64_t> ov_min_hist_;
+
+    // Thread-local flag: set by the overflow insert path, read by the public upsert.
+    static thread_local bool tl_ov_happened_;
     std::vector<Padded<uint64_t>> checkpoint;   // `checkpoint[i]` is the number of elements remaining to be added by the `i`'th user thread before it checks for a resize.
     static constexpr uint64_t resize_checkpoint = 16384;    // Checkpoint number of elements for a user thread to add before checking for resize.
 
@@ -267,6 +278,28 @@ public:
     // Returns the size of the overflow table.
     std::size_t overflow_size() const { return ov->size();  }
 
+    // Returns the total number of new k-mers inserted into overflow.
+    uint64_t overflow_insert_count() const { return ov_approx_sz_.load(std::memory_order_relaxed); }
+
+    // Returns the top-N (minimizer_bin, overflow_count) pairs sorted descending.
+    // minimizer_bin = top OV_HIST_BITS bits of the canonical ntHash minimizer value.
+    std::vector<std::pair<uint32_t, uint64_t>> overflow_top_minimizers(std::size_t n) const
+    {
+        std::vector<std::pair<uint32_t, uint64_t>> result;
+        result.reserve(OV_HIST_SIZE);
+        for(std::size_t i = 0; i < OV_HIST_SIZE; ++i)
+        {
+            const auto cnt = ov_min_hist_[i].load(std::memory_order_relaxed);
+            if(cnt > 0) result.emplace_back(static_cast<uint32_t>(i), cnt);
+        }
+        std::partial_sort(result.begin(),
+                          result.begin() + std::min(n, result.size()),
+                          result.end(),
+                          [](const auto& a, const auto& b){ return a.second > b.second; });
+        if(result.size() > n) result.resize(n);
+        return result;
+    }
+
     // Clears the table.
     void clear();
 
@@ -366,7 +399,7 @@ class Kmer_Window
 
     Directed_Vertex<k>    v;
     Rolling_Hash<k, true> rh;
-    MinimizerWindow<k>    nt_min{static_cast<uint16_t>(l)};
+    MinimizerWindow<k, l> nt_min;
     uint64_t              precomp_nt_h_ = 0;
     bool                  use_precomp_  = false;
 
@@ -520,6 +553,9 @@ inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Streaming_Kmer_Hash_Table(const
     , ov_new(nullptr)
     , registered_thread_count(0)
     , approx_sz(0)
+    , ov_approx_sz_(0)
+    , ov_resize_th_(static_cast<uint64_t>(capacity() * of_default * 0.5))
+    , ov_min_hist_(OV_HIST_SIZE)
     , checkpoint(std::thread::hardware_concurrency(), resize_checkpoint)
     , resize_worker_c(resize_worker_c)
 {
@@ -540,6 +576,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::clear()
     std::memset(M, 0, cap_ * sizeof(Metadata)); // Checksum `0` denotes absence of a key.
 
     approx_sz = 0;
+    ov_approx_sz_.store(0, std::memory_order_relaxed);
+    for(auto& bin : ov_min_hist_) bin.store(0, std::memory_order_relaxed);
     std::for_each(checkpoint.begin(), checkpoint.end(), [](auto& c){ c = resize_checkpoint; });
 
     ov->clear();
@@ -833,7 +871,7 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     {
         approx_sz += resize_checkpoint;
         cp = resize_checkpoint;
-        if(approx_sz >= resize_th)
+        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
             try_resize();
     }
 
@@ -861,7 +899,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     {
         approx_sz += resize_checkpoint;
         cp = resize_checkpoint;
-        if(approx_sz >= resize_th)
+        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
             try_resize();
     }
 
@@ -880,9 +918,13 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
+    tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = upsert(w.v.canonical(), c, h, m, f, val);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
+
+    if(tl_ov_happened_)
+        ov_min_hist_[nt_h >> (64 - OV_HIST_BITS)].fetch_add(1, std::memory_order_relaxed);
 
     auto& cp = checkpoint[token.id].unwrap();
     cp -= (r == null_val);
@@ -890,7 +932,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     {
         approx_sz += resize_checkpoint;
         cp = resize_checkpoint;
-        if(approx_sz >= resize_th)
+        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
             try_resize();
     }
 
@@ -960,10 +1002,15 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, co
             {
                 unlock_ordered(p, q);
                 if constexpr(is_set_)
-                    return ov->insert(x, Overflow_Set_Val(c, m));
+                {
+                    const auto ov_r = ov->insert(x, Overflow_Set_Val(c, m));
+                    ov_approx_sz_.fetch_add(!ov_r, std::memory_order_relaxed);
+                    return ov_r;
+                }
                 else
                 {
                     const auto p = ov->insert(x.first, Overflow_Map_Val(c, m, x.second));
+                    ov_approx_sz_.fetch_add(!p, std::memory_order_relaxed);
                     return !p ? null_val : val_t(p->val);
                 }
             }
@@ -985,7 +1032,7 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
     char buf[k];
     for (uint16_t i = 0; i < k; ++i)
         buf[i] = B2C[key.base_at(k - 1 - i)];
-    static thread_local MinimizerWindow<k> tmp_win(l);
+    static thread_local MinimizerWindow<k, l> tmp_win;
     tmp_win.reset(buf);
     const auto nt_h = tmp_win.hash();
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
@@ -1100,6 +1147,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
                     });
                 if(r) return val_t(r->val);
                 ov->insert(key, Overflow_Map_Val(c, m, val));
+                ov_approx_sz_.fetch_add(1, std::memory_order_relaxed);
+                tl_ov_happened_ = true;
                 return null_val;
             }
 
@@ -1114,7 +1163,7 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_resize()
 {
     if constexpr(mt_)   table_lock.lock();
 
-    if(approx_sz >= resize_th)
+    if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
         resize();
 
     if constexpr(mt_)   table_lock.unlock();
@@ -1164,6 +1213,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::resize()
     M_new = nullptr, T_new = nullptr, ov_new = nullptr;
 
     resize_th = capacity() * lf;
+    ov_approx_sz_.store(0, std::memory_order_relaxed);
+    ov_resize_th_ = static_cast<uint64_t>(capacity() * of_default * 0.5);
 
     const auto t_e = now();
     std::cerr << "Resize is triggered at size: " << size() << "; main table size: " << main_table_size() << "; overflow size: " << overflow_size() << "\n";
@@ -1250,6 +1301,11 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::report_stats() const
     std::cerr   << "========================================\n";
 
 }
+
+
+// Thread-local flag: set by overflow insert path, consumed by public upsert.
+template <uint16_t k, bool mt_, typename T_, uint16_t l>
+thread_local bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::tl_ov_happened_ = false;
 
 
 }

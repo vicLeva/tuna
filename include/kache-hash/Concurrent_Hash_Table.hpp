@@ -175,16 +175,10 @@ inline std::size_t Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::size() cons
 template <typename T_key_, typename T_val_, typename T_hasher_>
 inline const T_val_* Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::insert(const T_key_ key, const T_val_ val)
 {
-#ifndef NDEBUG
-    std::size_t tried_slots = 0;
-#endif
-
     bool success = false;
 
-    for(std::size_t i = hash_to_idx(hash(key)); ; i = next_index(i))
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
     {
-        assert(++tried_slots <= capacity_);
-
         if(T[i].key == empty_key_)
         {
             lock[i].lock();
@@ -201,23 +195,17 @@ inline const T_val_* Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::insert(co
             return &T[i].val;
     }
 
-    return &T[0].val;   // Placeholder.
+    return &T[0].val;   // Table full — silently treat as already present.
 }
 
 
 template <typename T_key_, typename T_val_, typename T_hasher_>
 inline std::optional<T_val_> Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::upsert(const T_key_ key, const T_val_ val)
 {
-#ifndef NDEBUG
-    std::size_t tried_slots = 0;
-#endif
-
     bool success = false;
 
-    for(std::size_t i = hash_to_idx(hash(key)); ; i = next_index(i))
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
     {
-        assert(++tried_slots <= capacity_);
-
         if(T[i].key == empty_key_)
         {
             lock[i].lock();
@@ -241,7 +229,7 @@ inline std::optional<T_val_> Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::u
         }
     }
 
-    return T[0].val;    // Placeholder.
+    return T[0].val;    // Table full — placeholder.
 }
 
 
@@ -276,7 +264,7 @@ template <typename T_key_, typename T_val_, typename T_hasher_>
 template <typename F>
 inline std::optional<T_val_> Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::find_and_update(const T_key_ key, const F& f)
 {
-    for(std::size_t i = hash_to_idx(hash(key)); ; i = next_index(i))
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
     {
         if(T[i].key == key)
         {
@@ -289,6 +277,7 @@ inline std::optional<T_val_> Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::f
         else if(T[i].key == empty_key_)
             return std::nullopt;
     }
+    return std::nullopt;  // Table full — key not found.
 }
 
 

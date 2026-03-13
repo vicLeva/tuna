@@ -49,7 +49,7 @@
 template <uint16_t l>
 static uint8_t find_minimizer_pos(const char* seq, uint8_t len) noexcept
 {
-    nt_hash::Roller roller(l);
+    nt_hash::Roller<l> roller;
     roller.init(seq);
     uint64_t min_h = roller.canonical();
     uint8_t  min_p = 0;
@@ -66,7 +66,7 @@ void extract_superkmers_from_actg(
     const char* const             seq,
     const size_t                  seq_len,
     PartitionFn&&                 partition_fn,
-    MinimizerWindow<k>&           min_it,
+    MinimizerWindow<k, l>&        min_it,
     std::vector<SuperkmerWriter>& writers,
     uint64_t&                     kmer_count)
 {
@@ -137,7 +137,7 @@ PartitionStats partition_kmers_impl(
 
     // ── Workers ───────────────────────────────────────────────────────
     auto worker = [&]() {
-        MinimizerWindow<k>           min_it(l);
+        MinimizerWindow<k, l>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts);
         uint64_t local_seqs = 0, local_kmers = 0;
 

@@ -79,27 +79,27 @@ inline bool is_dna(char c) noexcept {
 // Rolling update:
 //   H_rev_new = ror(H_rev, 1) ^ ror(REV[s_out], 1) ^ rol(REV[s_in], l-1)
 
+template <uint16_t l>
 class Roller {
     uint64_t fwd_ = 0, rev_ = 0;
-    uint16_t l_;
 
 public:
-    explicit Roller(uint16_t l) noexcept : l_(l) {}
+    Roller() noexcept = default;
 
     // Initialise from seq[0..l-1].
     void init(const char* seq) noexcept {
         fwd_ = 0; rev_ = 0;
-        for (uint16_t i = 0; i < l_; ++i) {
+        for (uint16_t i = 0; i < l; ++i) {
             const uint8_t b = to_2bit(seq[i]);
-            fwd_ ^= rol64(FWD[b], l_ - 1 - i);
+            fwd_ ^= rol64(FWD[b], l - 1 - i);
             rev_ ^= rol64(REV[b], i);
         }
     }
 
     // Slide the window: `out_2bit` leaves from the left, `in_2bit` enters on the right.
     void roll(uint8_t out_2bit, uint8_t in_2bit) noexcept {
-        fwd_ = rol64(fwd_, 1) ^ rol64(FWD[out_2bit], l_) ^ FWD[in_2bit];
-        rev_ = ror64(rev_, 1) ^ ror64(REV[out_2bit], 1) ^ rol64(REV[in_2bit], l_ - 1);
+        fwd_ = rol64(fwd_, 1) ^ rol64(FWD[out_2bit], l) ^ FWD[in_2bit];
+        rev_ = ror64(rev_, 1) ^ ror64(REV[out_2bit], 1) ^ rol64(REV[in_2bit], l - 1);
     }
 
     uint64_t fwd()       const noexcept { return fwd_; }

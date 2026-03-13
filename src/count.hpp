@@ -19,6 +19,7 @@
 #include <atomic>
 #include <utility>
 #include <algorithm>
+#include <iomanip>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -52,7 +53,7 @@ uint64_t count_partition(
             const uint8_t p = static_cast<uint8_t>(pos + i);
             buf[i] = KACHE2ASCII[(packed[p >> 2] >> (6u - 2u * (p & 3u))) & 3u];
         }
-        nt_hash::Roller roller(l);
+        nt_hash::Roller<l> roller;
         roller.init(buf);
         return roller.canonical();
     };
@@ -159,6 +160,11 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
 
+    // Overflow statistics accumulated across all partitions.
+    std::mutex                                     ov_stats_mutex;
+    std::vector<std::pair<uint32_t, uint64_t>>     ov_top_global;   // merged top minimizers
+    std::atomic<uint64_t>                          ov_total{0};
+
     auto worker = [&](size_t tid) {
         typename table_t::Token token;
         std::string chunk;
@@ -174,6 +180,23 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
             const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
+
+            // Collect per-partition overflow stats.
+            const uint64_t ov_cnt = table.overflow_insert_count();
+            if(ov_cnt > 0)
+            {
+                ov_total.fetch_add(ov_cnt, std::memory_order_relaxed);
+                auto top = table.overflow_top_minimizers(20);
+                std::lock_guard<std::mutex> lg(ov_stats_mutex);
+                // Merge into global top list.
+                for(auto& [bin, cnt] : top)
+                {
+                    auto it = std::find_if(ov_top_global.begin(), ov_top_global.end(),
+                                           [bin](const auto& e){ return e.first == bin; });
+                    if(it != ov_top_global.end()) it->second += cnt;
+                    else ov_top_global.emplace_back(bin, cnt);
+                }
+            }
         }
     };
 
@@ -182,6 +205,31 @@ std::pair<uint64_t, uint64_t> count_and_write(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
+
+    // Print overflow summary (always printed to stderr, regardless of -hp).
+    if(ov_total.load() > 0)
+    {
+        const uint64_t tot_ov = ov_total.load();
+        const uint64_t tot_ins = total_inserted.load();
+        std::cerr << "[overflow] " << tot_ov << " k-mers went to overflow ("
+                  << std::fixed << std::setprecision(2)
+                  << (100.0 * tot_ov / tot_ins) << "% of total)\n";
+
+        // Sort global top and print top-20.
+        std::partial_sort(ov_top_global.begin(),
+                          ov_top_global.begin() + std::min(std::size_t(20), ov_top_global.size()),
+                          ov_top_global.end(),
+                          [](const auto& a, const auto& b){ return a.second > b.second; });
+        if(ov_top_global.size() > 20) ov_top_global.resize(20);
+
+        std::cerr << "[overflow] top minimizer bins (top 16 bits of ntHash canonical):\n";
+        std::cerr << "  rank     bin_id (hex)     overflow_kmers\n";
+        for(std::size_t i = 0; i < ov_top_global.size(); ++i)
+            std::cerr << "  " << std::setw(4) << (i+1)
+                      << "     0x" << std::hex << std::setw(4) << std::setfill('0') << ov_top_global[i].first
+                      << std::dec << std::setfill(' ')
+                      << "     " << ov_top_global[i].second << "\n";
+    }
 
     return { total_inserted.load(), total_written.load() };
 }
