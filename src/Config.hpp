@@ -28,6 +28,7 @@ struct Config {
     uint16_t     kmc_sig_len   = 9;    // KMC signature length (5–11, default 9)
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
+    bool         ram_mode      = false; // skip disk partitions: insert k-mers directly into in-RAM tables
 
     // Returns the strategy prefix used in partition file names.
     std::string partition_prefix() const {

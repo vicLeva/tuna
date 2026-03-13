@@ -102,9 +102,9 @@ uint64_t count_partition(
 
 // ─── Output brick ─────────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t l, bool mt_ = false>
 uint64_t write_counts(
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, l>& table,
     const Config&   cfg,
     std::string&    chunk,
     std::ofstream&  out,

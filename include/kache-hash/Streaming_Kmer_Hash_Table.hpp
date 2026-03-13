@@ -426,6 +426,18 @@ public:
         init(buf);
     }
 
+    // Initializes the k-mer window from ASCII sequence `s` with a precomputed
+    // canonical ntHash of the minimizer l-mer (e.g. from MinimizerWindow::hash()).
+    // Skips MinimizerWindow::reset() — nt_h is reused for all k-mers in the
+    // superkmer since they all share the same minimizer.
+    void init_with_hash_ascii(const char* const s, uint64_t nt_h)
+    {
+        v = Directed_Vertex<k>(Kmer<k>(s));
+        rh.init(s);
+        precomp_nt_h_ = nt_h;
+        use_precomp_  = true;
+    }
+
     // Initializes the k-mer window from packed data with a precomputed canonical
     // ntHash of the minimizer l-mer (from the stored min_pos header byte).
     // Skips MinimizerWindow::reset() — nt_h is reused for all k-mers in the

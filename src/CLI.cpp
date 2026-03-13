@@ -40,6 +40,9 @@ void print_usage(const char* prog)
         "              load-balanced signature->partition table (Phase 0).\n"
         "  -s  <int>   KMC signature length (KMC strategy only) [default: 9, range 5-11]\n"
         "\n"
+        "  -ram        RAM mode: skip disk partition files, insert k-mers directly\n"
+        "              into in-memory tables (hash strategy only). Faster when I/O\n"
+        "              is the bottleneck; requires O(unique_kmers) RAM upfront.\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
@@ -99,6 +102,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         } else if (arg == "-s") {
             const char* v = next_val("-s"); if (!v) return false;
             cfg.kmc_sig_len = static_cast<uint16_t>(std::stoul(v));
+        } else if (arg == "-ram") {
+            cfg.ram_mode = true;
         } else if (arg == "-hp") {
             cfg.hide_progress = true;
         } else if (arg == "-kt") {

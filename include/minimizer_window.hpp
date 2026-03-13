@@ -24,6 +24,8 @@
 //   win.advance(ch);             // slide by one ASCII character
 //   win.advance_kache(b);        // slide by one kache-encoded base
 //   win.hash(min_coord);         // hash + dummy min_coord (for kache-hash API)
+//   win.min_lmer_pos();          // absolute position of the minimizer l-mer
+//                                //   (0 = first l-mer passed to reset())
 
 #include "nt_hash.hpp"
 
@@ -68,21 +70,41 @@ class MinimizerWindow {
     //
     // hash() = min(M_pre[pivot], M_suf).
     // When pivot reaches 0 the suffix becomes the new prefix (reset_windows).
+    //
+    // Position tracking (H_pos[], M_pre_pos[], M_suf_pos):
+    //   Each H[i] has a paired H_pos[i] = absolute position (0-indexed from
+    //   the first l-mer passed to reset()) of that l-mer.  M_pre_pos[i] and
+    //   M_suf_pos mirror the position of the minimum alongside the hash.
+    //   min_lmer_pos() returns the position of the current minimizer with no
+    //   extra work — avoids the O(superkmer_len) find_minimizer_pos rescan.
 
     uint64_t    H[w + 1];
+    uint64_t    H_pos[w + 1];     // absolute l-mer position for each H[] entry
     uint64_t    M_pre[w + 1];
-    uint64_t    M_suf  = 0;
-    std::size_t pivot  = 0;
+    uint64_t    M_pre_pos[w + 1]; // position of the minimum in each prefix slice
+    uint64_t    M_suf     = 0;
+    uint64_t    M_suf_pos = 0;
+    std::size_t pivot     = 0;
+    uint64_t    next_pos_ = 0;    // absolute position of the next l-mer to be written
 
     static constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
     static constexpr auto umin = [](uint64_t a, uint64_t b) noexcept { return a < b ? a : b; };
 
     void reset_windows() noexcept {
-        M_pre[0] = H[0];
-        for (std::size_t i = 1; i <= w; ++i)
-            M_pre[i] = umin(M_pre[i - 1], H[i]);
-        M_suf  = U64_MAX;
-        pivot  = w;
+        M_pre[0]     = H[0];
+        M_pre_pos[0] = H_pos[0];
+        for (std::size_t i = 1; i <= w; ++i) {
+            if (H[i] < M_pre[i - 1]) {
+                M_pre[i]     = H[i];
+                M_pre_pos[i] = H_pos[i];
+            } else {
+                M_pre[i]     = M_pre[i - 1];
+                M_pre_pos[i] = M_pre_pos[i - 1];
+            }
+        }
+        M_suf     = U64_MAX;
+        M_suf_pos = 0;
+        pivot     = w;
     }
 
     // Core slide: `in_2bit` is nt-encoded (A=0,C=1,T=2,G=3).
@@ -92,8 +114,11 @@ class MinimizerWindow {
         lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
         hasher_.roll(out_2bit, in_2bit);
 
-        H[pivot] = hasher_.canonical();
-        M_suf    = umin(M_suf, H[pivot]);
+        const uint64_t h    = hasher_.canonical();
+        const uint64_t pos  = next_pos_++;
+        H[pivot]     = h;
+        H_pos[pivot] = pos;
+        if (h < M_suf) { M_suf = h; M_suf_pos = pos; }
 
         if (pivot > 0)
             --pivot;
@@ -107,6 +132,7 @@ public:
 
     // Initialise to the first k characters of `seq` (ASCII ACGT, any case).
     // `seq` must contain at least k valid DNA characters.
+    // After reset(), positions are 0-indexed from seq[0].
     void reset(const char* seq) noexcept {
         lmer_     = 0;
         lmer_bar_ = 0;
@@ -117,8 +143,9 @@ public:
         }
         hasher_.init(seq);
 
-        pivot    = w;
-        H[pivot] = hasher_.canonical();
+        pivot       = w;
+        H[pivot]    = hasher_.canonical();
+        H_pos[pivot]= 0; // l-mer seq[0..l-1] is at position 0
 
         for (uint16_t i = l; i < k; ++i) {
             const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l - 1))) & 0x3u;
@@ -126,8 +153,11 @@ public:
             lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
             lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
             hasher_.roll(out_2bit, in_2bit);
-            H[--pivot] = hasher_.canonical();
+            --pivot;
+            H[pivot]     = hasher_.canonical();
+            H_pos[pivot] = static_cast<uint64_t>(i - l + 1); // l-mer seq[i-l+1..i]
         }
+        next_pos_ = static_cast<uint64_t>(w + 1); // next advance adds l-mer at position w+1
         reset_windows();
     }
 
@@ -152,5 +182,12 @@ public:
     uint64_t hash(uint8_t& min_coord) const noexcept {
         min_coord = 0;
         return hash();
+    }
+
+    // Absolute position (0-indexed from the sequence passed to reset()) of the
+    // l-mer that achieves the minimizer hash in the current k-mer window.
+    // Consistent with hash(): same tie-breaking (suffix wins on equality).
+    uint64_t min_lmer_pos() const noexcept {
+        return (M_pre[pivot] < M_suf) ? M_pre_pos[pivot] : M_suf_pos;
     }
 };

@@ -12,6 +12,7 @@
 #include "partition_hash.hpp"
 #include "partition_kmc.hpp"
 #include "count.hpp"
+#include "ram_mode.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -35,6 +36,33 @@ template <uint16_t k, uint16_t l>
 int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
+
+    // ── RAM mode: single-pass parse + count (no disk partitions) ──────────
+    if (cfg.ram_mode) {
+        if (!cfg.hide_progress)
+            std::cerr << "[ram] Parsing + counting into " << cfg.num_partitions
+                      << " in-RAM tables  (" << cfg.num_threads << " thread"
+                      << (cfg.num_threads > 1 ? "s" : "") << ")...\n";
+
+        std::ofstream out(cfg.output_file);
+        if (!out) {
+            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+            return 1;
+        }
+
+        const auto t1 = std::chrono::steady_clock::now();
+        const auto [total_inserted, total_written] = partition_and_count_ram<k, l>(cfg, out);
+        const double t_ram = elapsed_s(t1);
+
+        if (!cfg.hide_progress)
+            std::cerr << "    " << total_inserted << " k-mers processed, "
+                      << total_written << " unique written  (" << t_ram << "s)\n";
+        std::cerr << "ram: " << t_ram << "s\n";
+
+        if (!cfg.hide_progress)
+            std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
+        return 0;
+    }
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
