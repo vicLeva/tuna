@@ -20,7 +20,7 @@ void print_usage(const char* prog)
         "              odd values in [11,31]  (k ≤ 32, fits in 64-bit word)\n"
         "  -m  <int>   minimizer length            [default: 17]\n"
         "              odd values in [9,k-2]  (must be odd and < k)\n"
-        "  -n  <int>   number of partitions        [default: 32]\n"
+        "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
         "  -t  <int>   worker threads              [default: 1]\n"
         "              phase 1: parallel over input files (capped at #files)\n"
         "              phase 2: parallel over partitions  (capped at -n)\n"
@@ -156,11 +156,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
     if (cfg.l >= cfg.k) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l
                   << ") must be strictly less than k-mer length (-k " << cfg.k << ")\n";
-        return false;
-    }
-
-    if (cfg.num_partitions == 0) {
-        std::cerr << "tuna: error: number of partitions (-n) must be > 0\n";
         return false;
     }
 
