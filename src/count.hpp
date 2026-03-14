@@ -139,13 +139,18 @@ uint64_t write_counts(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// init_sz is fixed at 1<<22 (4M k-mer slots).  Rationale:
-//   - For high-coverage data (e.g. 200 E. coli × 32 partitions → ~1.5M unique
-//     k-mers/partition): 1.5M << 3.2M resize threshold → no resize, table is
-//     8× smaller than the old file_size/4 heuristic → better L3 utilisation.
-//   - For low-coverage data (e.g. human 1 file × 128 partitions → ~23M unique
-//     k-mers/partition): table resizes 2-3× but amortised cost is small
-//     compared to the counting time.
+// init_sz scales with partition count: 128M / n_parts, clamped to [256K, 4M].
+// Two competing constraints drive the formula:
+//   (1) Per-bucket occupancy ≤ ~50%: secondary bucket probing triggers when the
+//       primary bucket (B=32 slots) is full.  Secondary probe = 2 XXH3 + 2 cold
+//       cache line accesses.  Keeping occupancy low avoids this path.
+//   (2) Metadata fits in L3: each bucket = 64 B metadata (cs[32] + min_coord[32]).
+//       With 4 active threads, total metadata budget = L3/n_threads ≈ 7.5 MB.
+// Formula target: ~37% per-bucket occupancy at expected unique k-mers / partition.
+//   n=32:   4M → 128K buckets →  8 MB meta (slightly above L3, same as original)
+//   n=64:   2M →  64K buckets →  4 MB meta (fits in L3)
+//   n=128:  1M →  32K buckets →  2 MB meta
+//   n=256: 512K→  16K buckets →  1 MB meta
 
 template <uint16_t k, uint16_t l>
 std::pair<uint64_t, uint64_t> count_and_write(
@@ -173,7 +178,20 @@ std::pair<uint64_t, uint64_t> count_and_write(
             const std::string part_path = cfg.work_dir + cfg.partition_prefix()
                                           + "_" + std::to_string(p) + ".superkmers";
             SuperkmerReader reader(part_path);
-            table_t table(1u << 22, 1); // 4M k-mers, 1 resize worker
+            // Scale initial table size with partition count.
+            // Target ~37% per-bucket occupancy to avoid secondary bucket probing
+            // (buckets have B=32 slots; secondary probe triggers when primary is full).
+            // Also keeps metadata (64 B/bucket) fitting in L3 (30 MB / 4 threads = 7.5 MB).
+            // Formula: 128M / n_parts, clamped to [256K, 4M].
+            // For n=32:   4M (cap=128K, ~37% occ, 8 MB meta — original, no regression)
+            // For n=64:   2M (cap= 64K, ~37% occ, 4 MB meta — fits in L3)
+            // For n=128:  1M (cap= 32K, ~37% occ, 2 MB meta)
+            // For n=256: 512K(cap= 16K, ~37% occ, 1 MB meta)
+            const size_t init_sz = std::clamp(
+                size_t(1u << 27) / n_parts,
+                size_t(1u << 18),   // min 256K
+                size_t(1u << 22));  // max 4M
+            table_t table(init_sz, 1);
 
             const uint64_t ins = count_partition<k, l>(reader, table, token);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
