@@ -3,21 +3,18 @@
 // Orchestration only — wire Phase 1 and Phase 2+3 together.
 //
 // To change what each phase does, edit the corresponding brick header:
-//   partition_hash.hpp  — hash and kmtricks partition strategies
-//   partition_kmc.hpp   — KMC signature partition strategy (default)
-//   count.hpp           — how k-mers are counted and output is written
-//   superkmer_io.hpp    — the on-disk partition file format
+//   partition_hash.hpp  — Phase 1: sequences → per-partition superkmer files
+//   count.hpp           — Phase 2+3: count k-mers + write output
+//   superkmer_io.hpp    — on-disk partition file format
 
 #include "Config.hpp"
 #include "partition_hash.hpp"
-#include "partition_kmc.hpp"
 #include "count.hpp"
 #include "ram_mode.hpp"
 
 #include <chrono>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <vector>
 
 
@@ -72,57 +69,22 @@ int run(const Config& cfg)
                   << " partitions  (" << p1_threads << " thread"
                   << (p1_threads > 1 ? "s" : "") << ")...\n";
 
-
-    // Phase 0 (optional): pre-scan to build a load-balanced partition table.
-    std::optional<RepartitionTable> rt;
-    std::optional<KmcNormTable>     kmc_nt;
-    std::optional<KmcPartMap>       kmc_pm;
-    double t_phase0 = 0.0;
-
-    if (cfg.strategy == PartitionStrategy::KMC) {
-        if (!cfg.hide_progress)
-            std::cerr << "    [0/2] Building KMC norm table (m="
-                      << cfg.kmc_sig_len << ")...\n";
-        kmc_nt.emplace(cfg.kmc_sig_len);
-
-        if (!cfg.hide_progress)
-            std::cerr << "    [0/2] Scanning KMC signature frequencies...\n";
-        const auto t_scan = std::chrono::steady_clock::now();
-        auto counts = scan_kmc_sig_counts<k>(cfg, *kmc_nt);
-        kmc_pm.emplace(KmcPartMap::from_counts(*kmc_nt, counts, cfg.num_partitions));
-        t_phase0 = elapsed_s(t_scan);
-
-    } else if (cfg.strategy == PartitionStrategy::KMTRICKS) {
-        if (!cfg.hide_progress)
-            std::cerr << "    [0/2] Scanning minimizer frequencies (kmtricks)...\n";
-        const auto t_scan = std::chrono::steady_clock::now();
-        auto counts = scan_minimizer_counts<k, l>(cfg);
-        rt.emplace(RepartitionTable::from_counts(counts, cfg.num_partitions));
-        t_phase0 = elapsed_s(t_scan);
-    }
-
     std::vector<std::ofstream> buckets(cfg.num_partitions);
     for (size_t p = 0; p < cfg.num_partitions; ++p)
-        buckets[p].open(cfg.work_dir + cfg.partition_prefix() + "_" + std::to_string(p) + ".superkmers",
+        buckets[p].open(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers",
                         std::ios::binary);
 
     const auto t_part = std::chrono::steady_clock::now();
-    const auto stats = cfg.strategy == PartitionStrategy::KMC
-        ? partition_kmers_kmc<k, l>(cfg, buckets, *kmc_nt, *kmc_pm)
-        : cfg.strategy == PartitionStrategy::KMTRICKS
-            ? partition_kmers_kmtricks<k, l>(cfg, buckets, *rt)
-            : partition_kmers_hash<k, l>(cfg, buckets);
+    const auto stats = partition_kmers<k, l>(cfg, buckets);
     for (auto& f : buckets) f.close();
 
-    const double t_phase1 = elapsed_s(t_part); // partitioning only (excl. pre-scan)
+    const double t_phase1 = elapsed_s(t_part);
     if (!cfg.hide_progress)
         std::cerr << "    " << stats.seqs  << " sequences, "
                   << stats.kmers << " k-mers  ("
                   << t_phase1 << "s)\n";
 
     if (cfg.partition_only) {
-        if (t_phase0 > 0.0)
-            std::cerr << "phase0: " << t_phase0 << "s\n";
         std::cerr << "phase1: " << t_phase1 << "s\n";
         if (!cfg.hide_progress)
             std::cerr << "[done] partition only\n";
@@ -154,8 +116,6 @@ int run(const Config& cfg)
                   << t_phase2 << "s)\n";
 
     // Always emit structured phase timings for tooling (bench.sh).
-    if (t_phase0 > 0.0)
-        std::cerr << "phase0: " << t_phase0 << "s\n";
     std::cerr << "phase1: " << t_phase1 << "s\n"
               << "phase2: " << t_phase2 << "s\n";
 

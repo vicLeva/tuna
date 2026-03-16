@@ -2,23 +2,18 @@
 
 // Phase 1 — sequence input (FASTA/FASTQ, plain or gzip) → per-partition superkmer files.
 //
-// This file implements the two strategies that share the same minimizer-hash
-// inner loop, differing only in how they map a minimizer hash to a partition ID:
-//
-//   partition_kmers_hash<k,l>(cfg, buckets)           — hash % num_partitions
-//   partition_kmers_kmtricks<k,l>(cfg, buckets, rt)   — RepartitionTable lookup
+// Partitioning: minimizer_hash % num_partitions.
 //
 // Parsing is delegated to SeqSource, which delivers ACTG-only chunks regardless
 // of file format or compression (helicase for plain files, SeqReader+split for gz).
 //
-// Shared internals:
-//   extract_superkmers_from_actg<k, PartitionFn>  — pure ACTG sequence logic,
-//                                                    no I/O, no threads.
-//   partition_kmers_impl<k, l, PartitionFn>        — parallel harness.
+// Internals:
+//   extract_superkmers_from_actg<k, l, PartitionFn>  — pure ACTG sequence logic,
+//                                                       no I/O, no threads.
+//   partition_kmers_impl<k, l, PartitionFn>           — parallel harness.
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
-#include "partition_kmtricks.hpp"
 #include "minimizer_window.hpp"
 #include "seq_source.hpp"
 
@@ -278,27 +273,14 @@ PartitionStats partition_kmers_impl(
 }
 
 
-// ─── Public: hash strategy ────────────────────────────────────────────────────
+// ─── Public ───────────────────────────────────────────────────────────────────
 
 template <uint16_t k, uint16_t l>
-PartitionStats partition_kmers_hash(
+PartitionStats partition_kmers(
     const Config&               cfg,
     std::vector<std::ofstream>& buckets)
 {
     const size_t n = cfg.num_partitions;
     return partition_kmers_impl<k, l>(cfg, buckets,
         [n](uint64_t h) -> size_t { return h % n; });
-}
-
-
-// ─── Public: kmtricks strategy ────────────────────────────────────────────────
-
-template <uint16_t k, uint16_t l>
-PartitionStats partition_kmers_kmtricks(
-    const Config&               cfg,
-    std::vector<std::ofstream>& buckets,
-    const RepartitionTable&     rt)
-{
-    return partition_kmers_impl<k, l>(cfg, buckets,
-        [&rt](uint64_t h) -> size_t { return rt(h); });
 }

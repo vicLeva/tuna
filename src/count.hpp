@@ -218,8 +218,8 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            const std::string part_path = cfg.work_dir + cfg.partition_prefix()
-                                          + "_" + std::to_string(p) + ".superkmers";
+            const std::string part_path = cfg.work_dir + "hash_"
+                                          + std::to_string(p) + ".superkmers";
             SuperkmerReader reader(part_path);
             // Scale initial table size with partition count.
             // Target ~37% per-bucket occupancy to avoid secondary bucket probing

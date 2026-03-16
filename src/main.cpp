@@ -94,7 +94,7 @@ int main(int argc, char* argv[])
         else {
             // Only remove the partition files we created, not the whole directory.
             for (size_t p = 0; p < cfg.num_partitions; ++p)
-                fs::remove(cfg.work_dir + cfg.partition_prefix() + "_" + std::to_string(p) + ".superkmers");
+                fs::remove(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers");
         }
     }
 

@@ -29,20 +29,9 @@ void print_usage(const char* prog)
         "  -w  <dir>   working directory for temp files\n"
         "              [default: tuna_tmp/ next to output file]\n"
         "\n"
-        "Partition strategy (default: hash):\n"
-        "  -hash       hash strategy (default — no flag needed):\n"
-        "              minimizer_hash %% num_partitions. Fast, no pre-scan.\n"
-        "  -kmtricks   kmtricks strategy: pre-scans input to build a\n"
-        "              load-balanced minimizer->partition table (Phase 0),\n"
-        "              then uses table lookup instead of hash %% num_partitions.\n"
-        "  -kmc        KMC signature strategy: uses a norm-filtered canonical\n"
-        "              m-mer signature. Pre-scans input to build a\n"
-        "              load-balanced signature->partition table (Phase 0).\n"
-        "  -s  <int>   KMC signature length (KMC strategy only) [default: 9, range 5-11]\n"
-        "\n"
         "  -ram        RAM mode: skip disk partition files, insert k-mers directly\n"
-        "              into in-memory tables (hash strategy only). Faster when I/O\n"
-        "              is the bottleneck; requires O(unique_kmers) RAM upfront.\n"
+        "              into in-memory tables. Faster when I/O is the bottleneck;\n"
+        "              requires O(unique_kmers) RAM upfront.\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
@@ -95,15 +84,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         } else if (arg == "-w") {
             const char* v = next_val("-w"); if (!v) return false;
             cfg.work_dir = v;
-        } else if (arg == "-kmc") {
-            cfg.strategy = PartitionStrategy::KMC;
-        } else if (arg == "-kmtricks") {
-            cfg.strategy = PartitionStrategy::KMTRICKS;
-        } else if (arg == "-hash") {
-            cfg.strategy = PartitionStrategy::HASH;
-        } else if (arg == "-s") {
-            const char* v = next_val("-s"); if (!v) return false;
-            cfg.kmc_sig_len = static_cast<uint16_t>(std::stoul(v));
         } else if (arg == "-ram") {
             cfg.ram_mode = true;
         } else if (arg == "-dbg") {
@@ -165,19 +145,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
 
     if (cfg.num_threads == 0) {
         std::cerr << "tuna: error: number of threads (-t) must be > 0\n";
-        return false;
-    }
-
-    if (cfg.strategy == PartitionStrategy::KMC &&
-        (cfg.kmc_sig_len < 5 || cfg.kmc_sig_len > 11)) {
-        std::cerr << "tuna: error: KMC signature length (-s " << cfg.kmc_sig_len
-                  << ") must be in [5, 11]\n";
-        return false;
-    }
-
-    if (cfg.strategy == PartitionStrategy::KMC && cfg.kmc_sig_len >= cfg.k) {
-        std::cerr << "tuna: error: KMC signature length (-s " << cfg.kmc_sig_len
-                  << ") must be less than k (" << cfg.k << ")\n";
         return false;
     }
 
