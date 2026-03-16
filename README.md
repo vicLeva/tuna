@@ -152,4 +152,4 @@ Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 4 threads
 | *E. coli* ×200 (~940 MB) | 0:14 | ~0.9 GB | 0:25 | ~9.9 GB | **0.6×** | **0.09×** |
 | Tara metagenome (~5.9 GB gz) | 7:28 | — | 5:38 | ~7.6 GB | 1.3× | — |
 
-tuna's memory usage scales with unique k-mers per partition. KMC uses a roughly constant ~8–10 GB regardless of input size thanks to its on-disk intermediate representation.
+tuna's memory usage scales with unique k-mers per partition. KMC RSS figures above reflect its default `-m8` RAM limit; KMC's actual memory usage is configurable.
