@@ -262,6 +262,26 @@ private:
 };
 
 
+// ── split_actg (free function) ────────────────────────────────────────────────
+// Split a raw sequence on non-ACTG characters and call on_chunk(ptr, len) for
+// each ACTG-only run.  Header-free, usable outside SeqSource.
+
+template <typename F>
+inline void split_actg(const char* seq, size_t len, F&& on_chunk)
+{
+    size_t start  = 0;
+    bool   in_run = false;
+    for (size_t i = 0; i < len; ++i) {
+        if (nt_hash::is_dna(seq[i])) {
+            if (!in_run) { start = i; in_run = true; }
+        } else {
+            if (in_run) { on_chunk(seq + start, i - start); in_run = false; }
+        }
+    }
+    if (in_run) on_chunk(seq + start, len - start);
+}
+
+
 // ── SeqSource ─────────────────────────────────────────────────────────────────
 
 struct SeqSource

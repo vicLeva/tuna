@@ -46,6 +46,8 @@ void print_usage(const char* prog)
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
+        "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
+        "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -h/--help   show this help\n"
         "\n"
         "Output: plain text, one k-mer per line: <kmer>\\t<count>\n";
@@ -104,6 +106,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.kmc_sig_len = static_cast<uint16_t>(std::stoul(v));
         } else if (arg == "-ram") {
             cfg.ram_mode = true;
+        } else if (arg == "-dbg") {
+            cfg.debug_stats = true;
         } else if (arg == "-hp") {
             cfg.hide_progress = true;
         } else if (arg == "-kt") {

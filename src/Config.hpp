@@ -29,6 +29,7 @@ struct Config {
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
     bool         ram_mode      = false; // skip disk partitions: insert k-mers directly into in-RAM tables
+    bool         debug_stats  = false; // print per-partition table stats + write minimizer coverage CSV
 
     // Returns the strategy prefix used in partition file names.
     std::string partition_prefix() const {

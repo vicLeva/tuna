@@ -27,3 +27,11 @@ benchmark/results/
 tuna
 *.o
 *.a
+
+# Profiling
+perf.data
+perf.data.*
+
+# Plot outputs
+tools/*.png
+benchmark/*.png

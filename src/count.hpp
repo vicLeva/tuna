@@ -20,8 +20,28 @@
 #include <utility>
 #include <algorithm>
 #include <iomanip>
+#include <unordered_map>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
+
+
+// ─── Debug stats ──────────────────────────────────────────────────────────────
+//
+// Populated by count_partition when dbg != nullptr.
+// coverage_hist: maps (k-mers sharing one minimizer) → (number of minimizers
+// with that coverage).  Aggregated globally in count_and_write and written to
+// <work_dir>/debug_min_coverage.csv.
+
+struct PartitionDebugInfo {
+    uint64_t n_inserted  = 0;   // total k-mer insertions (with multiplicity)
+    uint64_t n_overflow  = 0;   // insertions that went to overflow table
+    uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots)
+    uint64_t n_buckets   = 0;   // table_cap / B
+
+    // coverage → count_of_minimizers_with_that_coverage
+    // Only populated for superkmers with min_pos != 0xFF.
+    std::unordered_map<uint32_t, uint64_t> coverage_hist;
+};
 
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
@@ -41,7 +61,8 @@ template <uint16_t k, uint16_t l>
 uint64_t count_partition(
     SuperkmerReader&                                                      reader,
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token)
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token,
+    PartitionDebugInfo* dbg = nullptr)
 {
     // Compute canonical ntHash of the l-mer at position min_pos in packed data.
     // Decodes l bases (kache→ASCII) then runs nt_hash::Roller.  O(l) work —
@@ -61,20 +82,29 @@ uint64_t count_partition(
     auto inc = [](uint32_t v) { return v + 1; };
     uint64_t inserted = 0;
 
+    // Per-minimizer k-mer count (only allocated when debug is requested).
+    // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
+    std::unordered_map<uint64_t, uint32_t> min_kmer_count;
+
     while (reader.next()) {
         const uint8_t* packed   = reader.packed_data();
         const size_t   len      = reader.size();
         const uint8_t  min_pos  = reader.min_pos();
         if (len < k) continue;
 
+        const uint32_t sk_kmers = static_cast<uint32_t>(len - k + 1);
+
         // min_pos == 0xFF is a sentinel (KMC mode: multiple ntHash minimizers
         // possible within one superkmer) — fall back to MinimizerWindow::reset().
         // Otherwise use the stored position to compute ntHash in O(l) vs O(k).
         kache_hash::Kmer_Window<k, l> win;
-        if (min_pos != 0xFF)
-            win.init_packed_with_hash(packed, lmer_nt_hash(packed, min_pos));
-        else
+        if (min_pos != 0xFF) {
+            const uint64_t mh = lmer_nt_hash(packed, min_pos);
+            win.init_packed_with_hash(packed, mh);
+            if (dbg) min_kmer_count[mh] += sk_kmers;
+        } else {
             win.init_packed(packed);
+        }
 
         // Prefetch the primary bucket before the first upsert.
         table.prefetch(win);
@@ -96,6 +126,13 @@ uint64_t count_partition(
             ++inserted;
         }
     }
+
+    if (dbg) {
+        // Convert per-minimizer k-mer counts to a coverage histogram.
+        for (auto& [mh, cnt] : min_kmer_count)
+            dbg->coverage_hist[cnt]++;
+    }
+
     return inserted;
 }
 
@@ -170,6 +207,12 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::vector<std::pair<uint32_t, uint64_t>>     ov_top_global;   // merged top minimizers
     std::atomic<uint64_t>                          ov_total{0};
 
+    // Debug statistics (only used when cfg.debug_stats).
+    std::mutex                                     dbg_mutex;
+    std::unordered_map<uint32_t, uint64_t>         global_coverage_hist;
+    std::vector<PartitionDebugInfo>                part_infos;
+    if (cfg.debug_stats) part_infos.resize(n_parts);
+
     auto worker = [&](size_t tid) {
         typename table_t::Token token;
         std::string chunk;
@@ -193,8 +236,16 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
 
-            const uint64_t ins = count_partition<k, l>(reader, table, token);
+            PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
+            const uint64_t ins = count_partition<k, l>(reader, table, token, dbg);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            if (dbg) {
+                dbg->n_inserted = ins;
+                dbg->n_overflow = table.overflow_insert_count();
+                dbg->table_cap  = table.capacity();
+                dbg->n_buckets  = table.bucket_count();
+            }
 
             const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
@@ -214,6 +265,13 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     if(it != ov_top_global.end()) it->second += cnt;
                     else ov_top_global.emplace_back(bin, cnt);
                 }
+            }
+
+            // Merge debug coverage histogram under lock.
+            if (dbg && !dbg->coverage_hist.empty()) {
+                std::lock_guard<std::mutex> lg(dbg_mutex);
+                for (auto& [cov, cnt] : dbg->coverage_hist)
+                    global_coverage_hist[cov] += cnt;
             }
         }
     };
@@ -240,13 +298,70 @@ std::pair<uint64_t, uint64_t> count_and_write(
                           [](const auto& a, const auto& b){ return a.second > b.second; });
         if(ov_top_global.size() > 20) ov_top_global.resize(20);
 
-        std::cerr << "[overflow] top minimizer bins (top 16 bits of ntHash canonical):\n";
+        std::cerr << "[overflow] top minimizer bins (top " << table_t::OV_HIST_BITS_PUBLIC
+                  << " bits of ntHash canonical):\n";
         std::cerr << "  rank     bin_id (hex)     overflow_kmers\n";
         for(std::size_t i = 0; i < ov_top_global.size(); ++i)
             std::cerr << "  " << std::setw(4) << (i+1)
                       << "     0x" << std::hex << std::setw(4) << std::setfill('0') << ov_top_global[i].first
                       << std::dec << std::setfill(' ')
                       << "     " << ov_top_global[i].second << "\n";
+    }
+
+    // ── Debug output ──────────────────────────────────────────────────────────
+    if (cfg.debug_stats) {
+        // Per-partition table summary.
+        std::cerr << "\n[debug] per-partition table stats (first 20):\n";
+        std::cerr << "  part   n_inserted   n_overflow   ov%      table_cap   n_buckets   avg_k/bucket\n";
+        for (size_t p = 0; p < std::min(n_parts, size_t(20)); ++p) {
+            const auto& d = part_infos[p];
+            const double ov_pct = d.n_inserted ? 100.0 * d.n_overflow / d.n_inserted : 0.0;
+            const double avg_kb = d.n_buckets  ? static_cast<double>(d.n_inserted) / d.n_buckets : 0.0;
+            std::cerr << "  " << std::setw(5) << p
+                      << "  " << std::setw(11) << d.n_inserted
+                      << "  " << std::setw(11) << d.n_overflow
+                      << "  " << std::fixed << std::setprecision(1) << std::setw(6) << ov_pct << "%"
+                      << "  " << std::setw(10) << d.table_cap
+                      << "  " << std::setw(10) << d.n_buckets
+                      << "  " << std::setprecision(1) << std::setw(12) << avg_kb << "\n";
+        }
+        if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
+
+        // Global minimizer coverage histogram summary.
+        if (!global_coverage_hist.empty()) {
+            uint64_t total_minimizers = 0, total_kmers_covered = 0;
+            uint32_t max_cov = 0;
+            for (auto& [cov, cnt] : global_coverage_hist) {
+                total_minimizers   += cnt;
+                total_kmers_covered += static_cast<uint64_t>(cov) * cnt;
+                if (cov > max_cov) max_cov = cov;
+            }
+            const double avg_cov = total_minimizers ? static_cast<double>(total_kmers_covered) / total_minimizers : 0.0;
+
+            std::cerr << "\n[debug] minimizer coverage (k-mers sharing one minimizer):\n";
+            std::cerr << "  unique minimizers tracked : " << total_minimizers << "\n";
+            std::cerr << "  total k-mers covered      : " << total_kmers_covered << "\n";
+            std::cerr << "  avg k-mers / minimizer    : " << std::fixed << std::setprecision(2) << avg_cov << "\n";
+            std::cerr << "  max k-mers / minimizer    : " << max_cov << "\n";
+
+            // Write full histogram to CSV.
+            const std::string csv_path = cfg.work_dir + "debug_min_coverage.csv";
+            std::ofstream csv(csv_path);
+            if (csv) {
+                csv << "coverage,n_minimizers,total_kmers\n";
+                // Sort by coverage for readability.
+                std::vector<std::pair<uint32_t, uint64_t>> sorted(
+                    global_coverage_hist.begin(), global_coverage_hist.end());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                for (auto& [cov, cnt] : sorted)
+                    csv << cov << "," << cnt << ","
+                        << (static_cast<uint64_t>(cov) * cnt) << "\n";
+                std::cerr << "[debug] minimizer coverage CSV written to: " << csv_path << "\n";
+            } else {
+                std::cerr << "[debug] warning: could not write CSV to " << csv_path << "\n";
+            }
+        }
     }
 
     return { total_inserted.load(), total_written.load() };

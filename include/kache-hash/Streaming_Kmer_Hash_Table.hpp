@@ -55,7 +55,7 @@ class Streaming_Kmer_Hash_Table
 private:
 
     static constexpr double lf_default = 0.8;   // Default load factor: 80%.
-    static constexpr double of_default = 0.1;   // Fixed overflow factor: 10%.
+    static constexpr double of_default = 0.3;   // Fixed overflow factor: 30% — raises ov_resize_th_ from 5% to 15% of capacity, reducing cascade resizes for hot minimizers.
     static constexpr std::size_t B = 32;    // Bucket size.
     static_assert(B % 8 == 0, "Bucket size must be a multiple of 8.");
     static_assert(B == 32, "Bucket size needs to be 32 for the current vectorization scheme to function.");
@@ -131,7 +131,7 @@ private:
 
     // Histogram of overflow inserts by minimizer hash (top 16 bits of nt_h → 65536 bins).
     // Populated by the public upsert when a new k-mer goes to overflow.
-    static constexpr std::size_t OV_HIST_BITS = 16;
+    static constexpr std::size_t OV_HIST_BITS = 8;  // 256 bins × 8 B = 2 KB — fully L1-resident, eliminating LLC misses per overflow insert (vs 512 KB at 16 bits).
     static constexpr std::size_t OV_HIST_SIZE = std::size_t(1) << OV_HIST_BITS;
     std::vector<std::atomic_uint64_t> ov_min_hist_;
 
@@ -269,8 +269,14 @@ public:
 
     ~Streaming_Kmer_Hash_Table();
 
+    // Number of bits used for the overflow histogram (public so callers can label output).
+    static constexpr std::size_t OV_HIST_BITS_PUBLIC = OV_HIST_BITS;
+
     // Returns the capacity (in terms of keys) of the table.
     auto capacity() const { return cap_ * B; }
+
+    // Returns the number of buckets in the flat table.
+    std::size_t bucket_count() const { return cap_; }
 
     // Returns the size of the table.
     std::size_t size() const;
@@ -1185,9 +1191,6 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_resize()
 template <uint16_t k, bool mt_, typename T_, uint16_t l>
 inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::resize()
 {
-    std::cerr << "Resize is triggered at size: " << size() << "; main table size: " << main_table_size() << "; overflow size: " << overflow_size() << "\n";
-    const auto t_s = now();
-
     const auto old_cap = cap_;
     cap_ *= 2;
     T_new = aligned_allocate<flat_t>(cap_ * B, L1_CACHE_LINE_SIZE);
@@ -1228,9 +1231,6 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::resize()
     ov_approx_sz_.store(0, std::memory_order_relaxed);
     ov_resize_th_ = static_cast<uint64_t>(capacity() * of_default * 0.5);
 
-    const auto t_e = now();
-    std::cerr << "Resize is triggered at size: " << size() << "; main table size: " << main_table_size() << "; overflow size: " << overflow_size() << "\n";
-    std::cerr << "Time taken: " << duration(t_e - t_s) << "s.\n";
 }
 
 
