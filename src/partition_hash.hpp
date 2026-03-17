@@ -155,8 +155,10 @@ PartitionStats partition_kmers_gz_pc(
 
     // Consumer: pull batches from the queue and extract superkmers.
     auto consumer_fn = [&]() {
+        // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
+        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
         MinimizerWindow<k, l>        min_it;
-        std::vector<SuperkmerWriter> writers(n_parts);
+        std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
         while (true) {
@@ -237,9 +239,11 @@ PartitionStats partition_kmers_impl(
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
 
     auto worker = [&]() {
+        // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
+        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
         SeqSource            source;
         MinimizerWindow<k, l>        min_it;
-        std::vector<SuperkmerWriter> writers(n_parts);
+        std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
         while (true) {

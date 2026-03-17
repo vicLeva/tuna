@@ -38,6 +38,9 @@ struct PartitionDebugInfo {
     uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots)
     uint64_t n_buckets   = 0;   // table_cap / B
 
+    // Resize events recorded during count_partition for this partition.
+    std::vector<kache_hash::ResizeEvent> resize_log;
+
     // coverage → count_of_minimizers_with_that_coverage
     // Only populated for superkmers with min_pos != 0xFF.
     std::unordered_map<uint32_t, uint64_t> coverage_hist;
@@ -192,6 +195,7 @@ uint64_t write_counts(
 template <uint16_t k, uint16_t l>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
+    uint64_t       total_kmers,
     std::ofstream& out)
 {
     using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>;
@@ -221,17 +225,23 @@ std::pair<uint64_t, uint64_t> count_and_write(
             const std::string part_path = cfg.work_dir + "hash_"
                                           + std::to_string(p) + ".superkmers";
             SuperkmerReader reader(part_path);
-            // Scale initial table size with partition count.
-            // Target ~37% per-bucket occupancy to avoid secondary bucket probing
-            // (buckets have B=32 slots; secondary probe triggers when primary is full).
-            // Also keeps metadata (64 B/bucket) fitting in L3 (30 MB / 4 threads = 7.5 MB).
-            // Formula: 128M / n_parts, clamped to [256K, 4M].
-            // For n=32:   4M (cap=128K, ~37% occ, 8 MB meta — original, no regression)
-            // For n=64:   2M (cap= 64K, ~37% occ, 4 MB meta — fits in L3)
-            // For n=128:  1M (cap= 32K, ~37% occ, 2 MB meta)
-            // For n=256: 512K(cap= 16K, ~37% occ, 1 MB meta)
+            // Size the table generously to avoid load-triggered resizes.
+            //
+            // Dynamic formula: 2 × (total_kmers / n_parts) puts the 80% load threshold
+            // at 1.6× the average k-mer load per partition — well above any balanced run.
+            //
+            // Guard: only use the dynamic formula when n_files is small (≤10).
+            // For high-coverage multi-file runs (e.g. 200 E. coli files), total_kmers
+            // counts the same k-mers 200× so total/n_parts >> unique/n_parts, producing
+            // L3-busting tables (4M slots, 8 MB metadata/thread > 7.5 MB L3/thread budget).
+            // With ≤10 files, total ≈ unique (low multiplicity), so the dynamic formula
+            // is an accurate estimate of unique k-mers per partition.
+            const size_t n_files = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
-                size_t(1u << 27) / n_parts,
+                per_part,
                 size_t(1u << 18),   // min 256K
                 size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
@@ -241,10 +251,11 @@ std::pair<uint64_t, uint64_t> count_and_write(
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
             if (dbg) {
-                dbg->n_inserted = ins;
-                dbg->n_overflow = table.overflow_insert_count();
-                dbg->table_cap  = table.capacity();
-                dbg->n_buckets  = table.bucket_count();
+                dbg->n_inserted  = ins;
+                dbg->n_overflow  = table.overflow_insert_count();
+                dbg->table_cap   = table.capacity();
+                dbg->n_buckets   = table.bucket_count();
+                dbg->resize_log  = table.resize_log();
             }
 
             const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
@@ -326,6 +337,87 @@ std::pair<uint64_t, uint64_t> count_and_write(
                       << "  " << std::setprecision(1) << std::setw(12) << avg_kb << "\n";
         }
         if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
+
+        // ── Resize event summary ───────────────────────────────────────────────
+        {
+            uint64_t total_resize_events = 0;
+            double   total_resize_s      = 0.0;
+            uint64_t n_ov_triggered      = 0;
+            uint64_t n_load_triggered    = 0;
+            size_t   n_parts_resized     = 0;
+            double   max_resize_s        = 0.0;
+            size_t   max_resize_part     = 0;
+            uint64_t max_resize_count    = 0;
+            size_t   max_resize_count_part = 0;
+
+            // Per-partition resize totals for the "top-5 by cost" display.
+            struct PartResizeSummary {
+                size_t   part;
+                uint64_t n_resizes;
+                double   total_s;
+                uint64_t n_ov;
+                uint64_t n_load;
+            };
+            std::vector<PartResizeSummary> summaries;
+
+            for (size_t p = 0; p < n_parts; ++p) {
+                const auto& rlog = part_infos[p].resize_log;
+                if (rlog.empty()) continue;
+                ++n_parts_resized;
+                PartResizeSummary ps{p, rlog.size(), 0.0, 0, 0};
+                for (const auto& ev : rlog) {
+                    ps.total_s += ev.elapsed_s;
+                    ps.n_ov    += ev.overflow_triggered ? 1 : 0;
+                    ps.n_load  += ev.overflow_triggered ? 0 : 1;
+                    if (ev.elapsed_s > max_resize_s) { max_resize_s = ev.elapsed_s; max_resize_part = p; }
+                }
+                total_resize_events += ps.n_resizes;
+                total_resize_s      += ps.total_s;
+                n_ov_triggered      += ps.n_ov;
+                n_load_triggered    += ps.n_load;
+                if (ps.n_resizes > max_resize_count) { max_resize_count = ps.n_resizes; max_resize_count_part = p; }
+                summaries.push_back(ps);
+            }
+
+            std::cerr << "\n[debug] resize summary:\n";
+            std::cerr << "  partitions with resizes : " << n_parts_resized << " / " << n_parts << "\n";
+            std::cerr << "  total resize events     : " << total_resize_events << "\n";
+            std::cerr << "  total resize time       : " << std::fixed << std::setprecision(3) << total_resize_s << "s\n";
+            std::cerr << "  overflow-triggered      : " << n_ov_triggered << "\n";
+            std::cerr << "  load-triggered          : " << n_load_triggered << "\n";
+            if (total_resize_events > 0) {
+                std::cerr << "  slowest single resize   : " << std::setprecision(3) << max_resize_s
+                          << "s (part " << max_resize_part << ")\n";
+                std::cerr << "  most resizes in one part: " << max_resize_count
+                          << " (part " << max_resize_count_part << ")\n";
+            }
+
+            if (!summaries.empty()) {
+                // Sort by total resize time descending — top 10.
+                std::partial_sort(summaries.begin(),
+                                  summaries.begin() + std::min(summaries.size(), size_t(10)),
+                                  summaries.end(),
+                                  [](const auto& a, const auto& b){ return a.total_s > b.total_s; });
+                const size_t show = std::min(summaries.size(), size_t(10));
+                std::cerr << "\n  top " << show << " partitions by resize cost:\n";
+                std::cerr << "  part   n_resizes  resize_s   n_ov_trig  n_load_trig  per-event old_cap→new_cap (trigger, s)\n";
+                for (size_t i = 0; i < show; ++i) {
+                    const auto& ps = summaries[i];
+                    std::cerr << "  " << std::setw(5) << ps.part
+                              << "  " << std::setw(9) << ps.n_resizes
+                              << "  " << std::setprecision(3) << std::setw(9) << ps.total_s
+                              << "  " << std::setw(9) << ps.n_ov
+                              << "  " << std::setw(11) << ps.n_load << "\n";
+                    for (const auto& ev : part_infos[ps.part].resize_log)
+                        std::cerr << "           "
+                                  << ev.old_cap << "->" << (ev.old_cap * 2)
+                                  << "  " << (ev.overflow_triggered ? "ov  " : "load")
+                                  << "  " << std::setprecision(3) << ev.elapsed_s << "s"
+                                  << "  ov_count=" << ev.ov_count
+                                  << "  main_sz=" << ev.main_sz << "\n";
+                }
+            }
+        }
 
         // Global minimizer coverage histogram summary.
         if (!global_coverage_hist.empty()) {

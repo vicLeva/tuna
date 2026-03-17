@@ -44,7 +44,14 @@
 struct SuperkmerWriter
 {
     std::string buf;
-    static constexpr size_t FLUSH_THRESHOLD = 512u << 10; // 512 KB
+    // flush_threshold is set per-writer based on n_parts so that total writer
+    // memory across all partitions stays bounded to ~64 MB per thread:
+    //   max(4 KB, 64 MB / n_parts)
+    // Default (512 KB) is used when n_parts is small (≤128).
+    const size_t flush_threshold;
+
+    explicit SuperkmerWriter(size_t flush_thresh = 512u << 10)
+        : flush_threshold(flush_thresh) {}
 
     // Serialise one superkmer.
     // `data` is ASCII DNA (ACGT, any case); `len` is the number of bases;
@@ -68,7 +75,7 @@ struct SuperkmerWriter
         }
     }
 
-    bool needs_flush() const { return buf.size() >= FLUSH_THRESHOLD; }
+    bool needs_flush() const { return buf.size() >= flush_threshold; }
 
     // Flush to the shared file under its mutex; no-op if buffer is empty.
     void flush_to(std::ofstream& file, std::mutex& mtx)

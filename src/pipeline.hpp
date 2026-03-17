@@ -107,7 +107,7 @@ int run(const Config& cfg)
         return 1;
     }
 
-    const auto [total_inserted, total_written] = count_and_write<k, l>(cfg, out);
+    const auto [total_inserted, total_written] = count_and_write<k, l>(cfg, stats.kmers, out);
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)

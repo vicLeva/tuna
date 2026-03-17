@@ -25,6 +25,7 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 #include <algorithm>
@@ -49,6 +50,16 @@ template <uint16_t k, uint16_t l> class Kmer_Window;
 // mapped type is `T_`. `l`-minimizers are used in underlying computations.
 // NB: concurrent insertions are guaranteed to function correctly only if
 // deletions are not performed, as of now.
+// Per-resize diagnostic record populated by Streaming_Kmer_Hash_Table::try_resize().
+struct ResizeEvent {
+    bool     overflow_triggered; // true = ov_approx_sz_ hit ov_resize_th_; false = main table load
+    double   elapsed_s;          // wall-clock duration of resize()
+    uint64_t old_cap;            // capacity (k-mer slots) before doubling
+    uint64_t ov_count;           // ov_approx_sz_ snapshot at trigger time
+    uint64_t main_sz;            // approx_sz snapshot at trigger time
+};
+
+
 template <uint16_t k, bool mt_, typename T_ = void, uint16_t l = 19>
 class Streaming_Kmer_Hash_Table
 {
@@ -126,8 +137,9 @@ private:
 
     std::atomic_uint16_t registered_thread_count;   // Number of threads registered to use the table.
     std::atomic_uint64_t approx_sz; // Approximate size (lower bound) of the hash table.
-    std::atomic_uint64_t ov_approx_sz_; // Approximate count of new overflow inserts.
-    uint64_t ov_resize_th_;             // Overflow insert count at which to trigger resize.
+    std::atomic_uint64_t ov_approx_sz_;    // Overflow inserts since last resize (drives ov_resize_th_; resets on resize).
+    std::atomic_uint64_t ov_total_inserts_; // Cumulative overflow inserts across all resizes (never reset).
+    uint64_t ov_resize_th_;                // Overflow insert count at which to trigger resize.
 
     // Histogram of overflow inserts by minimizer hash (top 16 bits of nt_h → 65536 bins).
     // Populated by the public upsert when a new k-mer goes to overflow.
@@ -144,6 +156,8 @@ private:
     RW_Lock<max_user> table_lock; // Readers-writers lock to resize the table exclusively.
 
     const uint64_t resize_worker_c; // Number of worker threads to spawn for a concurrent resize.
+
+    std::vector<ResizeEvent> resize_log_; // Per-table resize event log (populated by try_resize).
 
 
     // Returns `true` iff `key` matches to the key of the element `e`.
@@ -284,8 +298,8 @@ public:
     // Returns the size of the overflow table.
     std::size_t overflow_size() const { return ov->size();  }
 
-    // Returns the total number of new k-mers inserted into overflow.
-    uint64_t overflow_insert_count() const { return ov_approx_sz_.load(std::memory_order_relaxed); }
+    // Returns the total number of new k-mers inserted into overflow (cumulative across all resizes).
+    uint64_t overflow_insert_count() const { return ov_total_inserts_.load(std::memory_order_relaxed); }
 
     // Returns the top-N (minimizer_bin, overflow_count) pairs sorted descending.
     // minimizer_bin = top OV_HIST_BITS bits of the canonical ntHash minimizer value.
@@ -305,6 +319,9 @@ public:
         if(result.size() > n) result.resize(n);
         return result;
     }
+
+    // Returns the log of resize events recorded during insertion.
+    const std::vector<ResizeEvent>& resize_log() const { return resize_log_; }
 
     // Clears the table.
     void clear();
@@ -572,6 +589,7 @@ inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Streaming_Kmer_Hash_Table(const
     , registered_thread_count(0)
     , approx_sz(0)
     , ov_approx_sz_(0)
+    , ov_total_inserts_(0)
     , ov_resize_th_(static_cast<uint64_t>(capacity() * of_default * 0.5))
     , ov_min_hist_(OV_HIST_SIZE)
     , checkpoint(std::thread::hardware_concurrency(), resize_checkpoint)
@@ -1023,12 +1041,14 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, co
                 {
                     const auto ov_r = ov->insert(x, Overflow_Set_Val(c, m));
                     ov_approx_sz_.fetch_add(!ov_r, std::memory_order_relaxed);
+                    ov_total_inserts_.fetch_add(!ov_r, std::memory_order_relaxed);
                     return ov_r;
                 }
                 else
                 {
                     const auto p = ov->insert(x.first, Overflow_Map_Val(c, m, x.second));
                     ov_approx_sz_.fetch_add(!p, std::memory_order_relaxed);
+                    ov_total_inserts_.fetch_add(!p, std::memory_order_relaxed);
                     return !p ? null_val : val_t(p->val);
                 }
             }
@@ -1166,6 +1186,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
                 if(r) return val_t(r->val);
                 ov->insert(key, Overflow_Map_Val(c, m, val));
                 ov_approx_sz_.fetch_add(1, std::memory_order_relaxed);
+                ov_total_inserts_.fetch_add(1, std::memory_order_relaxed);
                 tl_ov_happened_ = true;
                 return null_val;
             }
@@ -1181,8 +1202,20 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_resize()
 {
     if constexpr(mt_)   table_lock.lock();
 
-    if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
+    const uint64_t cur_sz = approx_sz.load(std::memory_order_relaxed);
+    const uint64_t cur_ov = ov_approx_sz_.load(std::memory_order_relaxed);
+    if(cur_sz >= resize_th || cur_ov >= ov_resize_th_)
+    {
+        ResizeEvent ev;
+        ev.overflow_triggered = (cur_ov >= ov_resize_th_);
+        ev.old_cap  = capacity();
+        ev.ov_count = cur_ov;
+        ev.main_sz  = cur_sz;
+        const auto t0 = std::chrono::steady_clock::now();
         resize();
+        ev.elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        resize_log_.push_back(ev);
+    }
 
     if constexpr(mt_)   table_lock.unlock();
 }

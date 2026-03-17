@@ -12,7 +12,7 @@ struct Config {
     std::string  output_file;
     std::string  work_dir;            // directory for temp partition files
     uint16_t     k              = 31;
-    uint16_t     l              = 17;
+    uint16_t     l              = 21;
     uint32_t     num_partitions = 0;    // 0 = auto-tune from input size (set in main)
     uint32_t     num_threads    = 1;  // worker threads: phase 1 over files, phase 2 over partitions
     uint32_t     ci             = 1;  // minimum count to report
