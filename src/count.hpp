@@ -10,7 +10,6 @@
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
-#include "nt_hash.hpp"
 
 #include <fstream>
 #include <string>
@@ -67,20 +66,6 @@ uint64_t count_partition(
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
-    // Compute canonical ntHash of the l-mer at position min_pos in packed data.
-    // Decodes l bases (kache→ASCII) then runs nt_hash::Roller.  O(l) work —
-    // replaces O(k) MinimizerWindow::reset() in init_packed.
-    auto lmer_nt_hash = [](const uint8_t* packed, uint8_t pos) -> uint64_t {
-        static constexpr char KACHE2ASCII[4] = {'A', 'C', 'G', 'T'};
-        char buf[l];
-        for (uint16_t i = 0; i < l; ++i) {
-            const uint8_t p = static_cast<uint8_t>(pos + i);
-            buf[i] = KACHE2ASCII[(packed[p >> 2] >> (6u - 2u * (p & 3u))) & 3u];
-        }
-        nt_hash::Roller<l> roller;
-        roller.init(buf);
-        return roller.canonical();
-    };
 
     auto inc = [](uint32_t v) { return v + 1; };
     uint64_t inserted = 0;
@@ -102,8 +87,7 @@ uint64_t count_partition(
         // Otherwise use the stored position to compute ntHash in O(l) vs O(k).
         kache_hash::Kmer_Window<k, l> win;
         if (min_pos != 0xFF) {
-            const uint64_t mh = lmer_nt_hash(packed, min_pos);
-            win.init_packed_with_hash(packed, mh);
+            const uint64_t mh = win.init_packed_with_min(packed, min_pos);
             if (dbg) min_kmer_count[mh] += sk_kmers;
         } else {
             win.init_packed(packed);

@@ -477,6 +477,26 @@ public:
         use_precomp_  = true;
     }
 
+    // Fused init: decode k packed bases once, derive ntHash of the l-mer at
+    // min_pos from the decoded buffer, init Directed_Vertex + Rolling_Hash.
+    // Returns the canonical ntHash of the minimizer l-mer.
+    // Replaces the two-call pattern: lmer_nt_hash(packed, min_pos) then
+    // init_packed_with_hash(packed, mh) — eliminates one full decode pass.
+    uint64_t init_packed_with_min(const uint8_t* packed, uint8_t min_pos)
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
+        v = Directed_Vertex<k>(Kmer<k>(buf));
+        rh.init(buf);
+        nt_hash::Roller<l> roller;
+        roller.init(buf + min_pos);
+        precomp_nt_h_ = roller.canonical();
+        use_precomp_  = true;
+        return precomp_nt_h_;
+    }
+
     // Initializes the k-mer window from a packed super-kmer word array.
     void init(const uint64_t* super_kmer, const std::size_t word_count)
     {
