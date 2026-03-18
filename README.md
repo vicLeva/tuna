@@ -3,6 +3,85 @@
 **tuna** is a fast, streaming k-mer counter for FASTA/FASTQ input.
 It partitions k-mers by minimizer into superkmer files, then counts them using a streaming hash table — keeping memory usage low and throughput high.
 
+---
+
+## Partition-strategy benchmark (this branch)
+
+This branch (`bench/part-modes`) is a snapshot that includes three partition strategies (`hash`, `kmc`, `kmtricks`) and a ready-to-run benchmark harness.
+
+### 1. Build
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target tuna -j$(nproc)
+cd ..
+```
+
+### 2. Prepare a file-of-files
+
+Create a plain text file listing one input FASTA/FASTQ path per line:
+
+```
+/path/to/sample1.fa
+/path/to/sample2.fa.gz
+...
+```
+
+Pass it to tuna with an `@` prefix (e.g. `@myfiles.list`).
+
+### 3. Run the benchmark
+
+```bash
+bash benchmark/bench_part_modes.sh  <fof_file>  <out_dir>  [KEY=VALUE ...]
+```
+
+Key parameters (all optional):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `K` | 31 | k-mer length |
+| `M` | 17 | minimizer length |
+| `THREADS` | `"1 2 4 8"` | space-separated thread counts to test |
+| `PARTS` | 32 | number of partitions |
+| `REPS` | 1 | repetitions per configuration |
+| `KMC_SIG` | 9 | KMC signature length (5–11, `kmc` mode only) |
+
+Example on 200 E. coli assemblies, partition phase only, 4 threads:
+
+```bash
+bash benchmark/bench_part_modes.sh ~/data/ecoli200.list results/ecoli200 \
+    K=31 M=17 THREADS="4" PARTS=512 REPS=1
+```
+
+The script only runs **Phase 1 (partitioning)** — it stops before counting so runs finish quickly and measure partition quality in isolation.
+
+Outputs written to `<out_dir>/`:
+- `runs.csv` — one row per (mode, threads, rep): wall time, RSS, phase timings, load-balance stats
+- `partitions.csv` — per-partition byte sizes (rep 1 only)
+- `<run_id>.log` — full tuna stderr + GNU time report per run
+
+### 4. Plot the results
+
+Requires Python 3 with `pandas`, `matplotlib`, `numpy`:
+
+```bash
+pip install pandas matplotlib numpy   # once
+python3 benchmark/plot_part_modes.py  <out_dir>
+```
+
+Five figures are saved under `<out_dir>/`:
+
+| File | Content |
+|------|---------|
+| `plot_wall_time.png` | Wall time vs thread count, one line per strategy |
+| `plot_speedup.png` | Parallel speedup relative to 1-thread baseline |
+| `plot_phases.png` | Stacked phase bars: scan+partition / count+write |
+| `plot_balance.png` | Load-balance ratio (max/mean) + per-partition size violin |
+| `plot_summary.png` | 2×2 summary grid of the above |
+
+---
+
 It uses [kache-hash](https://github.com/vicLeva/kache-hash) as its streaming k-mer hash table.
 Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (SIMD FASTA/FASTQ, ~5 GB/s), and minimizer hashing uses a C++ port of [simd-minimizers](https://github.com/Daniel-Liu-c0deb0t/simd-minimizers) (canonical ntHash, two-stack sliding window minimum).
 

@@ -235,7 +235,7 @@ for mode in "${MODES[@]}"; do
                 "$run_no" "$total_runs" "$t" "$rep"
 
             # Build command array — FLAGS may contain multiple words
-            cmd=("$TUNA" -k "$K" -m "$M" -n "$PARTS" -t "$t" -kt -w "$wdir/")
+            cmd=("$TUNA" -k "$K" -m "$M" -n "$PARTS" -t "$t" -kt -tp -w "$wdir/")
             if [[ -n "${FLAGS[$mode]}" ]]; then
                 read -ra extra_flags <<< "${FLAGS[$mode]}"
                 cmd+=("${extra_flags[@]}")
