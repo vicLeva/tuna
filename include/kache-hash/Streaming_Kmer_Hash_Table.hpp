@@ -364,6 +364,26 @@ public:
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
+    // Issues a non-blocking L1 prefetch using only the l-mer minimizer stored at
+    // offset `min_pos` inside a packed superkmer byte array (kache 2-bit encoding).
+    // O(l) work — cheaper than prefetch(Kmer_Window) which needs a fully
+    // initialised window.  Call this one superkmer ahead to hide the LLC miss
+    // behind the current superkmer's hot loop.
+    void prefetch_packed(const uint8_t* packed, const uint8_t min_pos) const
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf_l[l];
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint16_t pos = static_cast<uint16_t>(min_pos) + i;
+            buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
+        }
+        nt_hash::Roller<l> roller;
+        roller.init(buf_l);
+        const uint64_t pf_nt_h = roller.canonical();
+        const uint64_t pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
+    }
+
     // Registers a new user and returns a unique token for it.
     Token register_user() { return Token(registered_thread_count++); }
 

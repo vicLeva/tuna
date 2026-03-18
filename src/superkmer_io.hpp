@@ -85,6 +85,15 @@ struct SuperkmerWriter
         file.write(buf.data(), static_cast<std::streamsize>(buf.size()));
         buf.clear();
     }
+
+    // Flush to an in-memory string sink (streaming mode — avoids disk I/O).
+    void flush_to_mem(std::string& dst, std::mutex& mtx)
+    {
+        if (buf.empty()) return;
+        std::lock_guard<std::mutex> g(mtx);
+        dst.append(buf);
+        buf.clear();
+    }
 };
 
 
@@ -164,4 +173,45 @@ private:
     const uint8_t* ptr_ = nullptr;
     size_t      len_     = 0;
     uint8_t     min_pos_ = 0;
+};
+
+
+// ─── In-memory reader (streaming mode) ───────────────────────────────────────
+//
+// Same interface as SuperkmerReader but backed by an existing std::string
+// rather than an mmap'd file.  Used by the streaming pipeline to avoid the
+// disk write + mmap round-trip between Phase 1 and Phase 2.
+
+struct MemoryReader
+{
+    MemoryReader() = default;
+    explicit MemoryReader(const std::string& data) noexcept
+        : cur_(data.data()), end_(data.data() + data.size()) {}
+
+    bool next() noexcept
+    {
+        if (cur_ + 2 > end_) return false;
+        const uint8_t len8 = static_cast<uint8_t>(*cur_);
+        if (len8 == 0) return false;
+        min_pos_ = static_cast<uint8_t>(cur_[1]);
+        cur_ += 2;
+        const size_t packed_bytes = (static_cast<size_t>(len8) + 3u) / 4u;
+        if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
+        ptr_  = reinterpret_cast<const uint8_t*>(cur_);
+        len_  = len8;
+        cur_ += packed_bytes;
+        return true;
+    }
+
+    const uint8_t* packed_data() const noexcept { return ptr_; }
+    size_t         size()        const noexcept { return len_; }
+    uint8_t        min_pos()     const noexcept { return min_pos_; }
+    bool           ok()          const noexcept { return cur_ != nullptr; }
+
+private:
+    const char*    cur_     = nullptr;
+    const char*    end_     = nullptr;
+    const uint8_t* ptr_     = nullptr;
+    size_t         len_     = 0;
+    uint8_t        min_pos_ = 0;
 };

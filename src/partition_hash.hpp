@@ -277,6 +277,154 @@ PartitionStats partition_kmers_impl(
 }
 
 
+// ─── Parallel harness (in-memory sinks) ───────────────────────────────────────
+//
+// Same logic as partition_kmers_impl but writes packed superkmers into
+// per-partition std::string buffers instead of disk files.  Used by the
+// streaming pipeline to avoid the Phase 1 disk write + Phase 2 mmap round-trip.
+
+template <uint16_t k, uint16_t l, typename PartitionFn>
+PartitionStats partition_kmers_mem_impl(
+    const Config&             cfg,
+    std::vector<std::string>& bufs,
+    PartitionFn               partition_fn)
+{
+    const size_t n_files      = cfg.input_files.size();
+    const size_t n_threads_req = static_cast<size_t>(cfg.num_threads);
+    const size_t n_parts      = cfg.num_partitions;
+
+    // Single gz file + multiple threads → producer-consumer (reuse the
+    // same consumers but flush to bufs instead of ofstreams).
+    // For simplicity we use the multi-file path capped at n_files threads.
+    const size_t n_threads = (n_files == 1 && n_threads_req > 1)
+        ? n_threads_req   // gz single-file: all threads participate
+        : std::min(n_threads_req, n_files);
+
+    // Single .gz file: producer-consumer variant using in-memory sinks.
+    if (n_files == 1 && n_threads_req > 1) {
+        const auto& gz_path = cfg.input_files[0];
+        const bool is_gz = gz_path.size() > 3 &&
+                           gz_path.compare(gz_path.size() - 3, 3, ".gz") == 0;
+        if (is_gz) {
+            using Batch = std::vector<std::string>;
+            constexpr size_t MAX_QUEUE  = 32;
+            constexpr size_t BATCH_SEQS = 512;
+            const size_t n_consumers = n_threads - 1;
+
+            std::deque<Batch>       queue;
+            std::mutex              q_mutex;
+            std::condition_variable q_cv;
+            bool                    producer_done = false;
+            std::vector<std::mutex> buf_mutexes(n_parts);
+            std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
+
+            auto producer_fn = [&]() {
+                SeqReader reader;
+                if (!reader.load(gz_path)) {
+                    std::lock_guard<std::mutex> lk(q_mutex);
+                    producer_done = true;
+                    q_cv.notify_all();
+                    return;
+                }
+                while (true) {
+                    Batch batch;
+                    size_t seq_count = 0;
+                    while (seq_count < BATCH_SEQS && reader.read_next_seq()) {
+                        split_actg(reader.seq(), reader.seq_len(),
+                                   [&](const char* c, size_t cl) { batch.emplace_back(c, cl); });
+                        ++seq_count;
+                    }
+                    if (batch.empty()) break;
+                    { std::unique_lock<std::mutex> lk(q_mutex);
+                      q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
+                      queue.push_back(std::move(batch)); }
+                    q_cv.notify_one();
+                }
+                { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
+                q_cv.notify_all();
+            };
+
+            auto consumer_fn = [&]() {
+                const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+                MinimizerWindow<k, l>        min_it;
+                std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
+                uint64_t local_seqs = 0, local_kmers = 0;
+                while (true) {
+                    Batch batch;
+                    { std::unique_lock<std::mutex> lk(q_mutex);
+                      q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
+                      if (queue.empty()) break;
+                      batch = std::move(queue.front());
+                      queue.pop_front(); }
+                    q_cv.notify_one();
+                    for (const auto& chunk : batch) {
+                        extract_superkmers_from_actg<k, l>(
+                            chunk.data(), chunk.size(), partition_fn,
+                            min_it, writers, local_kmers);
+                        ++local_seqs;
+                        for (size_t p = 0; p < n_parts; ++p)
+                            if (writers[p].needs_flush())
+                                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                    }
+                }
+                for (size_t p = 0; p < n_parts; ++p)
+                    writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                total_seqs .fetch_add(local_seqs,  std::memory_order_relaxed);
+                total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            };
+
+            std::vector<std::thread> threads;
+            threads.reserve(n_threads);
+            threads.emplace_back(producer_fn);
+            for (size_t t = 0; t < n_consumers; ++t)
+                threads.emplace_back(consumer_fn);
+            for (auto& th : threads) th.join();
+            return { total_seqs.load(), total_kmers.load() };
+        }
+    }
+
+    // Multi-file (or single plain file): file-level work-stealing.
+    std::atomic<size_t>     next_file{0};
+    std::vector<std::mutex> buf_mutexes(n_parts);
+    std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
+
+    auto worker = [&]() {
+        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+        SeqSource            source;
+        MinimizerWindow<k, l>        min_it;
+        std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
+        uint64_t local_seqs = 0, local_kmers = 0;
+
+        while (true) {
+            const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
+            if (fi >= n_files) break;
+
+            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
+                extract_superkmers_from_actg<k, l>(
+                    chunk, len, partition_fn, min_it, writers, local_kmers);
+                ++local_seqs;
+                for (size_t p = 0; p < n_parts; ++p)
+                    if (writers[p].needs_flush())
+                        writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+            });
+        }
+
+        for (size_t p = 0; p < n_parts; ++p)
+            writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+
+        total_seqs .fetch_add(local_seqs,  std::memory_order_relaxed);
+        total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker);
+    for (auto& th : threads) th.join();
+    return { total_seqs.load(), total_kmers.load() };
+}
+
+
 // ─── Public ───────────────────────────────────────────────────────────────────
 
 template <uint16_t k, uint16_t l>
@@ -286,5 +434,15 @@ PartitionStats partition_kmers(
 {
     const size_t n = cfg.num_partitions;
     return partition_kmers_impl<k, l>(cfg, buckets,
+        [n](uint64_t h) -> size_t { return h % n; });
+}
+
+template <uint16_t k, uint16_t l>
+PartitionStats partition_kmers_mem(
+    const Config&             cfg,
+    std::vector<std::string>& bufs)
+{
+    const size_t n = cfg.num_partitions;
+    return partition_kmers_mem_impl<k, l>(cfg, bufs,
         [n](uint64_t h) -> size_t { return h % n; });
 }

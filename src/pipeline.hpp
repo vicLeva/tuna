@@ -13,9 +13,25 @@
 #include "ram_mode.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <vector>
+
+#ifdef __linux__
+#  include <sys/sysinfo.h>
+#endif
+
+// Returns available RAM in bytes (Linux sysinfo; 0 if unavailable).
+inline uint64_t available_ram_bytes()
+{
+#ifdef __linux__
+    struct sysinfo si{};
+    if (sysinfo(&si) == 0)
+        return static_cast<uint64_t>(si.freeram + si.bufferram) * si.mem_unit;
+#endif
+    return 0;
+}
 
 
 // ─── Timing helper ────────────────────────────────────────────────────────────
@@ -61,21 +77,96 @@ int run(const Config& cfg)
         return 0;
     }
 
+    // ── Decide pipeline mode: in-memory (no disk round-trip) vs disk ──────
+    //
+    // In-memory mode: Phase 1 writes packed superkmers to per-partition
+    // std::string buffers; Phase 2 reads from them via MemoryReader.
+    // Saves the disk write (Phase 1) + mmap setup (Phase 2) overhead.
+    //
+    // Condition: estimated packed superkmer size < 60% of available RAM.
+    // Packed size ≈ 35% of uncompressed sequence size.
+    // .gz files are expanded by GZ_EXPAND=6 for the estimate.
+    const bool use_mem_pipeline = [&]() -> bool {
+        if (cfg.ram_mode) return false;  // -ram uses partition_and_count_ram instead
+        uint64_t est_raw = 0;
+        for (const auto& f : cfg.input_files) {
+            std::error_code ec;
+            uint64_t fsz = std::filesystem::file_size(f, ec);
+            if (ec) continue;
+            const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
+            est_raw += is_gz ? fsz * 6 : fsz;
+        }
+        const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
+        const uint64_t avail = available_ram_bytes();
+        return avail > 0 && est_packed < avail * 6 / 10;
+    }();
+
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
     const size_t p1_threads = static_cast<size_t>(cfg.num_threads);
     if (!cfg.hide_progress)
         std::cerr << "[1/2] Partitioning into " << cfg.num_partitions
                   << " partitions  (" << p1_threads << " thread"
-                  << (p1_threads > 1 ? "s" : "") << ")...\n";
+                  << (p1_threads > 1 ? "s" : "")
+                  << (use_mem_pipeline ? ", in-memory" : "") << ")...\n";
+
+    PartitionStats stats;
+    const auto t_part = std::chrono::steady_clock::now();
+
+    if (use_mem_pipeline) {
+        // In-memory: write to per-partition string buffers.
+        std::vector<std::string> part_bufs(cfg.num_partitions);
+        stats = partition_kmers_mem<k, l>(cfg, part_bufs);
+
+        const double t_phase1 = elapsed_s(t_part);
+        if (!cfg.hide_progress)
+            std::cerr << "    " << stats.seqs  << " sequences, "
+                      << stats.kmers << " k-mers  ("
+                      << t_phase1 << "s)\n";
+
+        if (cfg.partition_only) {
+            std::cerr << "phase1: " << t_phase1 << "s\n";
+            if (!cfg.hide_progress)
+                std::cerr << "[done] partition only\n";
+            return 0;
+        }
+
+        const size_t p2_threads = std::min(static_cast<size_t>(cfg.num_threads),
+                                           static_cast<size_t>(cfg.num_partitions));
+        if (!cfg.hide_progress)
+            std::cerr << "[2/2] Counting + writing  (" << p2_threads << " thread"
+                      << (p2_threads > 1 ? "s" : "") << ", in-memory)...\n";
+
+        const auto t2 = std::chrono::steady_clock::now();
+        std::ofstream out(cfg.output_file);
+        if (!out) {
+            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+            return 1;
+        }
+        const auto [total_inserted, total_written] =
+            count_and_write_mem<k, l>(cfg, stats.kmers, part_bufs, out);
+
+        const double t_phase2 = elapsed_s(t2);
+        if (!cfg.hide_progress)
+            std::cerr << "    " << total_inserted << " k-mers processed, "
+                      << total_written << " unique written  ("
+                      << t_phase2 << "s)\n";
+
+        std::cerr << "phase1: " << t_phase1 << "s\n"
+                  << "phase2: " << t_phase2 << "s\n";
+        if (!cfg.hide_progress)
+            std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
+        return 0;
+    }
+
+    // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
 
     std::vector<std::ofstream> buckets(cfg.num_partitions);
     for (size_t p = 0; p < cfg.num_partitions; ++p)
         buckets[p].open(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers",
                         std::ios::binary);
 
-    const auto t_part = std::chrono::steady_clock::now();
-    const auto stats = partition_kmers<k, l>(cfg, buckets);
+    stats = partition_kmers<k, l>(cfg, buckets);
     for (auto& f : buckets) f.close();
 
     const double t_phase1 = elapsed_s(t_part);

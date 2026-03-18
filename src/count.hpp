@@ -59,9 +59,9 @@ struct PartitionDebugInfo {
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t l, typename Reader = SuperkmerReader>
 uint64_t count_partition(
-    SuperkmerReader&                                                      reader,
+    Reader&                                                               reader,
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
@@ -74,37 +74,87 @@ uint64_t count_partition(
     // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
 
-    while (reader.next()) {
-        const uint8_t* packed   = reader.packed_data();
-        const size_t   len      = reader.size();
-        const uint8_t  min_pos  = reader.min_pos();
-        if (len < k) continue;
+    // 1-ahead prefetch: for each superkmer N, issue prefetch_packed for N+1
+    // BEFORE processing N, hiding the ~40 ns LLC miss behind N's hot loop.
+    //
+    // Timing model (k=31, m=21, typical superkmer = 11 k-mers):
+    //   T+0:   prefetch_packed(nxt)  — O(l≈21) hash, ~5 ns, miss starts
+    //   T+5:   process cur: 11 upserts × ~2 ns ≈ 22 ns
+    //   T+27:  init_packed_with_min(nxt) — O(k+l≈52) ≈ 20 ns
+    //   T+47:  first upsert(nxt)  — LLC miss resolves at T+45 ns → ~2 ns stall
+    //   vs current: 0 ns of overlap → 40 ns stall per superkmer.
+    //
+    // For min_pos==0xFF (KMC sentinel, no precomputed minimizer): falls back to
+    // the original prefetch-after-init pattern for those superkmers.
 
-        const uint32_t sk_kmers = static_cast<uint32_t>(len - k + 1);
+    // ── Prime the pump ────────────────────────────────────────────────────────
+    if (!reader.next()) return inserted;
 
-        // min_pos == 0xFF is a sentinel (KMC mode: multiple ntHash minimizers
-        // possible within one superkmer) — fall back to MinimizerWindow::reset().
-        // Otherwise use the stored position to compute ntHash in O(l) vs O(k).
-        kache_hash::Kmer_Window<k, l> win;
-        if (min_pos != 0xFF) {
-            const uint64_t mh = win.init_packed_with_min(packed, min_pos);
-            if (dbg) min_kmer_count[mh] += sk_kmers;
+    const uint8_t* cur_packed  = reader.packed_data();
+    size_t         cur_len     = reader.size();
+    uint8_t        cur_min_pos = reader.min_pos();
+
+    kache_hash::Kmer_Window<k, l> win;
+    if (cur_len >= k) {
+        if (cur_min_pos != 0xFF) {
+            const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
+            if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
         } else {
-            win.init_packed(packed);
+            win.init_packed(cur_packed);
+        }
+        table.prefetch(win);  // cold-start: no previous superkmer to hide behind
+    }
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
+    while (reader.next()) {
+        const uint8_t* nxt_packed  = reader.packed_data();
+        const size_t   nxt_len     = reader.size();
+        const uint8_t  nxt_min_pos = reader.min_pos();
+
+        // Issue prefetch for NEXT bucket BEFORE processing CURRENT superkmer.
+        if (nxt_len >= k && nxt_min_pos != 0xFF)
+            table.prefetch_packed(nxt_packed, nxt_min_pos);
+
+        // Process CURRENT superkmer.
+        if (cur_len >= k) {
+            table.upsert(win, inc, uint32_t(1), token);
+            ++inserted;
+
+            // Unpack subsequent bases directly as DNA::Base (kache encoding).
+            const uint8_t* byte_ptr = cur_packed + (k >> 2);
+            int shift = static_cast<int>(6u - 2u * (k & 3u));
+            for (size_t i = k; i < cur_len; ++i) {
+                const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
+                shift -= 2;
+                if (shift < 0) { shift = 6; ++byte_ptr; }
+                win.advance(b);
+                table.upsert(win, inc, uint32_t(1), token);
+                ++inserted;
+            }
         }
 
-        // Prefetch the primary bucket before the first upsert.
-        table.prefetch(win);
+        // Advance to next: reinitialise window from the already-prefetched data.
+        cur_packed  = nxt_packed;
+        cur_len     = nxt_len;
+        cur_min_pos = nxt_min_pos;
+        if (cur_len >= k) {
+            if (cur_min_pos != 0xFF) {
+                const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
+                if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
+            } else {
+                win.init_packed(cur_packed);
+                table.prefetch(win);  // 0xFF fallback: prefetch after init
+            }
+        }
+    }
 
+    // ── Last superkmer ────────────────────────────────────────────────────────
+    if (cur_len >= k) {
         table.upsert(win, inc, uint32_t(1), token);
         ++inserted;
-
-        // Unpack subsequent bases directly as DNA::Base (kache encoding), no
-        // ASCII round-trip.  Maintain byte pointer + shift counter to avoid
-        // division/modulo in the hot loop.
-        const uint8_t* byte_ptr = packed + (k >> 2);
+        const uint8_t* byte_ptr = cur_packed + (k >> 2);
         int shift = static_cast<int>(6u - 2u * (k & 3u));
-        for (size_t i = k; i < len; ++i) {
+        for (size_t i = k; i < cur_len; ++i) {
             const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
             shift -= 2;
             if (shift < 0) { shift = 6; ++byte_ptr; }
@@ -439,6 +489,76 @@ std::pair<uint64_t, uint64_t> count_and_write(
             }
         }
     }
+
+    return { total_inserted.load(), total_written.load() };
+}
+
+
+// ─── In-memory counting harness ───────────────────────────────────────────────
+//
+// Same as count_and_write but reads from per-partition std::string buffers
+// (populated by partition_kmers_mem) instead of mmap'd disk files.
+// Each partition buffer is cleared after processing to release memory
+// incrementally — peak RSS ≈ largest-single-partition buffer, not all at once.
+
+template <uint16_t k, uint16_t l>
+std::pair<uint64_t, uint64_t> count_and_write_mem(
+    const Config&             cfg,
+    uint64_t                  total_kmers,
+    std::vector<std::string>& part_bufs,
+    std::ofstream&            out)
+{
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>;
+
+    const size_t n_parts   = cfg.num_partitions;
+    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+
+    std::mutex            out_mutex;
+    std::atomic<uint64_t> total_inserted{0}, total_written{0};
+
+    std::mutex            ov_stats_mutex;
+    std::atomic<uint64_t> ov_total{0};
+
+    auto worker = [&](size_t tid) {
+        typename table_t::Token token;
+        std::string chunk;
+
+        for (size_t p = tid; p < n_parts; p += n_threads) {
+            const size_t n_files = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
+            const size_t init_sz = std::clamp(
+                per_part,
+                size_t(1u << 18),
+                size_t(1u << 22));
+            table_t table(init_sz, 1);
+
+            uint64_t ins;
+            {
+                MemoryReader reader(part_bufs[p]);
+                ins = count_partition<k, l, MemoryReader>(reader, table, token);
+            }
+            // Release the buffer immediately after counting to cap peak RSS.
+            { std::string tmp; part_bufs[p].swap(tmp); }
+
+            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
+
+            const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
+            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    if (ov_total.load() > 0)
+        std::cerr << "[overflow] " << ov_total.load() << " k-mers went to overflow\n";
 
     return { total_inserted.load(), total_written.load() };
 }
