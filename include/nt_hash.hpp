@@ -1,6 +1,6 @@
 #pragma once
 
-// Canonical ntHash rolling hash for DNA l-mers.
+// Canonical ntHash rolling hash for DNA m-mers.
 //
 // Reference: Mohamadi et al., "ntHash: recursive nucleotide hashing",
 //            Bioinformatics 2016. Classic ntHash (not ntHash2).
@@ -9,8 +9,8 @@
 // simd-minimizers (Rust crate seq-hash, NtHasher<true>).
 //
 // Usage:
-//   nt_hash::Roller h(l);
-//   h.init(seq);                       // initialise on seq[0..l-1]
+//   nt_hash::Roller h(m);
+//   h.init(seq);                       // initialise on seq[0..m-1]
 //   uint64_t hc = h.canonical();
 //   h.roll(out_2bit, in_2bit);         // slide window by 1
 //   uint64_t hc2 = h.canonical();
@@ -66,40 +66,40 @@ inline bool is_dna(char c) noexcept {
 
 // ── Rolling hash ─────────────────────────────────────────────────────────────
 //
-// Maintains the ntHash of a sliding l-mer window.
+// Maintains the ntHash of a sliding m-mer window.
 //
 // Forward hash formula:
-//   H_fwd(s[0..l-1]) = XOR_{i=0}^{l-1} rol(FWD[s[i]], l-1-i)
+//   H_fwd(s[0..m-1]) = XOR_{i=0}^{m-1} rol(FWD[s[i]], m-1-i)
 // Rolling update (drop s_out from left, add s_in on right):
-//   H_fwd_new = rol(H_fwd, 1) ^ rol(FWD[s_out], l) ^ FWD[s_in]
+//   H_fwd_new = rol(H_fwd, 1) ^ rol(FWD[s_out], m) ^ FWD[s_in]
 //
 // Reverse-complement hash formula:
-//   H_rev(s[0..l-1]) = XOR_{i=0}^{l-1} rol(REV[s[i]], i)
-//   (this equals the forward ntHash of the RC l-mer comp(s[l-1])…comp(s[0]))
+//   H_rev(s[0..m-1]) = XOR_{i=0}^{m-1} rol(REV[s[i]], i)
+//   (this equals the forward ntHash of the RC m-mer comp(s[m-1])…comp(s[0]))
 // Rolling update:
-//   H_rev_new = ror(H_rev, 1) ^ ror(REV[s_out], 1) ^ rol(REV[s_in], l-1)
+//   H_rev_new = ror(H_rev, 1) ^ ror(REV[s_out], 1) ^ rol(REV[s_in], m-1)
 
-template <uint16_t l>
+template <uint16_t m>
 class Roller {
     uint64_t fwd_ = 0, rev_ = 0;
 
 public:
     Roller() noexcept = default;
 
-    // Initialise from seq[0..l-1].
+    // Initialise from seq[0..m-1].
     void init(const char* seq) noexcept {
         fwd_ = 0; rev_ = 0;
-        for (uint16_t i = 0; i < l; ++i) {
+        for (uint16_t i = 0; i < m; ++i) {
             const uint8_t b = to_2bit(seq[i]);
-            fwd_ ^= rol64(FWD[b], l - 1 - i);
+            fwd_ ^= rol64(FWD[b], m - 1 - i);
             rev_ ^= rol64(REV[b], i);
         }
     }
 
     // Slide the window: `out_2bit` leaves from the left, `in_2bit` enters on the right.
     void roll(uint8_t out_2bit, uint8_t in_2bit) noexcept {
-        fwd_ = rol64(fwd_, 1) ^ rol64(FWD[out_2bit], l) ^ FWD[in_2bit];
-        rev_ = ror64(rev_, 1) ^ ror64(REV[out_2bit], 1) ^ rol64(REV[in_2bit], l - 1);
+        fwd_ = rol64(fwd_, 1) ^ rol64(FWD[out_2bit], m) ^ FWD[in_2bit];
+        rev_ = ror64(rev_, 1) ^ ror64(REV[out_2bit], 1) ^ rol64(REV[in_2bit], m - 1);
     }
 
     uint64_t fwd()       const noexcept { return fwd_; }

@@ -45,7 +45,7 @@ inline double elapsed_s(std::chrono::steady_clock::time_point t0)
 
 // ─── Core run function ────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
@@ -64,7 +64,7 @@ int run(const Config& cfg)
         }
 
         const auto t1 = std::chrono::steady_clock::now();
-        const auto [total_inserted, total_written] = partition_and_count_ram<k, l>(cfg, out);
+        const auto [total_inserted, total_written] = partition_and_count_ram<k, m>(cfg, out);
         const double t_ram = elapsed_s(t1);
 
         if (!cfg.hide_progress)
@@ -116,7 +116,7 @@ int run(const Config& cfg)
     if (use_mem_pipeline) {
         // In-memory: write to per-partition string buffers.
         std::vector<std::string> part_bufs(cfg.num_partitions);
-        stats = partition_kmers_mem<k, l>(cfg, part_bufs);
+        stats = partition_kmers_mem<k, m>(cfg, part_bufs);
 
         const double t_phase1 = elapsed_s(t_part);
         if (!cfg.hide_progress)
@@ -144,7 +144,7 @@ int run(const Config& cfg)
             return 1;
         }
         const auto [total_inserted, total_written] =
-            count_and_write_mem<k, l>(cfg, stats.kmers, part_bufs, out);
+            count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, out);
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
@@ -166,7 +166,7 @@ int run(const Config& cfg)
         buckets[p].open(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers",
                         std::ios::binary);
 
-    stats = partition_kmers<k, l>(cfg, buckets);
+    stats = partition_kmers<k, m>(cfg, buckets);
     for (auto& f : buckets) f.close();
 
     const double t_phase1 = elapsed_s(t_part);
@@ -198,7 +198,7 @@ int run(const Config& cfg)
         return 1;
     }
 
-    const auto [total_inserted, total_written] = count_and_write<k, l>(cfg, stats.kmers, out);
+    const auto [total_inserted, total_written] = count_and_write<k, m>(cfg, stats.kmers, out);
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)
@@ -217,15 +217,15 @@ int run(const Config& cfg)
 }
 
 
-// ─── Runtime dispatch (k × l) ────────────────────────────────────────────────
+// ─── Runtime dispatch (k × m) ────────────────────────────────────────────────
 // kache-hash Kmer<k> encodes bases as 2 bits in a single uint64_t → k ≤ 32.
-// Only odd k and odd l (even values admit reverse-complement palindromes).
+// Only odd k and odd m (even values admit reverse-complement palindromes).
 // Supported k: 11..31 (odd)
-// Supported l:  9..k-2 (odd, strictly less than k)
+// Supported m:  9..k-2 (odd, strictly less than k)
 
-#define TUNA_DISPATCH(K, L)  if (k == (K) && l == (L)) return run<K, L>(cfg)
+#define TUNA_DISPATCH(K, L)  if (k == (K) && m == (L)) return run<K, L>(cfg)
 
-inline int dispatch(uint16_t k, uint16_t l, const Config& cfg)
+inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
 {
     // k = 11  (1 pair)
     TUNA_DISPATCH(11,  9);
@@ -260,9 +260,9 @@ inline int dispatch(uint16_t k, uint16_t l, const Config& cfg)
     TUNA_DISPATCH(31, 17); TUNA_DISPATCH(31, 19); TUNA_DISPATCH(31, 21); TUNA_DISPATCH(31, 23);
     TUNA_DISPATCH(31, 25); TUNA_DISPATCH(31, 27); TUNA_DISPATCH(31, 29);
 
-    std::cerr << "tuna: error: unsupported combination k=" << k << " l=" << l << "\n"
+    std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
               << "  k must be odd in [11,31]  (kache-hash Kmer fits in 64 bits, k ≤ 32)\n"
-              << "  l must be odd in [9,k-2]  (strictly less than k)\n";
+              << "  m must be odd in [9,k-2]  (strictly less than k)\n";
     return 1;
 }
 

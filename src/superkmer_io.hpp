@@ -5,10 +5,10 @@
 // Each superkmer is stored as two header bytes followed by the bases packed 4
 // per byte in kache-hash encoding (A=0, C=1, G=2, T=3), MSB-first.
 //
-//   len_bases — number of bases (max 255; superkmers are at most 2k−l bases).
-//   min_pos   — 0-indexed start position of the minimizer l-mer within the
+//   len_bases — number of bases (max 255; superkmers are at most 2k−m bases).
+//   min_pos   — 0-indexed start position of the minimizer m-mer within the
 //               superkmer.  Stored so Phase 2 can compute ntHash(minimizer)
-//               in O(l) without running MinimizerWindow::reset() in O(k).
+//               in O(m) without running MinimizerWindow::reset() in O(k).
 //
 // Packed encoding: base i is at bits 7-2*(i%4) of byte i/4.
 // This is 4x smaller than ASCII.  Phase 2 unpacks directly to DNA::Base
@@ -55,7 +55,7 @@ struct SuperkmerWriter
 
     // Serialise one superkmer.
     // `data` is ASCII DNA (ACGT, any case); `len` is the number of bases;
-    // `min_pos` is the 0-indexed start of the minimizer l-mer within the superkmer.
+    // `min_pos` is the 0-indexed start of the minimizer m-mer within the superkmer.
     void append(const char* data, uint8_t len, uint8_t min_pos)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
@@ -156,7 +156,7 @@ struct SuperkmerReader
     // Number of bases in the current superkmer.
     size_t size() const { return len_; }
 
-    // 0-indexed start position of the minimizer l-mer within the current superkmer.
+    // 0-indexed start position of the minimizer m-mer within the current superkmer.
     uint8_t min_pos() const { return min_pos_; }
 
     // Total mapped bytes — available for diagnostics / capacity estimation.

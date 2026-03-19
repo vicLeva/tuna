@@ -8,9 +8,9 @@
 // of file format or compression (helicase for plain files, SeqReader+split for gz).
 //
 // Internals:
-//   extract_superkmers_from_actg<k, l, PartitionFn>  — pure ACTG sequence logic,
+//   extract_superkmers_from_actg<k, m, PartitionFn>  — pure ACTG sequence logic,
 //                                                       no I/O, no threads.
-//   partition_kmers_impl<k, l, PartitionFn>           — parallel harness.
+//   partition_kmers_impl<k, m, PartitionFn>           — parallel harness.
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
@@ -35,16 +35,16 @@
 // every superkmer has a single well-defined minimizer.
 //
 // min_pos is obtained from MinimizerWindow::min_lmer_pos() — the position of the
-// minimizer l-mer is tracked as a side-effect of the sliding-window minimum with
+// minimizer m-mer is tracked as a side-effect of the sliding-window minimum with
 // no extra scan.  This replaces the old O(sk_len) find_minimizer_pos rescan that
 // consumed ~22% of phase1 cycles.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t m, typename PartitionFn>
 void extract_superkmers_from_actg(
     const char* const             seq,
     const size_t                  seq_len,
     PartitionFn&&                 partition_fn,
-    MinimizerWindow<k, l>&        min_it,
+    MinimizerWindow<k, m>&        min_it,
     std::vector<SuperkmerWriter>& writers,
     uint64_t&                     kmer_count)
 {
@@ -93,7 +93,7 @@ void extract_superkmers_from_actg(
 // The queue is bounded (MAX_QUEUE batches) for backpressure.  Consumers flush
 // SuperkmerWriters to the shared bucket files under per-bucket mutexes.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_gz_pc(
     const Config&               cfg,
     const std::string&          gz_path,
@@ -157,7 +157,7 @@ PartitionStats partition_kmers_gz_pc(
     auto consumer_fn = [&]() {
         // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
         const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
-        MinimizerWindow<k, l>        min_it;
+        MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -173,7 +173,7 @@ PartitionStats partition_kmers_gz_pc(
             q_cv.notify_one();                  // wake producer if it was waiting for space
 
             for (const auto& chunk : batch) {
-                extract_superkmers_from_actg<k, l>(
+                extract_superkmers_from_actg<k, m>(
                     chunk.data(), chunk.size(), partition_fn,
                     min_it, writers, local_kmers);
                 ++local_seqs;
@@ -213,7 +213,7 @@ PartitionStats partition_kmers_gz_pc(
 // Load balancing is coarse (file granularity) but for equal-size files
 // (e.g. 200 × 4.7 MB E. coli) the imbalance is negligible.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_impl(
     const Config&               cfg,
     std::vector<std::ofstream>& buckets,
@@ -227,7 +227,7 @@ PartitionStats partition_kmers_impl(
     if (n_files == 1 && n_threads_req > 1) {
         const auto& f = cfg.input_files[0];
         if (f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
-            return partition_kmers_gz_pc<k, l>(cfg, f, buckets,
+            return partition_kmers_gz_pc<k, m>(cfg, f, buckets,
                                                partition_fn, n_threads_req);
     }
 
@@ -242,7 +242,7 @@ PartitionStats partition_kmers_impl(
         // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
         const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
         SeqSource            source;
-        MinimizerWindow<k, l>        min_it;
+        MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -251,7 +251,7 @@ PartitionStats partition_kmers_impl(
             if (fi >= n_files) break;
 
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                extract_superkmers_from_actg<k, l>(
+                extract_superkmers_from_actg<k, m>(
                     chunk, len, partition_fn, min_it, writers, local_kmers);
                 ++local_seqs;
                 for (size_t p = 0; p < n_parts; ++p)
@@ -283,7 +283,7 @@ PartitionStats partition_kmers_impl(
 // per-partition std::string buffers instead of disk files.  Used by the
 // streaming pipeline to avoid the Phase 1 disk write + Phase 2 mmap round-trip.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_mem_impl(
     const Config&             cfg,
     std::vector<std::string>& bufs,
@@ -346,7 +346,7 @@ PartitionStats partition_kmers_mem_impl(
 
             auto consumer_fn = [&]() {
                 const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
-                MinimizerWindow<k, l>        min_it;
+                MinimizerWindow<k, m>        min_it;
                 std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
                 uint64_t local_seqs = 0, local_kmers = 0;
                 while (true) {
@@ -358,7 +358,7 @@ PartitionStats partition_kmers_mem_impl(
                       queue.pop_front(); }
                     q_cv.notify_one();
                     for (const auto& chunk : batch) {
-                        extract_superkmers_from_actg<k, l>(
+                        extract_superkmers_from_actg<k, m>(
                             chunk.data(), chunk.size(), partition_fn,
                             min_it, writers, local_kmers);
                         ++local_seqs;
@@ -391,7 +391,7 @@ PartitionStats partition_kmers_mem_impl(
     auto worker = [&]() {
         const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
         SeqSource            source;
-        MinimizerWindow<k, l>        min_it;
+        MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -400,7 +400,7 @@ PartitionStats partition_kmers_mem_impl(
             if (fi >= n_files) break;
 
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                extract_superkmers_from_actg<k, l>(
+                extract_superkmers_from_actg<k, m>(
                     chunk, len, partition_fn, min_it, writers, local_kmers);
                 ++local_seqs;
                 for (size_t p = 0; p < n_parts; ++p)
@@ -427,22 +427,22 @@ PartitionStats partition_kmers_mem_impl(
 
 // ─── Public ───────────────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 PartitionStats partition_kmers(
     const Config&               cfg,
     std::vector<std::ofstream>& buckets)
 {
     const size_t n = cfg.num_partitions;
-    return partition_kmers_impl<k, l>(cfg, buckets,
+    return partition_kmers_impl<k, m>(cfg, buckets,
         [n](uint64_t h) -> size_t { return h % n; });
 }
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 PartitionStats partition_kmers_mem(
     const Config&             cfg,
     std::vector<std::string>& bufs)
 {
     const size_t n = cfg.num_partitions;
-    return partition_kmers_mem_impl<k, l>(cfg, bufs,
+    return partition_kmers_mem_impl<k, m>(cfg, bufs,
         [n](uint64_t h) -> size_t { return h % n; });
 }

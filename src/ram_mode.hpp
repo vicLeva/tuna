@@ -42,20 +42,20 @@
 // ─── Insert-superkmer brick ───────────────────────────────────────────────────
 //
 // Insert all k-mers from ASCII superkmer seq[0..len-1] into `table`.
-// min_nt_h is the canonical ntHash of the l-minimizer — already available from
+// min_nt_h is the canonical ntHash of the m-minimizer — already available from
 // MinimizerWindow::hash().  Caller owns the table exclusively — no locking.
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 void insert_superkmer_ascii(
     const char* seq, uint8_t len, uint64_t min_nt_h,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>& table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token)
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>& table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
 {
     if (len < k) return;
 
     auto inc = [](uint32_t v) { return v + 1; };
 
-    kache_hash::Kmer_Window<k, l> win;
+    kache_hash::Kmer_Window<k, m> win;
     win.init_with_hash_ascii(seq, min_nt_h);
     table.upsert(win, inc, uint32_t(1), token);
 
@@ -72,12 +72,12 @@ void insert_superkmer_ascii(
 // Only inserts superkmers where (pid % n_threads == thread_id).
 // Table (pid) is exclusively owned by thread (pid % n_threads) — no mutex.
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 void insert_actg_chunk_filtered(
     const char* seq, size_t seq_len,
-    MinimizerWindow<k, l>& min_it,
-    std::vector<kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>*>& tables,
-    std::vector<typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token>& tokens,
+    MinimizerWindow<k, m>& min_it,
+    std::vector<kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>*>& tables,
+    std::vector<typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token>& tokens,
     size_t n_parts, size_t thread_id, size_t n_threads,
     uint64_t& kmer_count)
 {
@@ -95,7 +95,7 @@ void insert_actg_chunk_filtered(
         if (new_hash != prev_hash || pos - sk_start >= 255u) {
             if (pid % n_threads == thread_id) {
                 const auto sk_len = static_cast<uint8_t>(sk_end - sk_start);
-                insert_superkmer_ascii<k, l>(seq + sk_start, sk_len, prev_hash,
+                insert_superkmer_ascii<k, m>(seq + sk_start, sk_len, prev_hash,
                                              *tables[pid], tokens[pid]);
                 kmer_count += sk_len - k + 1;
             }
@@ -109,7 +109,7 @@ void insert_actg_chunk_filtered(
     // flush last superkmer
     if (pid % n_threads == thread_id) {
         const auto sk_len = static_cast<uint8_t>(sk_end - sk_start);
-        insert_superkmer_ascii<k, l>(seq + sk_start, sk_len, prev_hash,
+        insert_superkmer_ascii<k, m>(seq + sk_start, sk_len, prev_hash,
                                      *tables[pid], tokens[pid]);
         kmer_count += sk_len - k + 1;
     }
@@ -126,12 +126,12 @@ void insert_actg_chunk_filtered(
 // After all workers finish, a second parallel phase writes output from each
 // table (work-stealing: threads pick the next unwritten partition atomically).
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> partition_and_count_ram(
     const Config&  cfg,
     std::ofstream& out)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts   = static_cast<size_t>(cfg.num_partitions);
@@ -169,7 +169,7 @@ std::pair<uint64_t, uint64_t> partition_and_count_ram(
 
     // ── Workers ───────────────────────────────────────────────────────
     auto worker = [&](size_t tid) {
-        MinimizerWindow<k, l> min_it;
+        MinimizerWindow<k, m> min_it;
         uint64_t local_kmers = 0;
         auto& wq = wqs[tid];
 
@@ -184,7 +184,7 @@ std::pair<uint64_t, uint64_t> partition_and_count_ram(
             }
             wq.not_full.notify_one();
 
-            insert_actg_chunk_filtered<k, l>(
+            insert_actg_chunk_filtered<k, m>(
                 task->data.data(), task->data.size(),
                 min_it, table_ptrs, tokens,
                 n_parts, tid, n_threads, local_kmers);

@@ -1,15 +1,15 @@
 #pragma once
 
-// MinimizerWindow<k, l> — streaming l-minimizer iterator using canonical ntHash.
+// MinimizerWindow<k, m> — streaming m-minimizer iterator using canonical ntHash.
 //
 // Used in:
 //   Phase 0+1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
-//   Phase 2   (kache-hash Kmer_Window) — field replaces Min_Iterator<k,l> (XXH3),
+//   Phase 2   (kache-hash Kmer_Window) — field replaces Min_Iterator<k,m> (XXH3),
 //             but bypassed for hash/kmtricks superkmers (min_pos byte used instead);
 //             only active for KMC-mode superkmers (min_pos == 0xFF fallback).
 //
 // Algorithm: two-stack (prefix/suffix) sliding window minimum over ntHash values.
-// Window size w = k - l; arrays sized exactly w+1 for compact cache footprint.
+// Window size w = k - m; arrays sized exactly w+1 for compact cache footprint.
 // O(1) amortised per advance() call.
 //
 // Two input encodings are supported:
@@ -18,51 +18,51 @@
 //            converts to nt via b ^ (b >> 1), then calls advance_impl().
 //
 // Public interface:
-//   MinimizerWindow<k, l> win;
+//   MinimizerWindow<k, m> win;
 //   win.reset(seq);              // initialise to first k ASCII characters
-//   uint64_t h = win.hash();     // canonical ntHash of the l-minimizer
+//   uint64_t h = win.hash();     // canonical ntHash of the m-minimizer
 //   win.advance(ch);             // slide by one ASCII character
 //   win.advance_kache(b);        // slide by one kache-encoded base
 //   win.hash(min_coord);         // hash + dummy min_coord (for kache-hash API)
-//   win.min_lmer_pos();          // absolute position of the minimizer l-mer
-//                                //   (0 = first l-mer passed to reset())
+//   win.min_lmer_pos();          // absolute position of the minimizer m-mer
+//                                //   (0 = first m-mer passed to reset())
 
 #include "nt_hash.hpp"
 
 #include <cstdint>
 #include <limits>
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 class MinimizerWindow {
-    static_assert(l < k, "minimizer length l must be strictly less than k-mer length k");
+    static_assert(m < k, "minimizer length m must be strictly less than k-mer length k");
 
-    // Window size: number of l-mers in a k-mer window.
-    static constexpr uint16_t w = k - l;
+    // Window size: number of m-mers in a k-mer window.
+    static constexpr uint16_t w = k - m;
 
-    // Mask to clear the top 2 bits of the 2*l-bit l-mer (used in advance_impl).
-    static constexpr uint64_t clear_msn_ = ~(uint64_t(0b11) << (2 * (l - 1)));
+    // Mask to clear the top 2 bits of the 2*m-bit m-mer (used in advance_impl).
+    static constexpr uint64_t clear_msn_ = ~(uint64_t(0b11) << (2 * (m - 1)));
 
-    // 2-bit packed l-mer (forward and RC), tracked to extract the outgoing
+    // 2-bit packed m-mer (forward and RC), tracked to extract the outgoing
     // base cheaply when rolling the ntHash.  nt encoding (A=0,C=1,T=2,G=3).
     uint64_t lmer_     = 0;
     uint64_t lmer_bar_ = 0;
 
-    nt_hash::Roller<l> hasher_;
+    nt_hash::Roller<m> hasher_;
 
     // ── Two-stack sliding window minimum ─────────────────────────────────────
     //
     // H[0..w] is a circular overwrite buffer of w+1 entries.
     // pivot is the index where the NEXT hash will be written (= current leftmost,
-    // the l-mer that will be evicted on the next advance).
+    // the m-mer that will be evicted on the next advance).
     //
     // Invariant when pivot = p (0 < p < w):
-    //   H[p]   = leftmost l-mer of the current window (will be evicted next)
-    //   H[p+1] = rightmost l-mer (just written)
-    //   H[p+2..w], H[0..p-1] = the w-1 intermediate l-mers
+    //   H[p]   = leftmost m-mer of the current window (will be evicted next)
+    //   H[p+1] = rightmost m-mer (just written)
+    //   H[p+2..w], H[0..p-1] = the w-1 intermediate m-mers
     //
     // After reset_windows() (pivot reset to w):
-    //   H[w]   = leftmost l-mer  (will be evicted on the first advance)
-    //   H[0]   = rightmost l-mer (most recently written before the reset)
+    //   H[w]   = leftmost m-mer  (will be evicted on the first advance)
+    //   H[0]   = rightmost m-mer (most recently written before the reset)
     //
     // M_pre[i] = min(H[0..i])   — prefix minimums from the rightmost end.
     // M_suf    = running min of the suffix (rightmost/newer) half since last reset.
@@ -73,19 +73,19 @@ class MinimizerWindow {
     //
     // Position tracking (H_pos[], M_pre_pos[], M_suf_pos):
     //   Each H[i] has a paired H_pos[i] = absolute position (0-indexed from
-    //   the first l-mer passed to reset()) of that l-mer.  M_pre_pos[i] and
+    //   the first m-mer passed to reset()) of that m-mer.  M_pre_pos[i] and
     //   M_suf_pos mirror the position of the minimum alongside the hash.
     //   min_lmer_pos() returns the position of the current minimizer with no
     //   extra work — avoids the O(superkmer_len) find_minimizer_pos rescan.
 
     uint64_t    H[w + 1];
-    uint64_t    H_pos[w + 1];     // absolute l-mer position for each H[] entry
+    uint64_t    H_pos[w + 1];     // absolute m-mer position for each H[] entry
     uint64_t    M_pre[w + 1];
     uint64_t    M_pre_pos[w + 1]; // position of the minimum in each prefix slice
     uint64_t    M_suf     = 0;
     uint64_t    M_suf_pos = 0;
     std::size_t pivot     = 0;
-    uint64_t    next_pos_ = 0;    // absolute position of the next l-mer to be written
+    uint64_t    next_pos_ = 0;    // absolute position of the next m-mer to be written
 
     static constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
     static constexpr auto umin = [](uint64_t a, uint64_t b) noexcept { return a < b ? a : b; };
@@ -109,9 +109,9 @@ class MinimizerWindow {
 
     // Core slide: `in_2bit` is nt-encoded (A=0,C=1,T=2,G=3).
     void advance_impl(uint8_t in_2bit) noexcept {
-        const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l - 1))) & 0x3u;
+        const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (m - 1))) & 0x3u;
         lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
+        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (m - 1)));
         hasher_.roll(out_2bit, in_2bit);
 
         const uint64_t h    = hasher_.canonical();
@@ -136,28 +136,28 @@ public:
     void reset(const char* seq) noexcept {
         lmer_     = 0;
         lmer_bar_ = 0;
-        for (uint16_t i = 0; i < l; ++i) {
+        for (uint16_t i = 0; i < m; ++i) {
             const uint8_t b = nt_hash::to_2bit(seq[i]);
-            lmer_     |= (uint64_t(b)      << (2 * (l - 1 - i)));
+            lmer_     |= (uint64_t(b)      << (2 * (m - 1 - i)));
             lmer_bar_ |= (uint64_t(b ^ 2u) << (2 * i));
         }
         hasher_.init(seq);
 
         pivot       = w;
         H[pivot]    = hasher_.canonical();
-        H_pos[pivot]= 0; // l-mer seq[0..l-1] is at position 0
+        H_pos[pivot]= 0; // m-mer seq[0..m-1] is at position 0
 
-        for (uint16_t i = l; i < k; ++i) {
-            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (l - 1))) & 0x3u;
+        for (uint16_t i = m; i < k; ++i) {
+            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (m - 1))) & 0x3u;
             const uint8_t in_2bit  = nt_hash::to_2bit(seq[i]);
             lmer_     = ((lmer_     & clear_msn_) << 2) | in_2bit;
-            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
+            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (m - 1)));
             hasher_.roll(out_2bit, in_2bit);
             --pivot;
             H[pivot]     = hasher_.canonical();
-            H_pos[pivot] = static_cast<uint64_t>(i - l + 1); // l-mer seq[i-l+1..i]
+            H_pos[pivot] = static_cast<uint64_t>(i - m + 1); // m-mer seq[i-m+1..i]
         }
-        next_pos_ = static_cast<uint64_t>(w + 1); // next advance adds l-mer at position w+1
+        next_pos_ = static_cast<uint64_t>(w + 1); // next advance adds m-mer at position w+1
         reset_windows();
     }
 
@@ -172,7 +172,7 @@ public:
         advance_impl(kache_b ^ (kache_b >> 1));
     }
 
-    // Canonical ntHash of the l-minimizer of the current k-mer window.
+    // Canonical ntHash of the m-minimizer of the current k-mer window.
     uint64_t hash() const noexcept {
         return umin(M_pre[pivot], M_suf);
     }
@@ -185,7 +185,7 @@ public:
     }
 
     // Absolute position (0-indexed from the sequence passed to reset()) of the
-    // l-mer that achieves the minimizer hash in the current k-mer window.
+    // m-mer that achieves the minimizer hash in the current k-mer window.
     // Consistent with hash(): same tie-breaking (suffix wins on equality).
     uint64_t min_lmer_pos() const noexcept {
         return (M_pre[pivot] < M_suf) ? M_pre_pos[pivot] : M_suf_pos;

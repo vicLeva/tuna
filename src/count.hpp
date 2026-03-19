@@ -4,9 +4,9 @@
 //
 // Three independently modifiable bricks:
 //
-//   count_partition<k,l>   — read one partition file, fill a hash table.
-//   write_counts<k,l>      — drain one table to the output stream.
-//   count_and_write<k,l>   — parallel harness (threading / scheduling).
+//   count_partition<k,m>   — read one partition file, fill a hash table.
+//   write_counts<k,m>      — drain one table to the output stream.
+//   count_and_write<k,m>   — parallel harness (threading / scheduling).
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
@@ -51,19 +51,19 @@ struct PartitionDebugInfo {
 // Drain an already-open SuperkmerReader into the caller-provided hash table.
 // The table must be private to the calling thread (mt_=false, no locking).
 //
-// The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(l)
+// The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(m)
 // instead of running MinimizerWindow::reset() in O(k).  All k-mers in the
 // superkmer share the same minimizer, so init_packed_with_hash sets the bucket
 // hash once and advance() skips nt_min entirely.  A single prefetch() hides
-// the LLC miss (~200 ns) behind the O(l) lmer hash computation.
+// the LLC miss (~200 ns) behind the O(m) lmer hash computation.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t l, typename Reader = SuperkmerReader>
+template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader>
 uint64_t count_partition(
     Reader&                                                               reader,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>::Token& token,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
 
@@ -78,9 +78,9 @@ uint64_t count_partition(
     // BEFORE processing N, hiding the ~40 ns LLC miss behind N's hot loop.
     //
     // Timing model (k=31, m=21, typical superkmer = 11 k-mers):
-    //   T+0:   prefetch_packed(nxt)  — O(l≈21) hash, ~5 ns, miss starts
+    //   T+0:   prefetch_packed(nxt)  — O(m≈21) hash, ~5 ns, miss starts
     //   T+5:   process cur: 11 upserts × ~2 ns ≈ 22 ns
-    //   T+27:  init_packed_with_min(nxt) — O(k+l≈52) ≈ 20 ns
+    //   T+27:  init_packed_with_min(nxt) — O(k+m≈52) ≈ 20 ns
     //   T+47:  first upsert(nxt)  — LLC miss resolves at T+45 ns → ~2 ns stall
     //   vs current: 0 ns of overlap → 40 ns stall per superkmer.
     //
@@ -94,7 +94,7 @@ uint64_t count_partition(
     size_t         cur_len     = reader.size();
     uint8_t        cur_min_pos = reader.min_pos();
 
-    kache_hash::Kmer_Window<k, l> win;
+    kache_hash::Kmer_Window<k, m> win;
     if (cur_len >= k) {
         if (cur_min_pos != 0xFF) {
             const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
@@ -176,9 +176,9 @@ uint64_t count_partition(
 
 // ─── Output brick ─────────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t l, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false>
 uint64_t write_counts(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, l>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
     const Config&   cfg,
     std::string&    chunk,
     std::ofstream&  out,
@@ -226,13 +226,13 @@ uint64_t write_counts(
 //   n=128:  1M →  32K buckets →  2 MB meta
 //   n=256: 512K→  16K buckets →  1 MB meta
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
     std::ofstream& out)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -281,7 +281,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
             table_t table(init_sz, 1);
 
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
-            const uint64_t ins = count_partition<k, l>(reader, table, token, dbg);
+            const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
             if (dbg) {
@@ -292,7 +292,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
 
             // Collect per-partition overflow stats.
@@ -501,14 +501,14 @@ std::pair<uint64_t, uint64_t> count_and_write(
 // Each partition buffer is cleared after processing to release memory
 // incrementally — peak RSS ≈ largest-single-partition buffer, not all at once.
 
-template <uint16_t k, uint16_t l>
+template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
     std::ofstream&            out)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, l>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -537,7 +537,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             uint64_t ins;
             {
                 MemoryReader reader(part_bufs[p]);
-                ins = count_partition<k, l, MemoryReader>(reader, table, token);
+                ins = count_partition<k, m, MemoryReader>(reader, table, token);
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }
@@ -546,7 +546,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
 
-            const uint64_t wrt = write_counts<k, l>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };
