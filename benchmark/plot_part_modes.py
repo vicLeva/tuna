@@ -41,14 +41,16 @@ PALETTE = {
     "kmc":      "#388E3C",   # green
     "kmtricks": "#F57C00",   # orange
     "hash":     "#1976D2",   # blue
+    "xxhash":   "#7B1FA2",   # purple
 }
-MARKERS = {"kmc": "^", "kmtricks": "s", "hash": "o"}
+MARKERS = {"kmc": "^", "kmtricks": "s", "hash": "o", "xxhash": "D"}
 LABELS  = {
     "kmc":      "KMC (default)",
     "kmtricks": "kmtricks",
-    "hash":     "Hash",
+    "hash":     "ntHash",
+    "xxhash":   "XXH3",
 }
-MODE_ORDER = ["kmc", "kmtricks", "hash"]
+MODE_ORDER = ["kmc", "kmtricks", "hash", "xxhash"]
 
 PHASE_COLORS = {
     "scan+partition": "#90CAF9",   # light blue
@@ -78,9 +80,10 @@ def load_data(out_dir: Path):
     runs  = pd.read_csv(runs_csv)
     parts = pd.read_csv(parts_csv)
 
-    # Ensure mode column is a category in our desired order
-    runs["mode"]  = pd.Categorical(runs["mode"],  categories=MODE_ORDER, ordered=True)
-    parts["mode"] = pd.Categorical(parts["mode"], categories=MODE_ORDER, ordered=True)
+    # Only keep modes that are present in the data (future-proof for partial runs)
+    present = [m for m in MODE_ORDER if m in runs["mode"].values]
+    runs["mode"]  = pd.Categorical(runs["mode"],  categories=present, ordered=True)
+    parts["mode"] = pd.Categorical(parts["mode"], categories=present, ordered=True)
 
     # Aggregate over reps: mean + std of numeric columns
     num_cols = [
@@ -98,13 +101,13 @@ def load_data(out_dir: Path):
     min_t = min(all_threads)
     max_t = max(all_threads)
 
-    return runs, parts, means, stds, all_threads, min_t, max_t
+    return runs, parts, means, stds, all_threads, min_t, max_t, present
 
 
 # ── Plot 1: Wall time vs threads ──────────────────────────────────────────────
 
-def plot_wall_time(ax, means, stds, all_threads):
-    for mode in MODE_ORDER:
+def plot_wall_time(ax, means, stds, all_threads, modes=None):
+    for mode in (modes or MODE_ORDER):
         dm = means[means["mode"] == mode].sort_values("threads")
         ds = stds [stds ["mode"] == mode].sort_values("threads")
         ax.errorbar(
@@ -126,13 +129,13 @@ def plot_wall_time(ax, means, stds, all_threads):
 
 # ── Plot 2: Speedup ───────────────────────────────────────────────────────────
 
-def plot_speedup(ax, means, all_threads, min_t):
+def plot_speedup(ax, means, all_threads, min_t, modes=None):
     ideal_x = all_threads
     ideal_y = [t / min_t for t in ideal_x]
     ax.plot(ideal_x, ideal_y, "k--", alpha=0.35, linewidth=1.5,
             label="Ideal (linear)")
 
-    for mode in MODE_ORDER:
+    for mode in (modes or MODE_ORDER):
         dm = means[means["mode"] == mode].sort_values("threads")
         baseline_rows = dm[dm["threads"] == min_t]["wall_s"].values
         if len(baseline_rows) == 0:
@@ -157,21 +160,23 @@ def plot_speedup(ax, means, all_threads, min_t):
 
 # ── Plot 3: Phase breakdown (one panel per mode) ──────────────────────────────
 #
-# axes: sequence of 3 Axes objects, one per mode in MODE_ORDER.
+# axes: sequence of Axes objects, one per mode in MODE_ORDER.
 # All panels share the same y-scale so bar heights are directly comparable.
 
-def plot_phases(axes, means, all_threads):
+def plot_phases(axes, means, all_threads, modes=None):
+    modes = modes or MODE_ORDER
     # Shared y-limit: tallest total bar across all modes
     y_max = 0.0
-    for mode in MODE_ORDER:
+    for mode in modes:
         dm = means[means["mode"] == mode]
-        y_max = max(y_max, (dm["phase01_s"] + dm["phase2_s"]).max())
+        if not dm.empty:
+            y_max = max(y_max, (dm["phase01_s"] + dm["phase2_s"]).max())
     y_max *= 1.15
 
     x     = np.arange(len(all_threads))
     bar_w = 0.55
 
-    for ax, mode in zip(axes, MODE_ORDER):
+    for ax, mode in zip(axes, modes):
         dm  = means[means["mode"] == mode].sort_values("threads")
         p01 = dm["phase01_s"].values
         p2  = dm["phase2_s"].values
@@ -192,31 +197,32 @@ def plot_phases(axes, means, all_threads):
 
     # y-label and legend only on the leftmost panel
     axes[0].set_ylabel("Time (s)", fontsize=10)
-    for ax in axes[1:]:
+    for ax in list(axes)[1:]:
         ax.set_ylabel("")
         ax.tick_params(labelleft=False)
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    axes[0].legend(handles, labels, fontsize=9, loc="upper right")
+    handles, labels_leg = axes[0].get_legend_handles_labels()
+    axes[0].legend(handles, labels_leg, fontsize=9, loc="upper right")
 
 
 # ── Plot 4: Partition load balance ───────────────────────────────────────────
 
-def plot_balance(ax, parts, means):
+def plot_balance(ax, parts, means, modes=None):
     """
     Left y-axis: violin plots of per-partition byte sizes (from partitions.csv).
     Right y-axis: max/mean imbalance ratio (from runs.csv means, first threads entry).
     """
+    modes = modes or MODE_ORDER
     # Use mean imbalance aggregated over all thread counts (balance is nearly
     # thread-independent for Phase 1).
     imb_by_mode = (means.groupby("mode", observed=True)["p_imbalance"]
-                        .mean().reindex(MODE_ORDER))
+                        .mean().reindex(modes))
 
-    x = np.arange(len(MODE_ORDER))
+    x = np.arange(len(modes))
     width = 0.55
 
     # Violin plots of per-partition sizes ─────────────────────────────────────
-    for mi, mode in enumerate(MODE_ORDER):
+    for mi, mode in enumerate(modes):
         data = parts[parts["mode"] == mode]["size_bytes"].values / 1024  # kB
         if len(data) == 0:
             continue
@@ -237,7 +243,7 @@ def plot_balance(ax, parts, means):
                 vp[part_name].set_linewidth(1.5)
 
     ax.set_xticks(x)
-    ax.set_xticklabels([LABELS[m] for m in MODE_ORDER], fontsize=9)
+    ax.set_xticklabels([LABELS[m] for m in modes], fontsize=9)
     style_ax(ax,
              ylabel="Partition size (kB)",
              title="Partition load balance",
@@ -257,8 +263,8 @@ def plot_balance(ax, parts, means):
 
 # ── Plot 5: Peak RSS ──────────────────────────────────────────────────────────
 
-def plot_rss(ax, means, all_threads):
-    for mode in MODE_ORDER:
+def plot_rss(ax, means, all_threads, modes=None):
+    for mode in (modes or MODE_ORDER):
         dm = means[means["mode"] == mode].sort_values("threads")
         ax.plot(
             dm["threads"], dm["peak_rss_kb"] / 1024,   # → MB
@@ -290,7 +296,7 @@ def main():
     fmt     = args.format
     dpi     = args.dpi
 
-    runs, parts, means, stds, all_threads, min_t, max_t = load_data(out_dir)
+    runs, parts, means, stds, all_threads, min_t, max_t, modes = load_data(out_dir)
 
     print(f"Loaded {len(runs)} run(s) across "
           f"{runs['mode'].nunique()} mode(s), "
@@ -306,49 +312,53 @@ def main():
         print(f"  Saved: {p}")
         plt.close(fig)
 
+    n_modes = len(modes)
+
     # 1. Wall time
     fig, ax = plt.subplots(figsize=(6, 4))
-    plot_wall_time(ax, means, stds, all_threads)
+    plot_wall_time(ax, means, stds, all_threads, modes)
     fig.tight_layout()
     save(fig, "plot_wall_time")
 
     # 2. Speedup
     fig, ax = plt.subplots(figsize=(6, 4))
-    plot_speedup(ax, means, all_threads, min_t)
+    plot_speedup(ax, means, all_threads, min_t, modes)
     fig.tight_layout()
     save(fig, "plot_speedup")
 
     # 3. Phase breakdown (one panel per mode)
-    fig, ax_ph = plt.subplots(1, 3, figsize=(13, 4), sharey=True)
+    fig, ax_ph = plt.subplots(1, n_modes, figsize=(4 * n_modes + 1, 4), sharey=True)
     fig.suptitle("Phase time breakdown", fontsize=11, fontweight="bold")
-    plot_phases(ax_ph, means, all_threads)
+    plot_phases(ax_ph if n_modes > 1 else [ax_ph], means, all_threads, modes)
     fig.tight_layout()
     save(fig, "plot_phases")
 
     # 4. Balance
     fig, ax = plt.subplots(figsize=(6, 4))
-    plot_balance(ax, parts, means)
+    plot_balance(ax, parts, means, modes)
     fig.tight_layout()
     save(fig, "plot_balance")
 
     # 5. Peak RSS
     fig, ax = plt.subplots(figsize=(6, 4))
-    plot_rss(ax, means, all_threads)
+    plot_rss(ax, means, all_threads, modes)
     fig.tight_layout()
     save(fig, "plot_rss")
 
-    # ── Summary figure: 2-row GridSpec (top: wall+speedup | bottom: 3×phases) ──
-    fig = plt.figure(figsize=(14, 9))
+    # ── Summary figure: 2-row GridSpec (top: wall+speedup | bottom: N×phases) ──
+    fig = plt.figure(figsize=(4 * n_modes + 2, 9))
     fig.suptitle("tuna — partition strategy comparison", fontsize=13, fontweight="bold")
 
-    gs = GridSpec(2, 6, figure=fig, hspace=0.42, wspace=0.35)
-    ax_wall  = fig.add_subplot(gs[0, :3])
-    ax_speed = fig.add_subplot(gs[0, 3:])
-    ax_ph    = [fig.add_subplot(gs[1, i*2:(i+1)*2]) for i in range(3)]
+    # Bottom row: n_modes phase panels, each 2 columns wide → 2*n_modes total columns.
+    # Top row: wall time (left half) + speedup (right half).
+    gs = GridSpec(2, 2 * n_modes, figure=fig, hspace=0.42, wspace=0.35)
+    ax_wall  = fig.add_subplot(gs[0, :n_modes])
+    ax_speed = fig.add_subplot(gs[0, n_modes:])
+    ax_ph    = [fig.add_subplot(gs[1, i*2:(i+1)*2]) for i in range(n_modes)]
 
-    plot_wall_time(ax_wall,  means, stds, all_threads)
-    plot_speedup  (ax_speed, means, all_threads, min_t)
-    plot_phases   (ax_ph,    means, all_threads)
+    plot_wall_time(ax_wall,  means, stds, all_threads, modes)
+    plot_speedup  (ax_speed, means, all_threads, min_t, modes)
+    plot_phases   (ax_ph,    means, all_threads, modes)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     save(fig, "plot_summary")
