@@ -32,6 +32,8 @@ void print_usage(const char* prog)
         "Partition strategy (default: hash):\n"
         "  -hash       hash strategy (default — no flag needed):\n"
         "              minimizer_hash %% num_partitions. Fast, no pre-scan.\n"
+        "  -xxhash     xxhash strategy: same as -hash but uses canonical XXH3_64bits\n"
+        "              on the 2-bit packed l-mer instead of canonical ntHash.\n"
         "  -kmtricks   kmtricks strategy: pre-scans input to build a\n"
         "              load-balanced minimizer->partition table (Phase 0),\n"
         "              then uses table lookup instead of hash %% num_partitions.\n"
@@ -101,6 +103,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.strategy = PartitionStrategy::KMTRICKS;
         } else if (arg == "-hash") {
             cfg.strategy = PartitionStrategy::HASH;
+        } else if (arg == "-xxhash") {
+            cfg.strategy = PartitionStrategy::XXHASH;
         } else if (arg == "-s") {
             const char* v = next_val("-s"); if (!v) return false;
             cfg.kmc_sig_len = static_cast<uint16_t>(std::stoul(v));

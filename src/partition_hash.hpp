@@ -44,12 +44,12 @@
 // no extra scan.  This replaces the old O(sk_len) find_minimizer_pos rescan that
 // consumed ~22% of phase1 cycles.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t l, typename Window = MinimizerWindow<k,l>, typename PartitionFn>
 void extract_superkmers_from_actg(
     const char* const             seq,
     const size_t                  seq_len,
     PartitionFn&&                 partition_fn,
-    MinimizerWindow<k, l>&        min_it,
+    Window&                       min_it,
     std::vector<SuperkmerWriter>& writers,
     uint64_t&                     kmer_count)
 {
@@ -98,7 +98,7 @@ void extract_superkmers_from_actg(
 // The queue is bounded (MAX_QUEUE batches) for backpressure.  Consumers flush
 // SuperkmerWriters to the shared bucket files under per-bucket mutexes.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t l, typename Window = MinimizerWindow<k,l>, typename PartitionFn>
 PartitionStats partition_kmers_gz_pc(
     const Config&               cfg,
     const std::string&          gz_path,
@@ -160,7 +160,7 @@ PartitionStats partition_kmers_gz_pc(
 
     // Consumer: pull batches from the queue and extract superkmers.
     auto consumer_fn = [&]() {
-        MinimizerWindow<k, l>        min_it;
+        Window                       min_it;
         std::vector<SuperkmerWriter> writers(n_parts);
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -176,7 +176,7 @@ PartitionStats partition_kmers_gz_pc(
             q_cv.notify_one();                  // wake producer if it was waiting for space
 
             for (const auto& chunk : batch) {
-                extract_superkmers_from_actg<k, l>(
+                extract_superkmers_from_actg<k, l, Window>(
                     chunk.data(), chunk.size(), partition_fn,
                     min_it, writers, local_kmers);
                 ++local_seqs;
@@ -216,7 +216,7 @@ PartitionStats partition_kmers_gz_pc(
 // Load balancing is coarse (file granularity) but for equal-size files
 // (e.g. 200 × 4.7 MB E. coli) the imbalance is negligible.
 
-template <uint16_t k, uint16_t l, typename PartitionFn>
+template <uint16_t k, uint16_t l, typename Window = MinimizerWindow<k,l>, typename PartitionFn>
 PartitionStats partition_kmers_impl(
     const Config&               cfg,
     std::vector<std::ofstream>& buckets,
@@ -230,8 +230,8 @@ PartitionStats partition_kmers_impl(
     if (n_files == 1 && n_threads_req > 1) {
         const auto& f = cfg.input_files[0];
         if (f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
-            return partition_kmers_gz_pc<k, l>(cfg, f, buckets,
-                                               partition_fn, n_threads_req);
+            return partition_kmers_gz_pc<k, l, Window>(cfg, f, buckets,
+                                                       partition_fn, n_threads_req);
     }
 
     const size_t n_threads = std::min(n_threads_req, n_files);
@@ -243,7 +243,7 @@ PartitionStats partition_kmers_impl(
 
     auto worker = [&]() {
         SeqSource            source;
-        MinimizerWindow<k, l>        min_it;
+        Window                       min_it;
         std::vector<SuperkmerWriter> writers(n_parts);
         uint64_t local_seqs = 0, local_kmers = 0;
 
@@ -252,7 +252,7 @@ PartitionStats partition_kmers_impl(
             if (fi >= n_files) break;
 
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                extract_superkmers_from_actg<k, l>(
+                extract_superkmers_from_actg<k, l, Window>(
                     chunk, len, partition_fn, min_it, writers, local_kmers);
                 ++local_seqs;
                 for (size_t p = 0; p < n_parts; ++p)
@@ -287,6 +287,21 @@ PartitionStats partition_kmers_hash(
 {
     const size_t n = cfg.num_partitions;
     return partition_kmers_impl<k, l>(cfg, buckets,
+        [n](uint64_t h) -> size_t { return h % n; });
+}
+
+
+// ─── Public: xxhash strategy ──────────────────────────────────────────────────
+// Same as hash strategy but uses canonical XXH3_64bits on the 2-bit packed l-mer
+// instead of canonical ntHash.  Partition mapping is still hash % num_partitions.
+
+template <uint16_t k, uint16_t l>
+PartitionStats partition_kmers_xxhash(
+    const Config&               cfg,
+    std::vector<std::ofstream>& buckets)
+{
+    const size_t n = cfg.num_partitions;
+    return partition_kmers_impl<k, l, MinimizerWindowXXH<k, l>>(cfg, buckets,
         [n](uint64_t h) -> size_t { return h % n; });
 }
 

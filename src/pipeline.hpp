@@ -111,7 +111,9 @@ int run(const Config& cfg)
         ? partition_kmers_kmc<k, l>(cfg, buckets, *kmc_nt, *kmc_pm)
         : cfg.strategy == PartitionStrategy::KMTRICKS
             ? partition_kmers_kmtricks<k, l>(cfg, buckets, *rt)
-            : partition_kmers_hash<k, l>(cfg, buckets);
+            : cfg.strategy == PartitionStrategy::XXHASH
+                ? partition_kmers_xxhash<k, l>(cfg, buckets)
+                : partition_kmers_hash<k, l>(cfg, buckets);
     for (auto& f : buckets) f.close();
 
     const double t_phase1 = elapsed_s(t_part); // partitioning only (excl. pre-scan)

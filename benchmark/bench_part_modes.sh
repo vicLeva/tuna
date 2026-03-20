@@ -2,10 +2,11 @@
 # ==============================================================================
 # bench_part_modes.sh  —  tuna partition-strategy benchmark
 #
-# Compares the three partitioning modes tuna supports:
+# Compares the four partitioning modes tuna supports:
 #   kmc      — KMC-style (default): norm-filtered canonical signature + table
 #   kmtricks — kmtricks-style: pre-scan + load-balanced minimizer table  (-kmtricks)
 #   hash     — simple hash: minimizer_hash % n_partitions               (-hash)
+#   xxhash   — same as hash but uses canonical XXH3 on 2-bit l-mer       (-xxhash)
 #
 # For each mode × thread count × repetition the script records:
 #   • total wall time and peak RSS (from GNU time -v)
@@ -188,12 +189,13 @@ collect_partition_stats() {
 }
 
 # ── Mode definitions ──────────────────────────────────────────────────────────
-MODES=(kmc kmtricks hash)
+MODES=(kmc kmtricks hash xxhash)
 
 declare -A FLAGS
 FLAGS[kmc]="-kmc -s $KMC_SIG"
 FLAGS[kmtricks]="-kmtricks"
 FLAGS[hash]="-hash"
+FLAGS[xxhash]="-xxhash"
 
 # ── Summary header ────────────────────────────────────────────────────────────
 n_threads_entries=$(echo "$THREADS_LIST" | wc -w)

@@ -1,6 +1,9 @@
 #pragma once
 
-// MinimizerWindow<k, l> — streaming l-minimizer iterator using canonical ntHash.
+// MinimizerWindow<k, l>    — streaming l-minimizer iterator using canonical ntHash.
+// MinimizerWindowXXH<k, l> — same algorithm, but uses canonical XXH3_64bits on the
+//                             2-bit packed l-mer instead of ntHash rolling.
+//                             Used by the -xxhash partition strategy benchmark.
 //
 // Used in:
 //   Phase 0+1 (partition_hash.hpp, partition_kmtricks.hpp) — ASCII input path.
@@ -28,6 +31,7 @@
 //                                //   (0 = first l-mer passed to reset())
 
 #include "nt_hash.hpp"
+#include "xxHash/xxhash.h"
 
 #include <cstdint>
 #include <limits>
@@ -187,6 +191,131 @@ public:
     // Absolute position (0-indexed from the sequence passed to reset()) of the
     // l-mer that achieves the minimizer hash in the current k-mer window.
     // Consistent with hash(): same tie-breaking (suffix wins on equality).
+    uint64_t min_lmer_pos() const noexcept {
+        return (M_pre[pivot] < M_suf) ? M_pre_pos[pivot] : M_suf_pos;
+    }
+};
+
+
+// ─── MinimizerWindowXXH<k, l> ────────────────────────────────────────────────
+//
+// Drop-in replacement for MinimizerWindow<k, l> that hashes each l-mer with
+// canonical XXH3_64bits instead of canonical ntHash.
+//
+// "Canonical" here mirrors the ntHash convention:
+//   hash = min(XXH3_64bits(&lmer_fwd, 8), XXH3_64bits(&lmer_rc, 8))
+// where lmer_fwd and lmer_rc are the 2-bit packed l-mer and its reverse
+// complement, maintained identically to MinimizerWindow.
+//
+// The sliding-window minimum structure (two-stack prefix/suffix) is unchanged.
+// The public interface is identical to MinimizerWindow.
+
+template <uint16_t k, uint16_t l>
+class MinimizerWindowXXH {
+    static_assert(l < k, "minimizer length l must be strictly less than k-mer length k");
+
+    static constexpr uint16_t  w         = k - l;
+    static constexpr uint64_t  clear_msn = ~(uint64_t(0b11) << (2 * (l - 1)));
+
+    uint64_t lmer_     = 0;   // 2-bit packed forward l-mer (nt encoding)
+    uint64_t lmer_bar_ = 0;   // 2-bit packed reverse-complement l-mer
+
+    // Two-stack sliding window minimum (same layout as MinimizerWindow).
+    uint64_t    H[w + 1];
+    uint64_t    H_pos[w + 1];
+    uint64_t    M_pre[w + 1];
+    uint64_t    M_pre_pos[w + 1];
+    uint64_t    M_suf     = 0;
+    uint64_t    M_suf_pos = 0;
+    std::size_t pivot     = 0;
+    uint64_t    next_pos_ = 0;
+
+    static constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
+    static constexpr auto umin = [](uint64_t a, uint64_t b) noexcept { return a < b ? a : b; };
+
+    static uint64_t xxh_canonical(uint64_t fwd, uint64_t rc) noexcept {
+        const uint64_t hf = XXH3_64bits(&fwd, sizeof(uint64_t));
+        const uint64_t hr = XXH3_64bits(&rc,  sizeof(uint64_t));
+        return hf < hr ? hf : hr;
+    }
+
+    void reset_windows() noexcept {
+        M_pre[0]     = H[0];
+        M_pre_pos[0] = H_pos[0];
+        for (std::size_t i = 1; i <= w; ++i) {
+            if (H[i] < M_pre[i - 1]) {
+                M_pre[i]     = H[i];
+                M_pre_pos[i] = H_pos[i];
+            } else {
+                M_pre[i]     = M_pre[i - 1];
+                M_pre_pos[i] = M_pre_pos[i - 1];
+            }
+        }
+        M_suf     = U64_MAX;
+        M_suf_pos = 0;
+        pivot     = w;
+    }
+
+    void advance_impl(uint8_t in_2bit) noexcept {
+        lmer_     = ((lmer_     & clear_msn) << 2) | in_2bit;
+        lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
+
+        const uint64_t h   = xxh_canonical(lmer_, lmer_bar_);
+        const uint64_t pos = next_pos_++;
+        H[pivot]     = h;
+        H_pos[pivot] = pos;
+        if (h < M_suf) { M_suf = h; M_suf_pos = pos; }
+
+        if (pivot > 0) --pivot;
+        else           reset_windows();
+    }
+
+public:
+
+    MinimizerWindowXXH() noexcept = default;
+
+    void reset(const char* seq) noexcept {
+        lmer_     = 0;
+        lmer_bar_ = 0;
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint8_t b = nt_hash::to_2bit(seq[i]);
+            lmer_     |= (uint64_t(b)      << (2 * (l - 1 - i)));
+            lmer_bar_ |= (uint64_t(b ^ 2u) << (2 * i));
+        }
+
+        pivot        = w;
+        H[pivot]     = xxh_canonical(lmer_, lmer_bar_);
+        H_pos[pivot] = 0;
+
+        for (uint16_t i = l; i < k; ++i) {
+            const uint8_t in_2bit = nt_hash::to_2bit(seq[i]);
+            lmer_     = ((lmer_     & clear_msn) << 2) | in_2bit;
+            lmer_bar_ = (lmer_bar_ >> 2) | (uint64_t(in_2bit ^ 2u) << (2 * (l - 1)));
+            --pivot;
+            H[pivot]     = xxh_canonical(lmer_, lmer_bar_);
+            H_pos[pivot] = static_cast<uint64_t>(i - l + 1);
+        }
+        next_pos_ = static_cast<uint64_t>(w + 1);
+        reset_windows();
+    }
+
+    void advance(char ch) noexcept {
+        advance_impl(nt_hash::to_2bit(ch));
+    }
+
+    void advance_kache(uint8_t kache_b) noexcept {
+        advance_impl(kache_b ^ (kache_b >> 1));
+    }
+
+    uint64_t hash() const noexcept {
+        return umin(M_pre[pivot], M_suf);
+    }
+
+    uint64_t hash(uint8_t& min_coord) const noexcept {
+        min_coord = 0;
+        return hash();
+    }
+
     uint64_t min_lmer_pos() const noexcept {
         return (M_pre[pivot] < M_suf) ? M_pre_pos[pivot] : M_suf_pos;
     }

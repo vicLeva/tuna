@@ -7,6 +7,7 @@
 
 enum class PartitionStrategy {
     HASH,      // simple minimizer-hash % num_partitions — no pre-scan (default)
+    XXHASH,    // same as HASH but uses canonical XXH3 on 2-bit l-mer instead of ntHash
     KMTRICKS,  // kmtricks-style: rolling minimizer hash + load-balanced table
     KMC,       // KMC norm-filtered signature + load-balanced table
 };
@@ -27,7 +28,7 @@ struct Config {
     PartitionStrategy strategy  = PartitionStrategy::HASH;
     uint16_t     kmc_sig_len   = 9;    // KMC signature length (5–11, default 9)
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
-    bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
+    bool         partition_only = true;  // exit after phase 1 (default on bench/part-modes branch)
     bool         ram_mode      = false; // skip disk partitions: insert k-mers directly into in-RAM tables
     bool         debug_stats  = false; // print per-partition table stats + write minimizer coverage CSV
 
@@ -37,6 +38,7 @@ struct Config {
             case PartitionStrategy::KMC:      return "kmc";
             case PartitionStrategy::KMTRICKS: return "kmtricks";
             case PartitionStrategy::HASH:     return "hash";
+            case PartitionStrategy::XXHASH:   return "xxhash";
         }
         return "hash";
     }
