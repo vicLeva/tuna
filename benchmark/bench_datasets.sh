@@ -4,9 +4,15 @@
 # Usage: bash bench_datasets.sh [THREADS] [K] [KMC_RAM_GB]
 # Example: bash bench_datasets.sh 8 31 250
 #
-# For each dataset, the first min(MAX_FILES, n_files) files are processed
-# individually (one tuna/KMC call per file).  tuna is run for each value
-# of m in M_VALUES; KMC is run once per file.
+# For each dataset, N files are selected from the fof according to the
+# sampling mode (head or spread) and processed individually (one tuna/KMC
+# call per file).  tuna is run for each value of m in M_VALUES; KMC once.
+#
+# Sampling modes:
+#   head   — take the first N files in the fof (default)
+#   spread — pick N files evenly spread across the full fof (always
+#             includes first and last), useful for getting size diversity
+#             without running the full list (e.g. tara big+small)
 #
 # Output layout:
 #   $RESULTS/bench.csv            — one row per (dataset, file, tool, m)
@@ -26,7 +32,6 @@ K=${2:-31}
 KMC_RAM=${3:-250}   # GB — KMC -m flag
 
 M_VALUES=(17 19 21 23)
-MAX_FILES=100
 
 TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
 KMC=kmc
@@ -37,18 +42,16 @@ RESULTS="$WORK/bench_datasets_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS"
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
-# Format: "name:fof_path:kmc_format"
-# kmc_format: -fm = FASTA, -fq = FASTQ
-
-# Format: "name:fof_path:kmc_format:max_files"
-# max_files is optional — defaults to MAX_FILES when omitted or empty.
+# Format: "name:fof_path:kmc_format:max_files:mode"
+#   max_files — how many files to run (default 10)
+#   mode      — head (default) or spread
 DATASETS=(
-    "refseq:/WORKS/vlevallois/data/dataset_refseq/fof.list:-fm"
-    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm"
-    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:10"
-    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm"
-    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm"
-    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:10"
+    "refseq:/WORKS/vlevallois/data/dataset_refseq/fof.list:-fm:10:head"
+    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm:10:head"
+    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:2:head"
+    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm:10:head"
+    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm:10:head"
+    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:2:spread"
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -87,14 +90,9 @@ echo ""
 
 for ENTRY in "${DATASETS[@]}"; do
 
-    DS_NAME="${ENTRY%%:*}"
-    REST="${ENTRY#*:}"
-    FOF="${REST%%:*}"
-    REST2="${REST#*:}"
-    KMC_FMT="${REST2%%:*}"
-    DS_MAX="${REST2#*:}"
-    # If no fourth field, DS_MAX == KMC_FMT (no colon after it) → use global default
-    [ "$DS_MAX" = "$KMC_FMT" ] && DS_MAX="$MAX_FILES"
+    IFS=: read -r DS_NAME FOF KMC_FMT DS_MAX DS_MODE <<< "$ENTRY"
+    DS_MAX="${DS_MAX:-10}"
+    DS_MODE="${DS_MODE:-head}"
 
     if [ ! -f "$FOF" ]; then
         echo "  [SKIP] $DS_NAME: fof not found: $FOF"
@@ -107,9 +105,21 @@ for ENTRY in "${DATASETS[@]}"; do
     DS_DIR="$RESULTS/$DS_NAME"
     mkdir -p "$DS_DIR"
 
-    echo "──── Dataset: $DS_NAME  ($N / $TOTAL files, format: $KMC_FMT) ────────"
+    echo "──── Dataset: $DS_NAME  ($N / $TOTAL files, format: $KMC_FMT, mode: $DS_MODE) ────────"
 
-    mapfile -t FILES < <(head -n "$N" "$FOF")
+    if [ "$DS_MODE" = "spread" ] && [ "$N" -ge 2 ] && [ "$TOTAL" -gt "$N" ]; then
+        # Pick N files evenly spread across the full fof (always includes first and last).
+        # For N=2: first and last file — gives size diversity without running everything.
+        mapfile -t ALL_FILES < "$FOF"
+        FILES=()
+        for i in $(seq 0 $(( N - 1 ))); do
+            idx=$(( i * (TOTAL - 1) / (N - 1) ))
+            FILES+=("${ALL_FILES[$idx]}")
+        done
+        unset ALL_FILES
+    else
+        mapfile -t FILES < <(head -n "$N" "$FOF")
+    fi
 
     # Defined here so they share DS_DIR, KMC_FMT, CSV, etc. via closure.
 
