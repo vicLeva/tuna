@@ -86,20 +86,17 @@ int run(const Config& cfg)
     // Condition: estimated packed superkmer size < 60% of available RAM.
     // Packed size ≈ 35% of uncompressed sequence size.
     // .gz files are expanded by GZ_EXPAND=6 for the estimate.
-    const bool use_mem_pipeline = [&]() -> bool {
-        if (cfg.ram_mode) return false;  // -ram uses partition_and_count_ram instead
-        uint64_t est_raw = 0;
-        for (const auto& f : cfg.input_files) {
-            std::error_code ec;
-            uint64_t fsz = std::filesystem::file_size(f, ec);
-            if (ec) continue;
-            const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-            est_raw += is_gz ? fsz * 6 : fsz;
-        }
-        const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
-        const uint64_t avail = available_ram_bytes();
-        return avail > 0 && est_packed < avail * 6 / 10;
-    }();
+    uint64_t est_raw = 0;
+    for (const auto& f : cfg.input_files) {
+        std::error_code ec;
+        uint64_t fsz = std::filesystem::file_size(f, ec);
+        if (ec) continue;
+        const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
+        est_raw += is_gz ? fsz * 6 : fsz;
+    }
+    const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
+    const uint64_t avail      = available_ram_bytes();
+    const bool use_mem_pipeline = !cfg.ram_mode && avail > 0 && est_packed < avail * 6 / 10;
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
@@ -115,7 +112,26 @@ int run(const Config& cfg)
 
     if (use_mem_pipeline) {
         // In-memory: write to per-partition string buffers.
+        // Pre-reserve each buffer to the estimated final size (with 20% slack) and
+        // touch all pages upfront — converts 12M+ scattered page faults into a single
+        // sequential zero-fill, eliminating the sys-time spike on large partition counts.
         std::vector<std::string> part_bufs(cfg.num_partitions);
+        // Pre-reserve only when total partition memory > 2 GB.
+        // Below that, buffers fit in L3 and grow cheaply; pre-faulting upfront
+        // would merely increase working-set size and add cache pressure.
+        // Above that threshold, 32K+ growing strings cause O(millions) scattered
+        // page faults (measurable as 100s+ of sys time) that pre-faulting eliminates.
+        if (est_packed > 0) {
+            const size_t per_part = static_cast<size_t>(
+                est_packed * 6 / 5 / cfg.num_partitions);   // ×1.2 slack
+            const uint64_t total = static_cast<uint64_t>(per_part) * cfg.num_partitions;
+            if (per_part >= 64 && total > (2ULL << 30)) {
+                for (auto& s : part_bufs) {
+                    s.resize(per_part, '\0');   // allocate + touch all pages
+                    s.clear();                   // size → 0, capacity stays
+                }
+            }
+        }
         stats = partition_kmers_mem<k, m>(cfg, part_bufs);
 
         const double t_phase1 = elapsed_s(t_part);

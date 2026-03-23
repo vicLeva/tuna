@@ -39,14 +39,18 @@
 // no extra scan.  This replaces the old O(sk_len) find_minimizer_pos rescan that
 // consumed ~22% of phase1 cycles.
 
-template <uint16_t k, uint16_t m, typename PartitionFn>
+// FlushFn signature: void(std::vector<SuperkmerWriter>&, size_t partition_id)
+// Called immediately after each append — O(1) per superkmer, O(n_superkmers) total.
+// Replaces the old O(n_parts) scan loop that ran after every sequence.
+template <uint16_t k, uint16_t m, typename PartitionFn, typename FlushFn>
 void extract_superkmers_from_actg(
     const char* const             seq,
     const size_t                  seq_len,
     PartitionFn&&                 partition_fn,
     MinimizerWindow<k, m>&        min_it,
     std::vector<SuperkmerWriter>& writers,
-    uint64_t&                     kmer_count)
+    uint64_t&                     kmer_count,
+    FlushFn&&                     flush_fn)
 {
     if (seq_len < k) return;
 
@@ -66,6 +70,7 @@ void extract_superkmers_from_actg(
             const auto sk_len  = static_cast<uint8_t>(sk_end - sk_start);
             const auto min_pos = static_cast<uint8_t>(prev_min_pos - sk_start);
             writers[pid].append(seq + sk_start, sk_len, min_pos);
+            flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             prev_hash    = new_hash;
             prev_min_pos = min_it.min_lmer_pos();
@@ -78,6 +83,7 @@ void extract_superkmers_from_actg(
     const auto sk_len  = static_cast<uint8_t>(sk_end - sk_start);
     const auto min_pos = static_cast<uint8_t>(prev_min_pos - sk_start);
     writers[pid].append(seq + sk_start, sk_len, min_pos);
+    flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
 }
 
@@ -164,6 +170,10 @@ PartitionStats partition_kmers_gz_pc(
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
+        auto flush_fn = [&](std::vector<SuperkmerWriter>& ws, size_t p) {
+            if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
+        };
+
         while (true) {
             Batch batch;
             {
@@ -178,11 +188,8 @@ PartitionStats partition_kmers_gz_pc(
             for (const auto& chunk : batch) {
                 extract_superkmers_from_actg<k, m>(
                     chunk.data(), chunk.size(), partition_fn,
-                    min_it, writers, local_kmers);
+                    min_it, writers, local_kmers, flush_fn);
                 ++local_seqs;
-                for (size_t p = 0; p < n_parts; ++p)
-                    if (writers[p].needs_flush())
-                        writers[p].flush_to(buckets[p], bucket_mutexes[p]);
             }
         }
 
@@ -249,17 +256,18 @@ PartitionStats partition_kmers_impl(
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
+        auto flush_fn = [&](std::vector<SuperkmerWriter>& ws, size_t p) {
+            if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
+        };
+
         while (true) {
             const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
             if (fi >= n_files) break;
 
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                 extract_superkmers_from_actg<k, m>(
-                    chunk, len, partition_fn, min_it, writers, local_kmers);
+                    chunk, len, partition_fn, min_it, writers, local_kmers, flush_fn);
                 ++local_seqs;
-                for (size_t p = 0; p < n_parts; ++p)
-                    if (writers[p].needs_flush())
-                        writers[p].flush_to(buckets[p], bucket_mutexes[p]);
             });
         }
 
@@ -361,6 +369,9 @@ PartitionStats partition_kmers_mem_impl(
                 MinimizerWindow<k, m>        min_it;
                 std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
                 uint64_t local_seqs = 0, local_kmers = 0;
+                auto flush_fn = [&](std::vector<SuperkmerWriter>& ws, size_t p) {
+                    if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                };
                 while (true) {
                     Batch batch;
                     { std::unique_lock<std::mutex> lk(q_mutex);
@@ -372,11 +383,8 @@ PartitionStats partition_kmers_mem_impl(
                     for (const auto& chunk : batch) {
                         extract_superkmers_from_actg<k, m>(
                             chunk.data(), chunk.size(), partition_fn,
-                            min_it, writers, local_kmers);
+                            min_it, writers, local_kmers, flush_fn);
                         ++local_seqs;
-                        for (size_t p = 0; p < n_parts; ++p)
-                            if (writers[p].needs_flush())
-                                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
                     }
                 }
                 for (size_t p = 0; p < n_parts; ++p)
@@ -407,17 +415,18 @@ PartitionStats partition_kmers_mem_impl(
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0;
 
+        auto flush_fn = [&](std::vector<SuperkmerWriter>& ws, size_t p) {
+            if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+        };
+
         while (true) {
             const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
             if (fi >= n_files) break;
 
             source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                 extract_superkmers_from_actg<k, m>(
-                    chunk, len, partition_fn, min_it, writers, local_kmers);
+                    chunk, len, partition_fn, min_it, writers, local_kmers, flush_fn);
                 ++local_seqs;
-                for (size_t p = 0; p < n_parts; ++p)
-                    if (writers[p].needs_flush())
-                        writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
             });
         }
 
