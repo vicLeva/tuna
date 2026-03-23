@@ -38,24 +38,33 @@ int main(int argc, char* argv[])
 
     // ── Auto-tune partition count from total input size ────────────────────
     // Triggered when -n is not given (num_partitions == 0).
-    // Target: ~2 MB of estimated uncompressed sequence per partition, so that
-    // each partition holds roughly 2M k-mers — well within the 4M hash table
-    // init_sz cap and comfortably L3-resident.
+    // Target: ~2 MB of estimated uncompressed sequence per partition.
     //
-    // .gz files compress at roughly 6× for genomic FASTA/FASTQ, so their raw
-    // file_size() vastly underestimates actual k-mer load.  We apply a
-    // conservative expansion factor to avoid severely under-partitioning inputs
-    // like a single-file human assembly (1 GB gz → 6 GB effective → n=4096
-    // instead of n=512).
+    // .gz files are expanded by GZ_EXPAND to approximate uncompressed size.
     //
-    // n is rounded to the next power of 2 and clamped to [16, fd_budget] where
-    // fd_budget = current RLIMIT_NOFILE - 32 (headroom for other FDs).
+    // Phase 1 performance is bounded by n_parts: each consumer thread keeps one
+    // SuperkmerWriter per partition, so writer-buffer cache footprint = n_parts×4 KB.
+    // Benchmarks show phase1 ∝ n_parts (writer buffers exceed L3 → cache thrashing):
+    //   tara 5.9 GB gz @ n=32768 → phase1 ≈ 387 s
+    //   tara 5.9 GB gz @ n=16384 → phase1 ≈ 202 s  (2× fewer → 2× faster)
+    // GZ_EXPAND=6 pushed tara to n=32768; we cap at 8192 so that writer buffers
+    // (8192×4 KB = 32 MB) stay within a typical server L3 cache.  This cap also
+    // corresponds to writer headers (8192×24 B = 192 KB) fitting in the L2 cache,
+    // which is the regime where random-access append is fast.
+    // Phase 2 tables grow proportionally but the cross-superkmer prefetch hides
+    // the resulting L3 misses (empirically: <10 % phase2 slowdown per 2× n_parts
+    // reduction) so the net effect is a large improvement.
+    //
+    // n is rounded to the next power of 2 and clamped to [16, min(WRITER_CAP, fd_budget)].
     if (cfg.num_partitions == 0) {
         struct rlimit rl{};
         size_t fd_limit = 1024;
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
             fd_limit = static_cast<size_t>(rl.rlim_cur);
         const size_t max_parts = (fd_limit > 32) ? fd_limit - 32 : 16;
+
+        // Hard cap: writer buffers = n_parts×4 KB should fit in a ~32 MB server L3.
+        constexpr size_t WRITER_CACHE_CAP = 8192;
 
         constexpr uint64_t GZ_EXPAND = 6;  // typical genomic FASTA/FASTQ compression ratio
 
@@ -72,7 +81,7 @@ int main(int argc, char* argv[])
         size_t n = 1;
         while (n < raw) n <<= 1;           // next power of 2 >= raw
         n = std::max(n, size_t(16));
-        n = std::min(n, max_parts);
+        n = std::min(n, std::min(max_parts, WRITER_CACHE_CAP));
 
         // For multi-file inputs where average file is small (< 50 MB uncompressed),
         // cap n at next_pow2(n_files): redundant genomes don't add unique k-mer content

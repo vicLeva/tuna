@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench_datasets.sh — tuna (m=17,19,21,23) vs KMC on 6 datasets
+# bench_datasets.sh — tuna (m=21) vs KMC on 6 datasets
 #
 # Usage: bash bench_datasets.sh [THREADS] [K] [KMC_RAM_GB]
 # Example: bash bench_datasets.sh 8 31 250
@@ -31,7 +31,7 @@ THREADS=${1:-8}
 K=${2:-31}
 KMC_RAM=${3:-250}   # GB — KMC -m flag
 
-M_VALUES=(17 19 21 23)
+M_VALUES=(21)
 
 TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
 KMC=kmc
