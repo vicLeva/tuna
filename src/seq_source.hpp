@@ -9,23 +9,21 @@
 //       // chunk is ACTG-only, newline-free; len >= 1
 //   });
 //
-// Dispatch:
-//   Plain files  — zero-copy mmap + helicase SIMD (split_non_actg).
-//   GZ files     — 64 MB streaming window (SeqReader) + split_actg() on each sequence.
+// All input types (plain/gz, FASTA/FASTQ) are handled uniformly by helicase SIMD
+// parsers.  Plain files use zero-copy mmap (MmapInput).  GZ files stream through
+// GzInput, a zlib-backed Block-producer that satisfies the helicase input interface.
 //
-// The internal gz buffer only grows, so reusing one SeqSource across many files
-// eliminates per-file allocation overhead.
+// GzInput is also usable directly — e.g. in producer-consumer harnesses that need
+// to decompress and parse independently from SeqSource.
 
 #include "nt_hash.hpp"
 #include <helicase.hpp>
 #include <zlib.h>
-#include <fstream>
 #include <string>
 #include <vector>
 #include <cstring>
 #include <cstdint>
-#include <cctype>
-#include <algorithm>
+#include <stdexcept>
 
 
 // ── helicase config ───────────────────────────────────────────────────────────
@@ -41,224 +39,95 @@ static constexpr helicase::Config HELICASE_ACTG =
     & ~helicase::advanced::RETURN_RECORD;
 
 
-// ── SeqReader (internal) ──────────────────────────────────────────────────────
-// Streaming FASTA/FASTQ reader with optional gzip decompression.
-// Used by SeqSource for gz files; exposed publicly for callers that need the
-// sequence-at-a-time interface (e.g. partition_kmc pre-scan helper).
+// ── GzInput ───────────────────────────────────────────────────────────────────
+// helicase-compatible Block-producer backed by zlib gz decompression.
+// RANDOM_ACCESS = false; use with FastaParser<CFG, GzInput> / FastqParser<CFG, GzInput>.
+// The constructor eagerly reads the first block so first_byte() is available before
+// any call to next().
 
-enum class SeqFormat { FASTA, FASTQ };
+class GzInput {
+    static constexpr size_t BUF_SIZE = 1u << 16;   // 64 KB ring buffer
 
-struct SeqReader
-{
-    SeqReader()
-    {
-        buf_.reserve(6 << 20);
-        seq_.reserve(6 << 20);
-    }
+    gzFile gz_   = nullptr;
+    bool   eof_  = false;
+    std::vector<uint8_t> buf_;
+    size_t buf_start_ = 0;
+    size_t buf_fill_  = 0;
+    size_t pos_       = 0;
+    alignas(64) uint8_t block_[64] = {};
+    const uint8_t* cur_ptr_    = nullptr;
+    size_t         cur_size_   = 0;
+    uint8_t        first_byte_ = 0;
 
-    ~SeqReader() { close(); }
-
-    bool load(const std::string& path)
-    {
-        close();
-        std::string inner = path;
-        bool gz = false;
-        if (inner.size() > 3) {
-            auto tail = inner.substr(inner.size() - 3);
-            for (char& c : tail) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (tail == ".gz") { gz = true; inner.resize(inner.size() - 3); }
+    void refill() {
+        size_t consumed = pos_ - buf_start_;
+        if (consumed > 0 && consumed <= buf_fill_) {
+            buf_fill_ -= consumed;
+            std::memmove(buf_.data(), buf_.data() + consumed, buf_fill_);
+            buf_start_ = pos_;
         }
-        fmt_ = detect_format(inner);
-        return gz ? load_gz(path) : load_plain(path);
-    }
-
-    bool read_next_seq()
-    {
-        if (gz_ && !gz_eof_ && fmt_ == SeqFormat::FASTQ) {
-            if (buf_.size() - rpos_ < (4u << 20))
-                gz_slide_and_refill();
+        while (buf_fill_ < buf_.size() && !eof_) {
+            int n = gzread(gz_, buf_.data() + buf_fill_,
+                           static_cast<unsigned>(buf_.size() - buf_fill_));
+            if (n <= 0) { eof_ = true; break; }
+            buf_fill_ += static_cast<size_t>(n);
         }
-        seq_.clear();
-        return fmt_ == SeqFormat::FASTQ ? read_fastq() : read_fasta();
     }
 
-    const char* seq()     const { return seq_.data(); }
-    size_t      seq_len() const { return seq_.size(); }
+public:
+    static constexpr bool RANDOM_ACCESS = false;
 
-    void close()
-    {
-        if (gz_) { gzclose(gz_); gz_ = nullptr; gz_eof_ = false; }
-    }
-
-private:
-    SeqFormat         fmt_ = SeqFormat::FASTA;
-    std::vector<char> buf_;
-    std::vector<char> seq_;
-    size_t            rpos_ = 0;
-    gzFile gz_     = nullptr;
-    bool   gz_eof_ = false;
-    static constexpr size_t GZ_CHUNK = 64u << 20;
-
-    bool load_plain(const std::string& path)
-    {
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
-        if (!f) return false;
-        const auto sz = static_cast<size_t>(f.tellg());
-        if (sz == 0) return false;
-        f.seekg(0);
-        buf_.resize(sz);
-        f.read(buf_.data(), static_cast<std::streamsize>(sz));
-        rpos_ = 0;
-        return true;
-    }
-
-    bool load_gz(const std::string& path)
-    {
+    explicit GzInput(const std::string& path) : buf_(BUF_SIZE) {
         gz_ = gzopen(path.c_str(), "rb");
-        if (!gz_) return false;
+        if (!gz_) throw std::runtime_error("Cannot open: " + path);
         gzbuffer(gz_, 256u << 10);
-        gz_eof_ = false;
-        buf_.clear();
-        rpos_ = 0;
-        buf_.resize(GZ_CHUNK);
-        const size_t got = gz_read_into(0, GZ_CHUNK);
-        buf_.resize(got);
-        return got > 0;
+        int n = gzread(gz_, buf_.data(), static_cast<unsigned>(buf_.size()));
+        if (n <= 0) { gzclose(gz_); gz_ = nullptr; throw std::runtime_error("Cannot read: " + path); }
+        buf_fill_   = static_cast<size_t>(n);
+        first_byte_ = buf_[0];
+        // eof_ is detected lazily by refill() when gzread returns 0.
+    }
+    ~GzInput() { if (gz_) gzclose(gz_); }
+    GzInput(const GzInput&) = delete;
+    GzInput& operator=(const GzInput&) = delete;
+    GzInput(GzInput&& o) noexcept
+        : gz_(o.gz_), eof_(o.eof_), buf_(std::move(o.buf_)),
+          buf_start_(o.buf_start_), buf_fill_(o.buf_fill_), pos_(o.pos_),
+          cur_ptr_(o.cur_ptr_), cur_size_(o.cur_size_), first_byte_(o.first_byte_) {
+        std::memcpy(block_, o.block_, 64);
+        o.gz_ = nullptr;
     }
 
-    size_t gz_read_into(size_t offset, size_t ask)
-    {
-        size_t got = 0;
-        while (got < ask && !gz_eof_) {
-            const unsigned chunk = static_cast<unsigned>(std::min(ask - got, size_t(1u << 30)));
-            const int n = gzread(gz_, buf_.data() + offset + got, chunk);
-            if (n <= 0) { gz_eof_ = true; break; }
-            got += static_cast<size_t>(n);
+    helicase::Block next() noexcept {
+        size_t avail = buf_start_ + buf_fill_ - pos_;
+        if (avail == 0) {
+            if (eof_) return {};
+            refill();
+            avail = buf_start_ + buf_fill_ - pos_;
+            if (avail == 0) return {};
         }
-        return got;
-    }
-
-    void gz_slide_and_refill()
-    {
-        if (!gz_ || gz_eof_) return;
-        const size_t rem = (rpos_ < buf_.size()) ? buf_.size() - rpos_ : 0;
-        if (rem > 0 && rpos_ > 0)
-            std::memmove(buf_.data(), buf_.data() + rpos_, rem);
-        rpos_ = 0;
-        buf_.resize(rem + GZ_CHUNK);
-        const size_t got = gz_read_into(rem, GZ_CHUNK);
-        buf_.resize(rem + got);
-    }
-
-    bool read_fasta()
-    {
-        while (rpos_ < buf_.size() && buf_[rpos_] != '>') ++rpos_;
-        if (rpos_ >= buf_.size()) {
-            if (!gz_ || gz_eof_) return false;
-            gz_slide_and_refill();
-            while (rpos_ < buf_.size() && buf_[rpos_] != '>') ++rpos_;
-            if (rpos_ >= buf_.size()) return false;
+        if (avail >= 64) {
+            cur_ptr_  = buf_.data() + (pos_ - buf_start_);
+            cur_size_ = 64;
+            pos_ += 64;
+            // Lookahead: prefill the buffer before the next next() call.
+            if (pos_ > buf_start_ + buf_fill_ && !eof_) refill();
+        } else {
+            // Last (partial) block.  Advance pos_ to the exact end of data so
+            // that the next next() call gets avail==0 and returns {} correctly,
+            // avoiding unsigned underflow if pos_ were advanced by a full 64.
+            std::memcpy(block_, buf_.data() + (pos_ - buf_start_), avail);
+            std::memset(block_ + avail, 0, 64 - avail);
+            cur_ptr_  = block_;
+            cur_size_ = avail;
+            pos_ = buf_start_ + buf_fill_;
         }
-        ++rpos_;
-
-        while (true) {
-            const char* nl = static_cast<const char*>(
-                std::memchr(buf_.data() + rpos_, '\n', buf_.size() - rpos_));
-            if (nl) { rpos_ = static_cast<size_t>(nl - buf_.data()) + 1; break; }
-            if (!gz_ || gz_eof_) return false;
-            gz_slide_and_refill();
-            if (rpos_ >= buf_.size()) return false;
-        }
-
-        while (true) {
-            if (rpos_ >= buf_.size()) {
-                if (!gz_ || gz_eof_) break;
-                gz_slide_and_refill();
-                if (rpos_ >= buf_.size()) break;
-            }
-            if (buf_[rpos_] == '>') break;
-
-            const char*  start = buf_.data() + rpos_;
-            const size_t rem   = buf_.size() - rpos_;
-            const char*  nl    = static_cast<const char*>(std::memchr(start, '\n', rem));
-
-            if (!nl) {
-                if (gz_ && !gz_eof_) {
-                    size_t line_len = rem;
-                    if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
-                    if (line_len > 0) {
-                        const size_t old_sz = seq_.size();
-                        seq_.resize(old_sz + line_len);
-                        std::memcpy(seq_.data() + old_sz, start, line_len);
-                    }
-                    rpos_ = buf_.size();
-                    gz_slide_and_refill();
-                    continue;
-                }
-                size_t line_len = rem;
-                if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
-                if (line_len > 0) {
-                    const size_t old_sz = seq_.size();
-                    seq_.resize(old_sz + line_len);
-                    std::memcpy(seq_.data() + old_sz, start, line_len);
-                }
-                rpos_ = buf_.size();
-                break;
-            }
-
-            size_t line_len = static_cast<size_t>(nl - start);
-            if (line_len > 0 && start[line_len - 1] == '\r') --line_len;
-            if (line_len > 0) {
-                const size_t old_sz = seq_.size();
-                seq_.resize(old_sz + line_len);
-                std::memcpy(seq_.data() + old_sz, start, line_len);
-            }
-            rpos_ += static_cast<size_t>(nl - start) + 1;
-        }
-
-        return !seq_.empty();
+        return {cur_ptr_, cur_size_};
     }
 
-    bool read_fastq()
-    {
-        if (rpos_ >= buf_.size()) return false;
-        const char* end = buf_.data() + buf_.size();
-        const char* p   = buf_.data() + rpos_;
-        const char* nl;
-
-        nl = static_cast<const char*>(std::memchr(p, '\n', end - p));
-        if (!nl) return false;
-        p = nl + 1;
-
-        const char* seq_start = p;
-        nl = static_cast<const char*>(std::memchr(seq_start, '\n', end - seq_start));
-        size_t slen = nl ? static_cast<size_t>(nl - seq_start) : static_cast<size_t>(end - seq_start);
-        if (slen > 0 && seq_start[slen - 1] == '\r') --slen;
-        if (slen > 0) seq_.assign(seq_start, seq_start + slen);
-        p = nl ? nl + 1 : end;
-
-        nl = static_cast<const char*>(std::memchr(p, '\n', end - p));
-        p = nl ? nl + 1 : end;
-
-        nl = static_cast<const char*>(std::memchr(p, '\n', end - p));
-        rpos_ = nl ? static_cast<size_t>(nl - buf_.data()) + 1 : buf_.size();
-
-        return !seq_.empty();
-    }
-
-    static SeqFormat detect_format(const std::string& name)
-    {
-        auto has_suffix = [&](const char* suf) -> bool {
-            const size_t n = std::strlen(suf);
-            if (name.size() < n) return false;
-            return std::equal(name.end() - static_cast<std::ptrdiff_t>(n), name.end(),
-                              suf, [](char a, char b) {
-                                  return std::tolower(static_cast<unsigned char>(a)) == b;
-                              });
-        };
-        if (has_suffix(".fastq") || has_suffix(".fq")) return SeqFormat::FASTQ;
-        return SeqFormat::FASTA;
-    }
+    const uint8_t* current_block()      const noexcept { return cur_ptr_; }
+    size_t         current_block_size() const noexcept { return cur_size_; }
+    uint8_t        first_byte()         const noexcept { return first_byte_; }
 };
 
 
@@ -282,6 +151,30 @@ inline void split_actg(const char* seq, size_t len, F&& on_chunk)
 }
 
 
+// ── Dispatch helper ───────────────────────────────────────────────────────────
+// Detect FASTA vs FASTQ from the first byte, instantiate the correct helicase
+// parser, and call on_chunk for every ACTG-only run.  Works for any helicase
+// input type I (MmapInput, GzInput, …).
+
+template <typename I, typename F>
+inline void helicase_parse(I inp, F&& on_chunk)
+{
+    if (inp.first_byte() == '@') {
+        helicase::FastqParser<HELICASE_ACTG, I> p(std::move(inp));
+        while (p.next()) {
+            auto [ptr, len] = p.get_dna_raw();
+            on_chunk(ptr, len);
+        }
+    } else {
+        helicase::FastaParser<HELICASE_ACTG, I> p(std::move(inp));
+        while (p.next()) {
+            auto [ptr, len] = p.get_dna_raw();
+            on_chunk(ptr, len);
+        }
+    }
+}
+
+
 // ── SeqSource ─────────────────────────────────────────────────────────────────
 
 struct SeqSource
@@ -294,54 +187,9 @@ struct SeqSource
     {
         const bool is_gz = path.size() > 3 &&
                            path.compare(path.size() - 3, 3, ".gz") == 0;
-        if (is_gz) process_gz(path, std::forward<F>(on_chunk));
-        else       process_plain(path, std::forward<F>(on_chunk));
-    }
-
-private:
-    SeqReader gz_reader_; // reused across gz files; buffer only grows
-
-    template <typename F>
-    void process_gz(const std::string& path, F&& on_chunk)
-    {
-        if (!gz_reader_.load(path)) return;
-        while (gz_reader_.read_next_seq())
-            split_actg(gz_reader_.seq(), gz_reader_.seq_len(),
-                       std::forward<F>(on_chunk));
-    }
-
-    template <typename F>
-    void process_plain(const std::string& path, F&& on_chunk)
-    {
-        helicase::MmapInput inp(path);
-        if (inp.first_byte() == '@') {
-            helicase::FastqParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
-            while (p.next()) {
-                auto [ptr, len] = p.get_dna_raw();
-                on_chunk(ptr, len);
-            }
-        } else {
-            helicase::FastaParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
-            while (p.next()) {
-                auto [ptr, len] = p.get_dna_raw();
-                on_chunk(ptr, len);
-            }
-        }
-    }
-
-    // Split a sequence on non-ACTG characters and call on_chunk for each run.
-    template <typename F>
-    static void split_actg(const char* seq, size_t len, F&& on_chunk)
-    {
-        size_t start  = 0;
-        bool   in_run = false;
-        for (size_t i = 0; i < len; ++i) {
-            if (nt_hash::is_dna(seq[i])) {
-                if (!in_run) { start = i; in_run = true; }
-            } else {
-                if (in_run) { on_chunk(seq + start, i - start); in_run = false; }
-            }
-        }
-        if (in_run) on_chunk(seq + start, len - start);
+        if (is_gz)
+            helicase_parse(GzInput(path), std::forward<F>(on_chunk));
+        else
+            helicase_parse(helicase::MmapInput(path), std::forward<F>(on_chunk));
     }
 };

@@ -4,8 +4,8 @@
 //
 // Partitioning: minimizer_hash % num_partitions.
 //
-// Parsing is delegated to SeqSource, which delivers ACTG-only chunks regardless
-// of file format or compression (helicase for plain files, SeqReader+split for gz).
+// Parsing is delegated to SeqSource / GzInput + helicase SIMD parsers, which deliver
+// ACTG-only chunks regardless of file format or compression.
 //
 // Internals:
 //   extract_superkmers_from_actg<k, m, PartitionFn>  — pure ACTG sequence logic,
@@ -117,40 +117,43 @@ PartitionStats partition_kmers_gz_pc(
     std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
 
-    // Producer: decompress gz one sequence at a time, split on non-ACTG characters,
-    // accumulate ACTG-only chunks into batches and push to the queue.
+    // Producer: decompress gz via GzInput, use helicase SIMD parser to deliver
+    // ACTG-only chunks, accumulate into batches and push to the queue.
     auto producer_fn = [&]() {
-        SeqReader reader;
-        if (!reader.load(gz_path)) {
+        auto feed = [&](auto& parser) {
+            while (true) {
+                Batch batch;
+                size_t chunk_count = 0;
+                while (chunk_count < BATCH_SEQS && parser.next()) {
+                    auto [ptr, len] = parser.get_dna_raw();
+                    batch.emplace_back(ptr, len);
+                    ++chunk_count;
+                }
+                if (batch.empty()) break;
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
+                    queue.push_back(std::move(batch));
+                }
+                q_cv.notify_one();
+            }
+            { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
+            q_cv.notify_all();
+        };
+        try {
+            GzInput inp(gz_path);
+            if (inp.first_byte() == '@') {
+                helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                feed(p);
+            } else {
+                helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                feed(p);
+            }
+        } catch (...) {
             std::lock_guard<std::mutex> lk(q_mutex);
             producer_done = true;
             q_cv.notify_all();
-            return;
         }
-
-        while (true) {
-            Batch batch;
-            size_t seq_count = 0;
-            while (seq_count < BATCH_SEQS && reader.read_next_seq()) {
-                split_actg(reader.seq(), reader.seq_len(),
-                           [&](const char* c, size_t cl) { batch.emplace_back(c, cl); });
-                ++seq_count;
-            }
-            if (batch.empty()) break;
-
-            {
-                std::unique_lock<std::mutex> lk(q_mutex);
-                q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
-                queue.push_back(std::move(batch));
-            }
-            q_cv.notify_one();
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(q_mutex);
-            producer_done = true;
-        }
-        q_cv.notify_all();
     };
 
     // Consumer: pull batches from the queue and extract superkmers.
@@ -319,29 +322,38 @@ PartitionStats partition_kmers_mem_impl(
             std::atomic<uint64_t>   total_seqs{0}, total_kmers{0};
 
             auto producer_fn = [&]() {
-                SeqReader reader;
-                if (!reader.load(gz_path)) {
+                auto feed = [&](auto& parser) {
+                    while (true) {
+                        Batch batch;
+                        size_t chunk_count = 0;
+                        while (chunk_count < BATCH_SEQS && parser.next()) {
+                            auto [ptr, len] = parser.get_dna_raw();
+                            batch.emplace_back(ptr, len);
+                            ++chunk_count;
+                        }
+                        if (batch.empty()) break;
+                        { std::unique_lock<std::mutex> lk(q_mutex);
+                          q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
+                          queue.push_back(std::move(batch)); }
+                        q_cv.notify_one();
+                    }
+                    { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
+                    q_cv.notify_all();
+                };
+                try {
+                    GzInput inp(gz_path);
+                    if (inp.first_byte() == '@') {
+                        helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                        feed(p);
+                    } else {
+                        helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                        feed(p);
+                    }
+                } catch (...) {
                     std::lock_guard<std::mutex> lk(q_mutex);
                     producer_done = true;
                     q_cv.notify_all();
-                    return;
                 }
-                while (true) {
-                    Batch batch;
-                    size_t seq_count = 0;
-                    while (seq_count < BATCH_SEQS && reader.read_next_seq()) {
-                        split_actg(reader.seq(), reader.seq_len(),
-                                   [&](const char* c, size_t cl) { batch.emplace_back(c, cl); });
-                        ++seq_count;
-                    }
-                    if (batch.empty()) break;
-                    { std::unique_lock<std::mutex> lk(q_mutex);
-                      q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
-                      queue.push_back(std::move(batch)); }
-                    q_cv.notify_one();
-                }
-                { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
-                q_cv.notify_all();
             };
 
             auto consumer_fn = [&]() {
