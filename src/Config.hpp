@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <limits>
 
-struct PartitionStats { uint64_t seqs = 0, kmers = 0; };
+struct PartitionStats { uint64_t seqs = 0, kmers = 0, superkmers = 0; };
 
 struct Config {
     std::vector<std::string> input_files;

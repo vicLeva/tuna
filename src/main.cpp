@@ -12,9 +12,25 @@
 #include "pipeline.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sys/resource.h>
+
+// Read L2 cache size per core from Linux sysfs.
+// Returns bytes; falls back to 256 KB if the file is unavailable.
+static size_t l2_cache_per_core()
+{
+    std::ifstream f("/sys/devices/system/cpu/cpu0/cache/index2/size");
+    if (!f) return 256u << 10;
+    std::string s;
+    if (!(f >> s) || s.empty()) return 256u << 10;
+    char* end;
+    size_t val = std::strtoul(s.c_str(), &end, 10);
+    if      (*end == 'K' || *end == 'k') val <<= 10;
+    else if (*end == 'M' || *end == 'm') val <<= 20;
+    return val ? val : (256u << 10);
+}
 
 
 int main(int argc, char* argv[])
@@ -63,8 +79,20 @@ int main(int argc, char* argv[])
             fd_limit = static_cast<size_t>(rl.rlim_cur);
         const size_t max_parts = (fd_limit > 32) ? fd_limit - 32 : 16;
 
-        // Hard cap: writer buffers = n_parts×4 KB should fit in a ~32 MB server L3.
-        constexpr size_t WRITER_CACHE_CAP = 8192;
+        // WRITER_CACHE_CAP: largest power of 2 such that the writer header array
+        // (n_parts × sizeof(SuperkmerWriter) ≈ 40 B) just fits within the per-core
+        // L2 cache, keeping random-access appends to writers[p] out of L3/RAM.
+        //   L2=256 KB → 6554 → next_pow2 = 8192  (typical server core)
+        //   L2=512 KB → 13107 → next_pow2 = 16384 (workstation core)
+        //   L2≥2 MB   → capped at 32768
+        // Detected at runtime from /sys/devices/system/cpu/cpu0/cache/index2/size;
+        // falls back to 8192 (256 KB L2 assumption) if unavailable.
+        constexpr size_t WRITER_HEADER_BYTES = 40;  // sizeof(SuperkmerWriter)
+        const size_t l2     = l2_cache_per_core();
+        const size_t ratio  = l2 / WRITER_HEADER_BYTES;
+        size_t writer_cache_cap = 4096;
+        while (writer_cache_cap < ratio) writer_cache_cap <<= 1;
+        const size_t WRITER_CACHE_CAP = std::min(writer_cache_cap, size_t(32768));
 
         constexpr uint64_t GZ_EXPAND = 6;  // typical genomic FASTA/FASTQ compression ratio
 

@@ -141,7 +141,8 @@ int run(const Config& cfg)
                       << t_phase1 << "s)\n";
 
         if (cfg.partition_only) {
-            std::cerr << "phase1: " << t_phase1 << "s\n";
+            std::cerr << "phase1: "     << t_phase1        << "s\n"
+                      << "superkmers: " << stats.superkmers << "\n";
             if (!cfg.hide_progress)
                 std::cerr << "[done] partition only\n";
             return 0;
@@ -168,8 +169,9 @@ int run(const Config& cfg)
                       << total_written << " unique written  ("
                       << t_phase2 << "s)\n";
 
-        std::cerr << "phase1: " << t_phase1 << "s\n"
-                  << "phase2: " << t_phase2 << "s\n";
+        std::cerr << "phase1: "     << t_phase1        << "s\n"
+                  << "phase2: "     << t_phase2        << "s\n"
+                  << "superkmers: " << stats.superkmers << "\n";
         if (!cfg.hide_progress)
             std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
         return 0;
@@ -223,8 +225,9 @@ int run(const Config& cfg)
                   << t_phase2 << "s)\n";
 
     // Always emit structured phase timings for tooling (bench.sh).
-    std::cerr << "phase1: " << t_phase1 << "s\n"
-              << "phase2: " << t_phase2 << "s\n";
+    std::cerr << "phase1: "     << t_phase1        << "s\n"
+              << "phase2: "     << t_phase2        << "s\n"
+              << "superkmers: " << stats.superkmers << "\n";
 
     if (!cfg.hide_progress)
         std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
