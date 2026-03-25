@@ -23,9 +23,9 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 
 tuna runs a two-phase pipeline:
 
-1. **Partition (Phase 1)** — streams each input file through a minimizer iterator. Whenever the minimizer changes, the current superkmer is flushed to a per-partition binary file on disk. This groups k-mers that share a minimizer into the same bucket. The number of partitions is auto-tuned from input size (targeting ~2 MB input per partition) or set explicitly with `-n`.
+1. **Partition (Phase 1)** — streams each input file through a minimizer iterator. Whenever the minimizer changes, the current superkmer is flushed to a per-partition binary file (on disk if unsufficient RAM budget). This groups k-mers that share a minimizer into the same bucket. The number of partitions is auto-tuned from input size (targeting ~2 MB input per partition) or set explicitly with `-n`.
 
-2. **Count (Phase 2)** — replays each partition through a `Kmer_Window`, upserting every k-mer into a `Streaming_Kmer_Hash_Table` with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time.
+2. **Count (Phase 2)** — replays each partition, upserting every k-mer into a Kache-hash table with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time.
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes `<kmer>\t<count>` to the output file.
 
@@ -149,13 +149,14 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 
 | dataset | type | tuna median | KMC median | speedup | tuna p1 | tuna p2 |
 |---------|------|-------------|------------|---------|---------|---------|
-| *E. coli* | genome (plain FASTA) | 0.54 s | 1.24 s | **2.3×** | 0.18 s | 0.30 s |
-| *Salmonella* | pangenome (gz) | 0.54 s | 1.23 s | **2.3×** | 0.20 s | 0.28 s |
-| Gut | metagenome (plain FASTA) | 0.26 s | 0.74 s | **2.9×** | 0.09 s | 0.13 s |
-| Human | genome (gz) | 161 s | 208 s | **1.3×** | 75 s | 82 s |
-| Tara | metagenome (gz, 5.9 GB) | 105 s | 179 s | **1.7×** | 43 s | 60 s |
+| *E. coli* | genomes (plain FASTA) | 0.54 s | 1.24 s | **2.3×** | 0.18 s | 0.30 s |
+| *Salmonella* | genomes (gz) | 0.54 s | 1.23 s | **2.3×** | 0.20 s | 0.28 s |
+| Gut | metagenome assemblies (plain FASTA) | 0.26 s | 0.74 s | **2.9×** | 0.09 s | 0.13 s |
+| Human | genomes (gz) | 161 s | 208 s | **1.3×** | 75 s | 82 s |
+| Tara | metagenome reads (gz, 5.9 GB) | 105 s | 179 s | **1.7×** | 43 s | 60 s |
 
 tuna is consistently faster than KMC across all dataset types.
-Memory usage scales with unique k-mers per partition rather than total input size.
+Memory usage scales with unique k-mers per partition rather than total input size.  
+KMC tends to be faster on scaling set of datasets rather than counting k-mers inside individual files.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)
