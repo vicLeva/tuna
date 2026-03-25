@@ -37,6 +37,7 @@ void print_usage(const char* prog)
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -h/--help   show this help\n"
+        "  -v/--version print version\n"
         "\n"
         "Output: plain text, one k-mer per line: <kmer>\\t<count>\n";
 }
@@ -52,6 +53,11 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         const std::string arg = argv[i];
 
         if (arg == "-h" || arg == "--help") return false;
+
+        if (arg == "-v" || arg == "--version") {
+            std::cerr << "tuna " << TUNA_VERSION << "\n";
+            std::exit(0);
+        }
 
         // Consume the next token as the value for 'flag'.
         auto next_val = [&](const char* flag) -> const char* {

@@ -44,6 +44,8 @@ endif()
 add_compile_definitions(L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE})
 
 # ── Optional: single-k build (-DFIXED_K=31) ───────────────────────────────────
+add_compile_definitions(TUNA_VERSION="${PROJECT_VERSION}")
+
 if(FIXED_K)
     add_compile_definitions(FIXED_K=${FIXED_K})
 endif()
