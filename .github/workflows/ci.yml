@@ -31,26 +31,26 @@ jobs:
         run: brew install zlib
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DFIXED_K=31
 
       - name: Build
         run: cmake --build build --target tuna -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
       - name: Smoke test
         run: |
-          # Generate a small FASTA with known content
+          # Generate a small FASTA (>31 bp so at least one k-mer is produced)
           printf ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>seq2\nTGCATGCATGCATGCATGCATGCATGCATGCATGCA\n" > /tmp/test.fa
 
-          # Run tuna (k=11 for speed, no -ci filter so all k-mers are reported)
-          ./build/tuna -k 11 -m 9 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
+          # Run tuna with default k=31
+          ./build/tuna -k 31 -m 21 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
 
           # Output must be non-empty
           [ -s /tmp/out.tsv ] || { echo "Output is empty"; exit 1; }
 
-          # Each line must be <kmer>\t<count> with kmer of length 11
+          # Each line must be <kmer>\t<count> with kmer of length 31
           awk -F'\t' '
             NF != 2           { print "Bad columns at line " NR; exit 1 }
-            length($1) != 11  { print "Bad kmer length at line " NR; exit 1 }
+            length($1) != 31  { print "Bad kmer length at line " NR; exit 1 }
             $2 !~ /^[0-9]+$/  { print "Bad count at line " NR; exit 1 }
           ' /tmp/out.tsv
 
