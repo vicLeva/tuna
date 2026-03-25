@@ -12,6 +12,7 @@
 #include "count.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -44,6 +45,14 @@ inline double elapsed_s(std::chrono::steady_clock::time_point t0)
 {
     using Sec = std::chrono::duration<double>;
     return Sec(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Format a duration as "X.XXXs" with 3 decimal places.
+inline std::string fmt_s(double s)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.3fs", s);
+    return buf;
 }
 
 
@@ -79,10 +88,9 @@ int run(const Config& cfg)
 
     const size_t p1_threads = static_cast<size_t>(cfg.num_threads);
     if (!cfg.hide_progress)
-        std::cerr << "[1/2] Partitioning into " << cfg.num_partitions
-                  << " partitions  (" << p1_threads << " thread"
+        std::cerr << "[1/2] partitioning  (" << p1_threads << " thread"
                   << (p1_threads > 1 ? "s" : "")
-                  << (use_mem_pipeline ? ", in-memory" : "") << ")...\n";
+                  << (use_mem_pipeline ? ", in-memory" : "") << ") ...\n";
 
     PartitionStats stats;
     const auto t_part = std::chrono::steady_clock::now();
@@ -113,23 +121,22 @@ int run(const Config& cfg)
 
         const double t_phase1 = elapsed_s(t_part);
         if (!cfg.hide_progress)
-            std::cerr << "    " << stats.seqs  << " sequences, "
-                      << stats.kmers << " k-mers  ("
-                      << t_phase1 << "s)\n";
+            std::cerr << "      " << stats.seqs << " seqs  "
+                      << stats.kmers << " k-mers  " << fmt_s(t_phase1) << "\n";
 
         if (cfg.partition_only) {
             std::cerr << "phase1: "     << t_phase1        << "s\n"
                       << "superkmers: " << stats.superkmers << "\n";
             if (!cfg.hide_progress)
-                std::cerr << "[done] partition only\n";
+                std::cerr << "done  (partition only)\n";
             return 0;
         }
 
         const size_t p2_threads = std::min(static_cast<size_t>(cfg.num_threads),
                                            static_cast<size_t>(cfg.num_partitions));
         if (!cfg.hide_progress)
-            std::cerr << "[2/2] Counting + writing  (" << p2_threads << " thread"
-                      << (p2_threads > 1 ? "s" : "") << ", in-memory)...\n";
+            std::cerr << "[2/2] counting  (" << p2_threads << " thread"
+                      << (p2_threads > 1 ? "s" : "") << ", in-memory) ...\n";
 
         const auto t2 = std::chrono::steady_clock::now();
         std::ofstream out(cfg.output_file);
@@ -142,15 +149,14 @@ int run(const Config& cfg)
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
-            std::cerr << "    " << total_inserted << " k-mers processed, "
-                      << total_written << " unique written  ("
-                      << t_phase2 << "s)\n";
+            std::cerr << "      " << total_inserted << " k-mers in  "
+                      << total_written << " unique out  " << fmt_s(t_phase2) << "\n";
 
         std::cerr << "phase1: "     << t_phase1        << "s\n"
                   << "phase2: "     << t_phase2        << "s\n"
                   << "superkmers: " << stats.superkmers << "\n";
         if (!cfg.hide_progress)
-            std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
+            std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
         return 0;
     }
 
@@ -166,14 +172,13 @@ int run(const Config& cfg)
 
     const double t_phase1 = elapsed_s(t_part);
     if (!cfg.hide_progress)
-        std::cerr << "    " << stats.seqs  << " sequences, "
-                  << stats.kmers << " k-mers  ("
-                  << t_phase1 << "s)\n";
+        std::cerr << "      " << stats.seqs << " seqs  "
+                  << stats.kmers << " k-mers  " << fmt_s(t_phase1) << "\n";
 
     if (cfg.partition_only) {
         std::cerr << "phase1: " << t_phase1 << "s\n";
         if (!cfg.hide_progress)
-            std::cerr << "[done] partition only\n";
+            std::cerr << "done  (partition only)\n";
         return 0;
     }
 
@@ -182,8 +187,8 @@ int run(const Config& cfg)
     const size_t p2_threads = std::min(static_cast<size_t>(cfg.num_threads),
                                        static_cast<size_t>(cfg.num_partitions));
     if (!cfg.hide_progress)
-        std::cerr << "[2/2] Counting + writing  (" << p2_threads << " thread"
-                  << (p2_threads > 1 ? "s" : "") << ")...\n";
+        std::cerr << "[2/2] counting  (" << p2_threads << " thread"
+                  << (p2_threads > 1 ? "s" : "") << ") ...\n";
 
     const auto t2 = std::chrono::steady_clock::now();
 
@@ -197,9 +202,8 @@ int run(const Config& cfg)
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)
-        std::cerr << "    " << total_inserted << " k-mers processed, "
-                  << total_written << " unique written  ("
-                  << t_phase2 << "s)\n";
+        std::cerr << "      " << total_inserted << " k-mers in  "
+                  << total_written << " unique out  " << fmt_s(t_phase2) << "\n";
 
     // Always emit structured phase timings for tooling (bench.sh).
     std::cerr << "phase1: "     << t_phase1        << "s\n"
@@ -207,7 +211,7 @@ int run(const Config& cfg)
               << "superkmers: " << stats.superkmers << "\n";
 
     if (!cfg.hide_progress)
-        std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
+        std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
 
     return 0;
 }

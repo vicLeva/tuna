@@ -162,9 +162,9 @@ int main(int argc, char* argv[])
 
     if (!cfg.hide_progress) {
         std::cerr << "tuna  k=" << cfg.k
-                  << "  l=" << cfg.l
-                  << "  partitions=" << cfg.num_partitions
-                  << "  threads=" << cfg.num_threads;
+                  << "  m=" << cfg.l
+                  << "  n=" << cfg.num_partitions
+                  << "  t=" << cfg.num_threads;
         if (cfg.ci > 1 || cfg.cx != std::numeric_limits<uint64_t>::max())
             std::cerr << "  ci=" << cfg.ci << "  cx=" << cfg.cx;
         std::cerr << "\n";
