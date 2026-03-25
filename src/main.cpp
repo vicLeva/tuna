@@ -10,6 +10,7 @@
 
 #include "CLI.hpp"
 #include "pipeline.hpp"
+#include "superkmer_io.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -18,18 +19,31 @@
 #include <sys/resource.h>
 
 // Read L2 cache size per core from Linux sysfs.
-// Returns bytes; falls back to 256 KB if the file is unavailable.
+// Scans index0..index4 for level=2 to avoid assuming a fixed index number —
+// on some CPUs (AMD EPYC, unified-L1 Intel) index2 is L3, not L2.
+// Falls back to 256 KB if no level-2 entry is found.
 static size_t l2_cache_per_core()
 {
-    std::ifstream f("/sys/devices/system/cpu/cpu0/cache/index2/size");
-    if (!f) return 256u << 10;
-    std::string s;
-    if (!(f >> s) || s.empty()) return 256u << 10;
-    char* end;
-    size_t val = std::strtoul(s.c_str(), &end, 10);
-    if      (*end == 'K' || *end == 'k') val <<= 10;
-    else if (*end == 'M' || *end == 'm') val <<= 20;
-    return val ? val : (256u << 10);
+    for (int idx = 0; idx <= 4; ++idx) {
+        const std::string base =
+            "/sys/devices/system/cpu/cpu0/cache/index" + std::to_string(idx);
+        {
+            std::ifstream lf(base + "/level");
+            if (!lf) continue;
+            int level = 0;
+            if (!(lf >> level) || level != 2) continue;
+        }
+        std::ifstream sf(base + "/size");
+        if (!sf) continue;
+        std::string s;
+        if (!(sf >> s) || s.empty()) continue;
+        char* end;
+        size_t val = std::strtoul(s.c_str(), &end, 10);
+        if      (*end == 'K' || *end == 'k') val <<= 10;
+        else if (*end == 'M' || *end == 'm') val <<= 20;
+        if (val) return val;
+    }
+    return 256u << 10;
 }
 
 
@@ -87,11 +101,18 @@ int main(int argc, char* argv[])
         //   L2≥2 MB   → capped at 32768
         // Detected at runtime from /sys/devices/system/cpu/cpu0/cache/index2/size;
         // falls back to 8192 (256 KB L2 assumption) if unavailable.
-        constexpr size_t WRITER_HEADER_BYTES = 40;  // sizeof(SuperkmerWriter)
+        // sizeof(SuperkmerWriter) = sizeof(std::string) + sizeof(size_t).
+        // On GCC/libstdc++ x86-64: 32 + 8 = 40 B.  The static_assert below
+        // catches mismatches on other toolchains at compile time.
+        constexpr size_t WRITER_HEADER_BYTES = sizeof(SuperkmerWriter);
+        static_assert(WRITER_HEADER_BYTES >= 8 && WRITER_HEADER_BYTES <= 64,
+                      "SuperkmerWriter size out of expected range — update WRITER_HEADER_BYTES");
         const size_t l2     = l2_cache_per_core();
         const size_t ratio  = l2 / WRITER_HEADER_BYTES;
+        // Largest power of 2 such that n × WRITER_HEADER_BYTES ≤ L2 (prev_pow2).
+        // Using next_pow2 would give a cap 2× larger than the L2 budget.
         size_t writer_cache_cap = 4096;
-        while (writer_cache_cap < ratio) writer_cache_cap <<= 1;
+        while ((writer_cache_cap << 1) <= ratio) writer_cache_cap <<= 1;
         const size_t WRITER_CACHE_CAP = std::min(writer_cache_cap, size_t(32768));
 
         constexpr uint64_t GZ_EXPAND = 6;  // typical genomic FASTA/FASTQ compression ratio
