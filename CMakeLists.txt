@@ -50,7 +50,12 @@ endif()
 
 # ── Compile flags ──────────────────────────────────────────────────────────────
 
-set(TUNA_COMPILE_FLAGS -Wall -Wextra -Wno-unused-function -fconstexpr-ops-limit=99000100)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(CONSTEXPR_FLAG -fconstexpr-ops-limit=99000100)
+else()
+    set(CONSTEXPR_FLAG -fconstexpr-steps=99000100)
+endif()
+set(TUNA_COMPILE_FLAGS -Wall -Wextra -Wno-unused-function ${CONSTEXPR_FLAG})
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     list(APPEND TUNA_COMPILE_FLAGS -funroll-loops -march=native)
