@@ -47,6 +47,86 @@ static size_t l2_cache_per_core()
 }
 
 
+// Auto-tune the partition count when -n is not given (cfg.num_partitions == 0).
+//
+// Target: ~2 MB of estimated uncompressed sequence per partition.
+// GZ files are expanded by GZ_EXPAND to approximate uncompressed size.
+//
+// Two caps are applied (in addition to the fd-limit budget):
+//
+//   WRITER_CACHE_CAP — keeps the writer-header array (n×sizeof(SuperkmerWriter))
+//     within the per-core L2 cache.  Phase 1 performance ∝ n_parts when the
+//     array exceeds L2 (cache thrashing on random-access appends):
+//       tara 5.9 GB gz @ n=32768 → phase1 ≈ 387 s
+//       tara 5.9 GB gz @ n= 8192 → phase1 ≈  89 s  (4× fewer → 4× faster)
+//     Cap = prev_pow2(L2_bytes / sizeof(SuperkmerWriter)), clamped to [4096, 32768].
+//     Detected at runtime from sysfs; falls back to 4096 (256 KB L2).
+//
+//   small-file cap — for multi-file runs where average file < 50 MB: cap n at
+//     next_pow2(n_files) to avoid over-partitioning redundant genomes.
+//
+// n is rounded to the next power of 2 and clamped to [16, min(caps)].
+static uint32_t auto_tune_partitions(const std::vector<std::string>& input_files)
+{
+    namespace fs = std::filesystem;
+
+    // ── FD budget ─────────────────────────────────────────────────────────
+    struct rlimit rl{};
+    size_t fd_limit = 1024;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        fd_limit = static_cast<size_t>(rl.rlim_cur);
+    const size_t max_parts = (fd_limit > 32) ? fd_limit - 32 : 16;
+
+    // ── Writer cache cap ──────────────────────────────────────────────────
+    // Largest power of 2 s.t. n×sizeof(SuperkmerWriter) ≤ L2 per core.
+    //   L2=256 KB → cap=4096  (server core, validated: tara phase1=89s)
+    //   L2=512 KB → cap=8192
+    //   L2≥2  MB  → cap=32768 (clamped)
+    constexpr size_t WRITER_HEADER_BYTES = sizeof(SuperkmerWriter);
+    static_assert(WRITER_HEADER_BYTES >= 8 && WRITER_HEADER_BYTES <= 64,
+                  "SuperkmerWriter size out of expected range");
+    const size_t l2    = l2_cache_per_core();
+    const size_t ratio = l2 / WRITER_HEADER_BYTES;
+    size_t writer_cap  = 4096;
+    while ((writer_cap << 1) <= ratio) writer_cap <<= 1;
+    const size_t WRITER_CACHE_CAP = std::min(writer_cap, size_t(32768));
+
+    // ── Estimate total uncompressed input ─────────────────────────────────
+    uint64_t total_effective = 0;
+    for (const auto& f : input_files) {
+        std::error_code ec;
+        uint64_t sz = fs::file_size(f, ec);
+        if (f.size() >= 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
+            sz *= GZ_EXPAND;
+        total_effective += sz;
+    }
+
+    // ── Base n: next_pow2(total / 2MB), clamped ───────────────────────────
+    const size_t raw = static_cast<size_t>(
+        std::max(uint64_t(1), total_effective >> 21));  // / 2 MB
+    size_t n = 1;
+    while (n < raw) n <<= 1;
+    n = std::max(n, size_t(16));
+    n = std::min(n, std::min(max_parts, WRITER_CACHE_CAP));
+
+    // ── Small-file cap ────────────────────────────────────────────────────
+    // For many small files, total_effective overestimates unique k-mers
+    // (redundant genomes): cap at next_pow2(n_files) to avoid excess partitions.
+    const size_t n_files = input_files.size();
+    if (n_files > 1) {
+        const uint64_t avg_effective = total_effective / n_files;
+        constexpr uint64_t SMALL_FILE_THRESHOLD = 50ULL << 20;  // 50 MB
+        if (avg_effective < SMALL_FILE_THRESHOLD) {
+            size_t file_cap = 1;
+            while (file_cap < n_files) file_cap <<= 1;
+            n = std::min(n, file_cap);
+        }
+    }
+
+    return static_cast<uint32_t>(n);
+}
+
+
 int main(int argc, char* argv[])
 {
     Config cfg;
@@ -66,88 +146,8 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── Auto-tune partition count from total input size ────────────────────
-    // Triggered when -n is not given (num_partitions == 0).
-    // Target: ~2 MB of estimated uncompressed sequence per partition.
-    //
-    // .gz files are expanded by GZ_EXPAND to approximate uncompressed size.
-    //
-    // Phase 1 performance is bounded by n_parts: each consumer thread keeps one
-    // SuperkmerWriter per partition, so writer-buffer cache footprint = n_parts×4 KB.
-    // Benchmarks show phase1 ∝ n_parts (writer buffers exceed L3 → cache thrashing):
-    //   tara 5.9 GB gz @ n=32768 → phase1 ≈ 387 s
-    //   tara 5.9 GB gz @ n=16384 → phase1 ≈ 202 s  (2× fewer → 2× faster)
-    // GZ_EXPAND=6 pushed tara to n=32768; we cap at 8192 so that writer buffers
-    // (8192×4 KB = 32 MB) stay within a typical server L3 cache.  This cap also
-    // corresponds to writer headers (8192×24 B = 192 KB) fitting in the L2 cache,
-    // which is the regime where random-access append is fast.
-    // Phase 2 tables grow proportionally but the cross-superkmer prefetch hides
-    // the resulting L3 misses (empirically: <10 % phase2 slowdown per 2× n_parts
-    // reduction) so the net effect is a large improvement.
-    //
-    // n is rounded to the next power of 2 and clamped to [16, min(WRITER_CAP, fd_budget)].
-    if (cfg.num_partitions == 0) {
-        struct rlimit rl{};
-        size_t fd_limit = 1024;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
-            fd_limit = static_cast<size_t>(rl.rlim_cur);
-        const size_t max_parts = (fd_limit > 32) ? fd_limit - 32 : 16;
-
-        // WRITER_CACHE_CAP: largest power of 2 such that the writer header array
-        // (n_parts × sizeof(SuperkmerWriter) ≈ 40 B) just fits within the per-core
-        // L2 cache, keeping random-access appends to writers[p] out of L3/RAM.
-        //   L2=256 KB → 6554 → next_pow2 = 8192  (typical server core)
-        //   L2=512 KB → 13107 → next_pow2 = 16384 (workstation core)
-        //   L2≥2 MB   → capped at 32768
-        // Detected at runtime from /sys/devices/system/cpu/cpu0/cache/index2/size;
-        // falls back to 8192 (256 KB L2 assumption) if unavailable.
-        // sizeof(SuperkmerWriter) = sizeof(std::string) + sizeof(size_t).
-        // On GCC/libstdc++ x86-64: 32 + 8 = 40 B.  The static_assert below
-        // catches mismatches on other toolchains at compile time.
-        constexpr size_t WRITER_HEADER_BYTES = sizeof(SuperkmerWriter);
-        static_assert(WRITER_HEADER_BYTES >= 8 && WRITER_HEADER_BYTES <= 64,
-                      "SuperkmerWriter size out of expected range — update WRITER_HEADER_BYTES");
-        const size_t l2     = l2_cache_per_core();
-        const size_t ratio  = l2 / WRITER_HEADER_BYTES;
-        // Largest power of 2 such that n × WRITER_HEADER_BYTES ≤ L2 (prev_pow2).
-        // Using next_pow2 would give a cap 2× larger than the L2 budget.
-        size_t writer_cache_cap = 4096;
-        while ((writer_cache_cap << 1) <= ratio) writer_cache_cap <<= 1;
-        const size_t WRITER_CACHE_CAP = std::min(writer_cache_cap, size_t(32768));
-
-        constexpr uint64_t GZ_EXPAND = 6;  // typical genomic FASTA/FASTQ compression ratio
-
-        uint64_t total_effective = 0;
-        for (const auto& f : cfg.input_files) {
-            std::error_code ec;
-            uint64_t sz = fs::file_size(f, ec);
-            if (f.size() >= 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
-                sz *= GZ_EXPAND;
-            total_effective += sz;
-        }
-        const size_t raw = static_cast<size_t>(
-            std::max(uint64_t(1), total_effective >> 21)); // / 2 MB
-        size_t n = 1;
-        while (n < raw) n <<= 1;           // next power of 2 >= raw
-        n = std::max(n, size_t(16));
-        n = std::min(n, std::min(max_parts, WRITER_CACHE_CAP));
-
-        // For multi-file inputs where average file is small (< 50 MB uncompressed),
-        // cap n at next_pow2(n_files): redundant genomes don't add unique k-mer content
-        // proportionally, so total_effective overestimates partition load and leads to
-        // too many tiny partitions with excessive phase2 overhead.
-        const size_t n_files = cfg.input_files.size();
-        if (n_files > 1) {
-            const uint64_t avg_effective = total_effective / n_files;
-            constexpr uint64_t SMALL_FILE_THRESHOLD = 50ULL << 20; // 50 MB
-            if (avg_effective < SMALL_FILE_THRESHOLD) {
-                size_t file_cap = 1;
-                while (file_cap < n_files) file_cap <<= 1; // next_pow2(n_files)
-                n = std::min(n, file_cap);
-            }
-        }
-        cfg.num_partitions = static_cast<uint32_t>(n);
-    }
+    if (cfg.num_partitions == 0)
+        cfg.num_partitions = auto_tune_partitions(cfg.input_files);
 
     // ── Working directory ──────────────────────────────────────────────────
     bool own_work_dir = false;
@@ -179,7 +179,7 @@ int main(int argc, char* argv[])
         else {
             // Only remove the partition files we created, not the whole directory.
             for (size_t p = 0; p < cfg.num_partitions; ++p)
-                fs::remove(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers");
+                fs::remove(partition_path(cfg.work_dir, p));
         }
     }
 

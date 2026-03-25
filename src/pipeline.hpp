@@ -33,6 +33,11 @@ inline uint64_t available_ram_bytes()
 }
 
 
+// Estimated expansion factor for gzipped genomic FASTA/FASTQ.
+// Used to approximate uncompressed size from compressed file size when
+// auto-tuning partition count and deciding between in-memory vs disk pipelines.
+constexpr uint64_t GZ_EXPAND = 6;
+
 // ─── Timing helper ────────────────────────────────────────────────────────────
 
 inline double elapsed_s(std::chrono::steady_clock::time_point t0)
@@ -64,7 +69,7 @@ int run(const Config& cfg)
         uint64_t fsz = std::filesystem::file_size(f, ec);
         if (ec) continue;
         const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-        est_raw += is_gz ? fsz * 6 : fsz;
+        est_raw += is_gz ? fsz * GZ_EXPAND : fsz;
     }
     const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
     const uint64_t avail      = available_ram_bytes();
@@ -153,7 +158,7 @@ int run(const Config& cfg)
 
     std::vector<std::ofstream> buckets(cfg.num_partitions);
     for (size_t p = 0; p < cfg.num_partitions; ++p)
-        buckets[p].open(cfg.work_dir + "hash_" + std::to_string(p) + ".superkmers",
+        buckets[p].open(partition_path(cfg.work_dir, p),
                         std::ios::binary);
 
     stats = partition_kmers<k, m>(cfg, buckets);

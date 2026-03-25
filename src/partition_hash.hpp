@@ -25,6 +25,18 @@
 #include <atomic>
 
 
+// Per-writer buffer flush threshold.
+// Each thread holds n_parts SuperkmerWriter objects.  The threshold caps total
+// writer memory per thread to ~64 MB: max(4 KB, 64 MB / n_parts).
+// At n_parts=8192: 8 KB/writer × 8192 = 64 MB.  At n_parts=32: 2 MB/writer.
+inline size_t writer_flush_threshold(size_t n_parts)
+{
+    constexpr size_t WRITER_MEMORY_BUDGET = 64u << 20;  // 64 MB per thread
+    constexpr size_t MIN_FLUSH_BYTES      =  4u << 10;  // 4 KB minimum
+    return std::max(MIN_FLUSH_BYTES, WRITER_MEMORY_BUDGET / n_parts);
+}
+
+
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
 //
 // Walk one ACTG-only DNA chunk (no N, no newlines — pre-filtered by helicase),
@@ -168,7 +180,7 @@ PartitionStats partition_kmers_gz_pc(
     // Consumer: pull batches from the queue and extract superkmers.
     auto consumer_fn = [&]() {
         // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
-        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+        const size_t flush_thresh = writer_flush_threshold(n_parts);
         MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
         uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
@@ -254,7 +266,7 @@ PartitionStats partition_kmers_impl(
 
     auto worker = [&]() {
         // Cap per-writer buffer so total writer memory ≤ 64 MB/thread regardless of n_parts.
-        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+        const size_t flush_thresh = writer_flush_threshold(n_parts);
         SeqSource            source;
         MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
@@ -370,7 +382,7 @@ PartitionStats partition_kmers_mem_impl(
             };
 
             auto consumer_fn = [&]() {
-                const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+                const size_t flush_thresh = writer_flush_threshold(n_parts);
                 MinimizerWindow<k, m>        min_it;
                 std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));
                 uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
@@ -415,7 +427,7 @@ PartitionStats partition_kmers_mem_impl(
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     auto worker = [&]() {
-        const size_t flush_thresh = std::max(size_t(4u << 10), size_t(64u << 20) / n_parts);
+        const size_t flush_thresh = writer_flush_threshold(n_parts);
         SeqSource            source;
         MinimizerWindow<k, m>        min_it;
         std::vector<SuperkmerWriter> writers(n_parts, SuperkmerWriter(flush_thresh));

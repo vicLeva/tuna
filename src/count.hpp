@@ -256,9 +256,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            const std::string part_path = cfg.work_dir + "hash_"
-                                          + std::to_string(p) + ".superkmers";
-            SuperkmerReader reader(part_path);
+            SuperkmerReader reader(partition_path(cfg.work_dir, p));
             // Size the table generously to avoid load-triggered resizes.
             //
             // Dynamic formula: 2 × (total_kmers / n_parts) puts the 80% load threshold

@@ -29,6 +29,13 @@
 #include <cstdint>
 #include <cstring>
 
+// Returns the path to the superkmer file for partition p under work_dir.
+// Used in pipeline setup, counting, and cleanup — centralises the naming convention.
+inline std::string partition_path(const std::string& work_dir, size_t p)
+{
+    return work_dir + "hash_" + std::to_string(p) + ".superkmers";
+}
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
