@@ -34,7 +34,5 @@ perf.data.*
 
 # Plot outputs
 tools/*.png
-benchmark/*.png
+benchmark/results/
 
-# docs, for now
-docs/

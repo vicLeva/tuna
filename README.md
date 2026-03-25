@@ -94,7 +94,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Any odd value in `[11,31]` (fits in 64-bit word) |
-| `-m` | `<int>` | `17` | Minimizer length. Any odd value in `[9, k-2]` (must be odd and < k) |
+| `-m` | `<int>` | `21` | Minimizer length. Any odd value in `[9, k-2]` (must be odd and < k) |
 | `-n` | `<int>` | auto | Number of partitions. Auto-tuned to ~2 MB input/partition when omitted |
 | `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files; Phase 2 over partitions |
 | `-ci` | `<int>` | `1` | Minimum count to report |
@@ -145,11 +145,18 @@ Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographica
 
 ## Benchmarks
 
-Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 4 threads.
+Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, m=21, 8 threads, on a cluster node (96 MB L3).
+Each row shows the **median wall time** over per-file runs (100 files for bacteria/metagenomes, 10 for human and Tara).
 
-| dataset | tuna wall | tuna RSS | KMC wall | KMC RSS | time ratio | mem ratio |
-|---------|-----------|----------|----------|---------|------------|-----------|
-| *E. coli* ×200 (~940 MB) | 0:14 | ~0.9 GB | 0:25 | ~9.9 GB | **0.6×** | **0.09×** |
-| Tara metagenome (~5.9 GB gz) | 7:28 | — | 5:38 | ~7.6 GB | 1.3× | — |
+| dataset | type | tuna median | KMC median | speedup | tuna p1 | tuna p2 |
+|---------|------|-------------|------------|---------|---------|---------|
+| *E. coli* | genome (plain FASTA) | 0.54 s | 1.24 s | **2.3×** | 0.18 s | 0.30 s |
+| *Salmonella* | pangenome (gz) | 0.54 s | 1.23 s | **2.3×** | 0.20 s | 0.28 s |
+| Gut | metagenome (plain FASTA) | 0.26 s | 0.74 s | **2.9×** | 0.09 s | 0.13 s |
+| Human | genome (gz) | 161 s | 208 s | **1.3×** | 75 s | 82 s |
+| Tara | metagenome (gz, 5.9 GB) | 105 s | 179 s | **1.7×** | 43 s | 60 s |
 
-tuna's memory usage scales with unique k-mers per partition. KMC RSS figures above reflect its default `-m8` RAM limit; KMC's actual memory usage is configurable.
+tuna is consistently faster than KMC across all dataset types.
+Memory usage scales with unique k-mers per partition rather than total input size.
+
+![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)
