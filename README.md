@@ -62,25 +62,26 @@ brew install llvm cmake zlib
 git clone https://github.com/vicLeva/tuna.git
 cd tuna/
 mkdir build && cd build/
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --target tuna -j$(nproc)
+cmake ..
+make -j$(nproc)
 ```
-
-> **Note:** Always pass `-DCMAKE_BUILD_TYPE=Release` explicitly. If a stale `CMakeCache.txt` exists in the build directory from a previous Debug configuration, plain `cmake ..` will reuse the cached build type and produce an unoptimized binary (~6× slower).
 
 The `tuna` binary will be at `build/tuna`.
 
-### Cluster / conda environments
+<details>
+<summary><strong>Compile-time options</strong></summary>
 
-If you see a linker error like `undefined reference to 'memcpy@GLIBC_2.14'`, your environment's `libz.so` was compiled against a newer glibc than the system provides (common with conda or spack on HPC clusters).
-CMake will automatically fall back to static `libz.a`, which avoids the issue — so deleting your `build/` directory and rebuilding from scratch should resolve it.
+**Single-k binary** — compile only the templates for one k value. Roughly 10× faster to build and produces a much smaller binary. Passing any other `-k` at runtime prints an error:
+```bash
+cmake .. -DFIXED_K=31
+```
 
-### Optional compile-time flags
+**Debug build** — disables optimisations, enables debug symbols for gdb/valgrind:
+```bash
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-DINSTANCE_COUNT=N` | 32 | Number of k values instantiated at compile time |
-| `-DFIXED_K=N` | — | Compile for a single k value only (smaller binary) |
+</details>
 
 ---
 
@@ -99,17 +100,25 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Any odd value in `[11,31]` (fits in 64-bit word) |
-| `-m` | `<int>` | `21` | Minimizer length. Any odd value in `[9, k-2]` (must be odd and < k) |
-| `-n` | `<int>` | auto | Number of partitions. Auto-tuned to ~2 MB input/partition when omitted |
+| `-m` | `<int>` | `21` | Minimizer length. Any odd value in `[9, k-2]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes) |
 | `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files; Phase 2 over partitions |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
-| `-w` | `<dir>` | next to output | Working directory for temporary partition files |
-| `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
-| `-kt` | — | off | Keep temporary partition files after the run (useful for benchmarking) |
-| `-tp` | — | off | Stop after partitioning — Phase 1 only (useful for benchmarking partition speed) |
-| `-dbg` | — | off | Debug stats: per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
+| `-w` | `<dir>` | next to output | Working directory for temporary partition files. |
 | `-h` / `--help` | — | — | Print usage |
+
+<details>
+<summary><strong>Advanced / benchmarking flags</strong></summary>
+
+| Flag | Argument | Default | Description |
+|------|----------|---------|-------------|
+| `-n` | `<int>` | auto | Number of partitions. Auto-tuned to ~2 MB input/partition when omitted |
+| `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
+| `-kt` | — | off | Keep temporary partition files after the run |
+| `-tp` | — | off | Stop after partitioning — Phase 1 only |
+| `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
+
+</details>
 
 ### Examples
 
@@ -131,6 +140,8 @@ Count from a list of files:
 tuna -k 31 -t 8 @genomes.list counts.tsv
 ```
 
+> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers, so the output file can reach ~20–30 GB.
+
 ---
 
 ## Output format
@@ -149,7 +160,7 @@ Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographica
 
 ## Benchmarks
 
-Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, m=21, 8 threads, on a cluster node (96 MB L3).
+Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, m=21, 8 threads, on a cluster node.
 Each row shows the **median wall time** over per-file runs (100 files for bacteria/metagenomes, 10 for human and Tara).
 
 | dataset | type | tuna median | KMC median | speedup | tuna p1 | tuna p2 |

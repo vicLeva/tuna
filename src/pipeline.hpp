@@ -223,38 +223,60 @@ int run(const Config& cfg)
 
 inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
 {
-    // k = 11  (1 pair)
+#if defined(FIXED_K)
+    // Binary compiled for a single k — reject any other value at runtime.
+    if (k != FIXED_K) {
+        std::cerr << "tuna: error: binary compiled for k=" << FIXED_K
+                  << " only; pass -k " << FIXED_K
+                  << " or recompile without -DFIXED_K to support other k values\n";
+        return 1;
+    }
+#endif
+    // Each k block is guarded by #if so that only the selected k's templates
+    // are instantiated — keeping compile time and binary size minimal with FIXED_K.
+#if !defined(FIXED_K) || FIXED_K == 11
     TUNA_DISPATCH(11,  9);
-    // k = 13  (2 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 13
     TUNA_DISPATCH(13,  9); TUNA_DISPATCH(13, 11);
-    // k = 15  (3 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 15
     TUNA_DISPATCH(15,  9); TUNA_DISPATCH(15, 11); TUNA_DISPATCH(15, 13);
-    // k = 17  (4 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 17
     TUNA_DISPATCH(17,  9); TUNA_DISPATCH(17, 11); TUNA_DISPATCH(17, 13); TUNA_DISPATCH(17, 15);
-    // k = 19  (5 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 19
     TUNA_DISPATCH(19,  9); TUNA_DISPATCH(19, 11); TUNA_DISPATCH(19, 13); TUNA_DISPATCH(19, 15);
     TUNA_DISPATCH(19, 17);
-    // k = 21  (6 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 21
     TUNA_DISPATCH(21,  9); TUNA_DISPATCH(21, 11); TUNA_DISPATCH(21, 13); TUNA_DISPATCH(21, 15);
     TUNA_DISPATCH(21, 17); TUNA_DISPATCH(21, 19);
-    // k = 23  (7 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 23
     TUNA_DISPATCH(23,  9); TUNA_DISPATCH(23, 11); TUNA_DISPATCH(23, 13); TUNA_DISPATCH(23, 15);
     TUNA_DISPATCH(23, 17); TUNA_DISPATCH(23, 19); TUNA_DISPATCH(23, 21);
-    // k = 25  (8 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 25
     TUNA_DISPATCH(25,  9); TUNA_DISPATCH(25, 11); TUNA_DISPATCH(25, 13); TUNA_DISPATCH(25, 15);
     TUNA_DISPATCH(25, 17); TUNA_DISPATCH(25, 19); TUNA_DISPATCH(25, 21); TUNA_DISPATCH(25, 23);
-    // k = 27  (9 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 27
     TUNA_DISPATCH(27,  9); TUNA_DISPATCH(27, 11); TUNA_DISPATCH(27, 13); TUNA_DISPATCH(27, 15);
     TUNA_DISPATCH(27, 17); TUNA_DISPATCH(27, 19); TUNA_DISPATCH(27, 21); TUNA_DISPATCH(27, 23);
     TUNA_DISPATCH(27, 25);
-    // k = 29  (10 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 29
     TUNA_DISPATCH(29,  9); TUNA_DISPATCH(29, 11); TUNA_DISPATCH(29, 13); TUNA_DISPATCH(29, 15);
     TUNA_DISPATCH(29, 17); TUNA_DISPATCH(29, 19); TUNA_DISPATCH(29, 21); TUNA_DISPATCH(29, 23);
     TUNA_DISPATCH(29, 25); TUNA_DISPATCH(29, 27);
-    // k = 31  (11 pairs)
+#endif
+#if !defined(FIXED_K) || FIXED_K == 31
     TUNA_DISPATCH(31,  9); TUNA_DISPATCH(31, 11); TUNA_DISPATCH(31, 13); TUNA_DISPATCH(31, 15);
     TUNA_DISPATCH(31, 17); TUNA_DISPATCH(31, 19); TUNA_DISPATCH(31, 21); TUNA_DISPATCH(31, 23);
     TUNA_DISPATCH(31, 25); TUNA_DISPATCH(31, 27); TUNA_DISPATCH(31, 29);
+#endif
 
     std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
               << "  k must be odd in [11,31]  (kache-hash Kmer fits in 64 bits, k ≤ 32)\n"

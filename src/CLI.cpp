@@ -134,6 +134,18 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         return false;
     }
 
+    if (cfg.k % 2 == 0 || cfg.k < 11 || cfg.k > 31) {
+        std::cerr << "tuna: error: k-mer length (-k " << cfg.k
+                  << ") must be an odd value in [11, 31]\n";
+        return false;
+    }
+
+    if (cfg.l % 2 == 0 || cfg.l < 9) {
+        std::cerr << "tuna: error: minimizer length (-m " << cfg.l
+                  << ") must be an odd value >= 9\n";
+        return false;
+    }
+
     if (cfg.l >= cfg.k) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l
                   << ") must be strictly less than k-mer length (-k " << cfg.k << ")\n";
