@@ -1,24 +1,17 @@
 #!/usr/bin/env bash
-# bench_datasets.sh — tuna (m=21) vs KMC on 6 datasets
+# bench_datasets.sh — tuna (m=21) vs KMC on 5 datasets
 #
 # Usage: bash bench_datasets.sh [THREADS] [K] [KMC_RAM_GB] [KMC_CACHE_CSV]
 # Example: bash bench_datasets.sh 8 31 250 /path/to/old/bench.csv
 #
 # KMC_CACHE_CSV: path to a previous bench.csv that already contains KMC
 #   per-file rows.  When set, run_kmc will look up (dataset, filename) in
-#   that file and copy the cached row instead of re-running KMC.  KMC is
-#   always executed for the full-dataset experiment (fname="full").
+#   that file and copy the cached row instead of re-running KMC.
 #
-# Two experiments per dataset:
+# Per-file experiment: N files selected from the fof (head or spread mode),
+#   one tuna + one KMC call per file.  Measures single-file throughput.
 #
-#   Per-file   — N files selected from the fof (head or spread mode), one
-#                tuna/KMC call per file.  Measures single-file throughput.
-#
-#   Full       — One tuna/KMC call on the complete fof.list (all files at
-#                once).  Measures multi-file parallel throughput.
-#                tuna receives "@fof.list"; KMC likewise.
-#
-# Sampling modes (per-file only):
+# Sampling modes:
 #   head   — take the first N files in the fof (default)
 #   spread — pick N files evenly spread across the full fof (always
 #             includes first and last)
@@ -54,16 +47,15 @@ RESULTS="$WORK/bench_datasets_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS"
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
-# Format: "name:fof_path:kmc_format:max_files:mode:full_max"
+# Format: "name:fof_path:kmc_format:max_files:mode"
 #   max_files — how many files to use for the per-file experiment
 #   mode      — head (default) or spread
-#   full_max  — how many files for the full-dataset experiment (0 = all)
 DATASETS=(
-    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm:100:head:3000"
-    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:10:head:30"
-    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm:100:head:3000"
-    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm:100:head:3000"
-    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:10:head:0"
+    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm:100:head"
+    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:10:head"
+    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm:100:head"
+    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm:100:head"
+    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:10:head"
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -103,10 +95,9 @@ echo ""
 
 for ENTRY in "${DATASETS[@]}"; do
 
-    IFS=: read -r DS_NAME FOF KMC_FMT DS_MAX DS_MODE DS_FULL_MAX <<< "$ENTRY"
+    IFS=: read -r DS_NAME FOF KMC_FMT DS_MAX DS_MODE <<< "$ENTRY"
     DS_MAX="${DS_MAX:-10}"
     DS_MODE="${DS_MODE:-head}"
-    DS_FULL_MAX="${DS_FULL_MAX:-0}"
 
     if [ ! -f "$FOF" ]; then
         echo "  [SKIP] $DS_NAME: fof not found: $FOF"
@@ -262,41 +253,6 @@ for ENTRY in "${DATASETS[@]}"; do
         unset TUNA_KMERS
     done
 
-    # ── Full-dataset experiment ────────────────────────────────────────────────
-    # One tuna call + one KMC call on (up to DS_FULL_MAX, or all) files.
-    # tuna and KMC both accept "@fof.list" as multi-file input.
-
-    if [ "$DS_FULL_MAX" -gt 0 ] && [ "$TOTAL" -gt "$DS_FULL_MAX" ]; then
-        FULL_N=$DS_FULL_MAX
-        FULL_FOF=$(mktemp "$WORK/full_fof_${DS_NAME}_XXXXXX.list")
-        head -n "$DS_FULL_MAX" "$FOF" > "$FULL_FOF"
-    else
-        FULL_N=$TOTAL
-        FULL_FOF="$FOF"
-    fi
-
-    echo ""
-    echo "  [full] $DS_NAME — $FULL_N files"
-    FTAG="${DS_NAME}_full"
-    K_KMERS=0
-    declare -A TUNA_KMERS
-
-    run_kmc  "$FTAG" "@${FULL_FOF}" 0 "full"
-    run_tuna "$FTAG" "@${FULL_FOF}" 0 "full"
-
-    [ "$FULL_FOF" != "$FOF" ] && rm -f "$FULL_FOF"
-
-    any_diff=0
-    for M in "${M_VALUES[@]}"; do
-        t_kmers=${TUNA_KMERS[$M]:-0}
-        if [ "$t_kmers" -ne "$K_KMERS" ] 2>/dev/null; then
-            echo "    [DIFF] tuna m=$M: tuna=$t_kmers  kmc=$K_KMERS"
-            any_diff=1
-        fi
-    done
-    [ $any_diff -eq 0 ] && echo "    [OK]  all m values match kmc ($K_KMERS unique k-mers)"
-
-    unset TUNA_KMERS
     echo ""
 done
 

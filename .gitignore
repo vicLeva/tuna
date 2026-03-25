@@ -34,5 +34,3 @@ perf.data.*
 
 # Plot outputs
 tools/*.png
-benchmark/results/
-
