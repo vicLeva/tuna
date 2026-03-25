@@ -100,7 +100,6 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files |
-| `-ram` | — | off | RAM mode: skip disk partitions, count directly in memory. Faster when I/O is the bottleneck; requires O(unique k-mers) RAM upfront |
 | `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
 | `-kt` | — | off | Keep temporary partition files after the run (useful for benchmarking) |
 | `-tp` | — | off | Stop after partitioning — Phase 1 only (useful for benchmarking partition speed) |

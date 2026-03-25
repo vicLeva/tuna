@@ -10,7 +10,6 @@
 #include "Config.hpp"
 #include "partition_hash.hpp"
 #include "count.hpp"
-#include "ram_mode.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -50,33 +49,6 @@ int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
 
-    // ── RAM mode: single-pass parse + count (no disk partitions) ──────────
-    if (cfg.ram_mode) {
-        if (!cfg.hide_progress)
-            std::cerr << "[ram] Parsing + counting into " << cfg.num_partitions
-                      << " in-RAM tables  (" << cfg.num_threads << " thread"
-                      << (cfg.num_threads > 1 ? "s" : "") << ")...\n";
-
-        std::ofstream out(cfg.output_file);
-        if (!out) {
-            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
-            return 1;
-        }
-
-        const auto t1 = std::chrono::steady_clock::now();
-        const auto [total_inserted, total_written] = partition_and_count_ram<k, m>(cfg, out);
-        const double t_ram = elapsed_s(t1);
-
-        if (!cfg.hide_progress)
-            std::cerr << "    " << total_inserted << " k-mers processed, "
-                      << total_written << " unique written  (" << t_ram << "s)\n";
-        std::cerr << "ram: " << t_ram << "s\n";
-
-        if (!cfg.hide_progress)
-            std::cerr << "[done] total: " << elapsed_s(t_start) << "s\n";
-        return 0;
-    }
-
     // ── Decide pipeline mode: in-memory (no disk round-trip) vs disk ──────
     //
     // In-memory mode: Phase 1 writes packed superkmers to per-partition
@@ -96,7 +68,7 @@ int run(const Config& cfg)
     }
     const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
     const uint64_t avail      = available_ram_bytes();
-    const bool use_mem_pipeline = !cfg.ram_mode && avail > 0 && est_packed < avail * 6 / 10;
+    const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 

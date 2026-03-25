@@ -20,6 +20,5 @@ struct Config {
     bool         hide_progress  = false;
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
-    bool         ram_mode      = false; // skip disk partitions: insert k-mers directly into in-RAM tables
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
 };

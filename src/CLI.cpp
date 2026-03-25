@@ -31,9 +31,6 @@ void print_usage(const char* prog)
         "  -w  <dir>   working directory for temp files\n"
         "              [default: tuna_tmp/ next to output file]\n"
         "\n"
-        "  -ram        RAM mode: skip disk partition files, insert k-mers directly\n"
-        "              into in-memory tables. Faster when I/O is the bottleneck;\n"
-        "              requires O(unique_kmers) RAM upfront.\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
@@ -86,8 +83,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         } else if (arg == "-w") {
             const char* v = next_val("-w"); if (!v) return false;
             cfg.work_dir = v;
-        } else if (arg == "-ram") {
-            cfg.ram_mode = true;
         } else if (arg == "-dbg") {
             cfg.debug_stats = true;
         } else if (arg == "-hp") {
