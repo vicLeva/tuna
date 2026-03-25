@@ -21,7 +21,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Required system libraries ──────────────────────────────────────────────────
 find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
+
+# Prefer static zlib to avoid GLIBC symbol-versioning issues in conda/spack
+# environments on clusters (libz.so compiled against GLIBC_2.14 but system
+# glibc predates that versioned memcpy).  Falls back to dynamic if no static
+# library is found (e.g. macOS with brew).
+set(ZLIB_USE_STATIC_LIBS ON)
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+    set(ZLIB_USE_STATIC_LIBS OFF)
+    find_package(ZLIB REQUIRED)
+endif()
 
 # ── L1 cache line size ────────────────────────────────────────────────────────
 # Required by utility.hpp (Padded<T>) and kache-hash internals.

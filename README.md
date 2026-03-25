@@ -70,6 +70,11 @@ cmake --build . --target tuna -j$(nproc)
 
 The `tuna` binary will be at `build/tuna`.
 
+### Cluster / conda environments
+
+If you see a linker error like `undefined reference to 'memcpy@GLIBC_2.14'`, your environment's `libz.so` was compiled against a newer glibc than the system provides (common with conda or spack on HPC clusters).
+CMake will automatically fall back to static `libz.a`, which avoids the issue — so deleting your `build/` directory and rebuilding from scratch should resolve it.
+
 ### Optional compile-time flags
 
 | Flag | Default | Description |
