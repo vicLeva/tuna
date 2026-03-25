@@ -35,6 +35,7 @@ Partitions are processed in parallel across threads (up to `-n` partitions at a 
 
 ## Dependencies
 
+- **Platform: Linux or macOS, x86\_64 only** (kache-hash uses x86 SIMD intrinsics)
 - C++20 compiler: [GCC](https://gcc.gnu.org/) >= 9.1 or [Clang](https://clang.llvm.org) >= 9.0
 - [CMake](https://cmake.org/) >= 3.17
 - [zlib](https://zlib.net/)
