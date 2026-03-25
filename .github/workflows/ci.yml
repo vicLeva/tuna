@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: macos-latest
+            name: macOS
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y zlib1g-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zlib
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target tuna -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Smoke test
+        run: |
+          # Generate a small FASTA with known content
+          printf ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>seq2\nTGCATGCATGCATGCATGCATGCATGCATGCATGCA\n" > /tmp/test.fa
+
+          # Run tuna (k=11 for speed, no -ci filter so all k-mers are reported)
+          ./build/tuna -k 11 -m 9 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
+
+          # Output must be non-empty
+          [ -s /tmp/out.tsv ] || { echo "Output is empty"; exit 1; }
+
+          # Each line must be <kmer>\t<count> with kmer of length 11
+          awk -F'\t' '
+            NF != 2           { print "Bad columns at line " NR; exit 1 }
+            length($1) != 11  { print "Bad kmer length at line " NR; exit 1 }
+            $2 !~ /^[0-9]+$/  { print "Bad count at line " NR; exit 1 }
+          ' /tmp/out.tsv
+
+          echo "Smoke test passed ($(wc -l < /tmp/out.tsv) k-mers)"
