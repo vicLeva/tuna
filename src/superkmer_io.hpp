@@ -6,22 +6,11 @@
 // per byte in kache-hash encoding (A=0, C=1, G=2, T=3), MSB-first.
 //
 //   len_bases — number of bases (max 255; superkmers are at most 2k−m bases).
-//   min_pos   — 0-indexed start position of the minimizer m-mer within the
-//               superkmer.  Stored so Phase 2 can compute ntHash(minimizer)
-//               in O(m) without running MinimizerWindow::reset() in O(k).
+//   min_pos   — 0-indexed start of the minimizer m-mer within the superkmer.
+//               Stored so Phase 2 can compute ntHash(minimizer) in O(m) instead
+//               of O(k) via MinimizerWindow::reset().
 //
 // Packed encoding: base i is at bits 7-2*(i%4) of byte i/4.
-// This is 4x smaller than ASCII.  Phase 2 unpacks directly to DNA::Base
-// (kache encoding) without any ASCII round-trip.
-//
-// SuperkmerWriter — per-thread per-bucket buffered write.
-//   Converts ASCII → packed on the fly; flushes to the shared ofstream under
-//   its mutex when needs_flush() is true.
-//
-// SuperkmerReader — zero-copy sequential reader backed by mmap (Linux/POSIX).
-//   Construction maps the entire file into the virtual address space.
-//   next() reads the two header bytes and advances the cursor; packed_data(),
-//   size(), and min_pos() expose the current superkmer.
 
 #include <fstream>
 #include <mutex>
@@ -49,13 +38,8 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 // ─── Writer ───────────────────────────────────────────────────────────────────
 //
 // SuperkmerWriter uses a raw POD buffer instead of std::string to avoid
-// zero-initialisation on resize.  std::string::resize(n) zeroes new bytes even
-// when the caller will immediately overwrite them; with ~11 bytes zeroed per
-// superkmer this wasted ~5.5% of phase-1 cycles in profiling.
-//
-// The raw buffer grows by doubling when full (same amortised cost as std::string)
-// but skips zero-fill entirely.  Memory is managed with operator new/delete
-// to preserve alignment guarantees without triggering value-init.
+// zero-initialisation on resize.  std::string::resize zeroes new bytes even when
+// immediately overwritten; this buffer grows by doubling but skips zero-fill.
 
 struct SuperkmerWriter
 {

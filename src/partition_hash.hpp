@@ -25,12 +25,9 @@
 #include <atomic>
 
 
-// Per-writer buffer flush threshold.
-// Each thread holds n_parts SuperkmerWriter objects.  The threshold caps total
-// writer memory per thread to budget_per_thread: max(4 KB, budget / n_parts).
-// Disk mode: budget is RAM-proportional (see pipeline.hpp) — larger buffers
-// yield fewer, bigger writes, matching KMC's -m behaviour.
-// In-memory mode: budget stays at 64 MB (writes go to RAM, no I/O benefit).
+// Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
+// Disk mode: budget is RAM-proportional — larger buffers yield fewer, bigger writes.
+// In-memory mode: fixed 64 MB budget (writes go to RAM, no I/O benefit).
 inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
 {
     constexpr size_t MIN_FLUSH_BYTES = 4u << 10;  // 4 KB minimum
@@ -40,21 +37,13 @@ inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
 
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
 //
-// Walk one ACTG-only DNA chunk (no N, no newlines — pre-filtered by helicase),
-// detect superkmer boundaries with the minimizer iterator, and append each
-// superkmer to the corresponding writer.
+// Walk one ACTG-only sequence, detect superkmer boundaries on minimizer hash
+// changes, and append each superkmer to the corresponding writer.
+// Splits on hash change (not partition change) so every superkmer has one minimizer.
+// min_pos comes from MinimizerWindow::min_lmer_pos() — no extra scan needed.
 //
-// Splits on every minimizer HASH change (not merely partition change) so that
-// every superkmer has a single well-defined minimizer.
-//
-// min_pos is obtained from MinimizerWindow::min_lmer_pos() — the position of the
-// minimizer m-mer is tracked as a side-effect of the sliding-window minimum with
-// no extra scan.  This replaces the old O(sk_len) find_minimizer_pos rescan that
-// consumed ~22% of phase1 cycles.
-
-// FlushFn signature: void(std::vector<SuperkmerWriter>&, size_t partition_id)
-// Called immediately after each append — O(1) per superkmer, O(n_superkmers) total.
-// Replaces the old O(n_parts) scan loop that ran after every sequence.
+// FlushFn: void(std::vector<SuperkmerWriter>&, size_t partition_id)
+// Called after each append; O(1) per superkmer.
 template <uint16_t k, uint16_t m, typename PartitionFn, typename FlushFn>
 void extract_superkmers_from_actg(
     const char* const             seq,
@@ -69,8 +58,7 @@ void extract_superkmers_from_actg(
 {
     if (seq_len < k) return;
 
-    // Pre-encode ASCII→kache once here; each base is then read N times (once per
-    // overlapping superkmer it belongs to) without re-doing the shift-XOR-mask.
+    // Pre-encode ASCII→kache once; bases are read multiple times across superkmers.
     kache_buf.resize(seq_len);
     for (size_t i = 0; i < seq_len; ++i)
         kache_buf[i] = ((uint8_t(seq[i]) >> 2) ^ (uint8_t(seq[i]) >> 1)) & 3u;
@@ -235,15 +223,9 @@ PartitionStats partition_kmers_gz_pc(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// File-level work stealing: each worker atomically claims the next unprocessed
-// file and runs helicase + superkmer extraction entirely on its own thread.
-// No producer thread, no queue, no memcpy — exactly n_threads threads run,
-// all land on P-cores (avoids the hybrid-CPU E-core penalty that the old
-// producer/consumer design suffered from when n_threads+1 threads competed
-// for n_threads P-cores).
-//
-// Load balancing is coarse (file granularity) but for equal-size files
-// (e.g. 200 × 4.7 MB E. coli) the imbalance is negligible.
+// File-level work stealing: each worker atomically claims the next file and runs
+// helicase + superkmer extraction on its own thread.
+// Load balancing is coarse (file granularity) but negligible for equal-size files.
 
 template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_impl(

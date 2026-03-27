@@ -25,11 +25,8 @@
 
 
 // ─── Debug stats ──────────────────────────────────────────────────────────────
-//
-// Populated by count_partition when dbg != nullptr.
-// coverage_hist: maps (k-mers sharing one minimizer) → (number of minimizers
-// with that coverage).  Aggregated globally in count_and_write and written to
-// <work_dir>/debug_min_coverage.csv.
+// Populated by count_partition when dbg != nullptr (-dbg flag).
+// coverage_hist is aggregated globally and written to debug_min_coverage.csv.
 
 struct PartitionDebugInfo {
     uint64_t n_inserted  = 0;   // total k-mer insertions (with multiplicity)
@@ -48,14 +45,9 @@ struct PartitionDebugInfo {
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
 //
-// Drain an already-open SuperkmerReader into the caller-provided hash table.
-// The table must be private to the calling thread (mt_=false, no locking).
-//
-// The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(m)
-// instead of running MinimizerWindow::reset() in O(k).  All k-mers in the
-// superkmer share the same minimizer, so init_packed_with_hash sets the bucket
-// hash once and advance() skips nt_min entirely.  A single prefetch() hides
-// the LLC miss (~200 ns) behind the O(m) lmer hash computation.
+// Drains a superkmer reader into the caller-provided hash table (mt_=false).
+// The stored min_pos byte lets Phase 2 init the bucket hash in O(m) rather than
+// O(k), and a 1-ahead prefetch_packed hides the ~40 ns LLC miss per superkmer.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
@@ -74,18 +66,9 @@ uint64_t count_partition(
     // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
 
-    // 1-ahead prefetch: for each superkmer N, issue prefetch_packed for N+1
-    // BEFORE processing N, hiding the ~40 ns LLC miss behind N's hot loop.
-    //
-    // Timing model (k=31, m=21, typical superkmer = 11 k-mers):
-    //   T+0:   prefetch_packed(nxt)  — O(m≈21) hash, ~5 ns, miss starts
-    //   T+5:   process cur: 11 upserts × ~2 ns ≈ 22 ns
-    //   T+27:  init_packed_with_min(nxt) — O(k+m≈52) ≈ 20 ns
-    //   T+47:  first upsert(nxt)  — LLC miss resolves at T+45 ns → ~2 ns stall
-    //   vs current: 0 ns of overlap → 40 ns stall per superkmer.
-    //
-    // For min_pos==0xFF (KMC sentinel, no precomputed minimizer): falls back to
-    // the original prefetch-after-init pattern for those superkmers.
+    // 1-ahead prefetch: issue prefetch_packed for superkmer N+1 before processing N
+    // to hide the ~40 ns LLC miss behind N's processing time.
+    // min_pos==0xFF (no precomputed minimizer): falls back to prefetch-after-init.
 
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
@@ -213,18 +196,9 @@ uint64_t write_counts(
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// init_sz scales with partition count: 128M / n_parts, clamped to [256K, 4M].
-// Two competing constraints drive the formula:
-//   (1) Per-bucket occupancy ≤ ~50%: secondary bucket probing triggers when the
-//       primary bucket (B=32 slots) is full.  Secondary probe = 2 XXH3 + 2 cold
-//       cache line accesses.  Keeping occupancy low avoids this path.
-//   (2) Metadata fits in L3: each bucket = 64 B metadata (cs[32] + min_coord[32]).
-//       With 4 active threads, total metadata budget = L3/n_threads ≈ 7.5 MB.
-// Formula target: ~37% per-bucket occupancy at expected unique k-mers / partition.
-//   n=32:   4M → 128K buckets →  8 MB meta (slightly above L3, same as original)
-//   n=64:   2M →  64K buckets →  4 MB meta (fits in L3)
-//   n=128:  1M →  32K buckets →  2 MB meta
-//   n=256: 512K→  16K buckets →  1 MB meta
+// Workers steal partitions round-robin (p = tid, tid+n_threads, …).
+// init_sz = clamp(2 × total_kmers/n_parts, 256K, 4M) for single-file runs;
+// falls back to 128M/n_parts for multi-file runs (where total counts duplicates).
 
 template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write(
@@ -257,17 +231,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader reader(partition_path(cfg.work_dir, p));
-            // Size the table generously to avoid load-triggered resizes.
-            //
-            // Dynamic formula: 2 × (total_kmers / n_parts) puts the 80% load threshold
-            // at 1.6× the average k-mer load per partition — well above any balanced run.
-            //
-            // Guard: only use the dynamic formula when n_files is small (≤10).
-            // For high-coverage multi-file runs (e.g. 200 E. coli files), total_kmers
-            // counts the same k-mers 200× so total/n_parts >> unique/n_parts, producing
-            // L3-busting tables (4M slots, 8 MB metadata/thread > 7.5 MB L3/thread budget).
-            // With ≤10 files, total ≈ unique (low multiplicity), so the dynamic formula
-            // is an accurate estimate of unique k-mers per partition.
+            // Dynamic init_sz: 2× estimated unique k-mers per partition.
+            // Only use total_kmers when n_files ≤ 10: for multi-file runs total_kmers
+            // counts duplicates across files (total >> unique), over-sizing the table.
             const size_t n_files = cfg.input_files.size();
             const size_t per_part = (total_kmers > 0 && n_files <= 10)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2

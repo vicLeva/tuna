@@ -64,22 +64,14 @@ int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
 
-    // ── Decide pipeline mode: in-memory (no disk round-trip) vs disk ──────
+    // ── Decide pipeline mode: in-memory vs disk ───────────────────────────
     //
-    // In-memory mode: Phase 1 writes packed superkmers to per-partition
-    // std::string buffers; Phase 2 reads from them via MemoryReader.
-    // Saves the disk write (Phase 1) + mmap setup (Phase 2) overhead.
+    // In-memory: Phase 1 writes superkmers to per-partition std::string buffers;
+    // Phase 2 reads via MemoryReader — no disk round-trip.
+    // Selected when estimated packed superkmer size < 60% of available RAM.
     //
-    // Condition: estimated packed superkmer size < 60% of available RAM.
-    //
-    // Estimation factors:
-    //   GZ inputs  — 35% of GZ_EXPAND-inflated size.  GZ_EXPAND is already
-    //                conservative; packed bases dominate for large gz genomes.
-    //   Plain inputs — 2× file size.  File size ≈ sequence content for FASTA.
-    //                Superkmers store k−1 overlapping bases at every boundary;
-    //                for k=31 and ~6 k-mers/superkmer this inflates stored bytes
-    //                to ~2× the raw sequence (validated: 2000 × 5 MB E. coli →
-    //                ~19 GB in-memory vs 10 GB raw input).
+    // Estimation: gz → fsz × GZ_EXPAND × 35%; plain → fsz × 2
+    // (superkmers store k-1 overlapping bases per boundary ≈ 2× raw sequence).
     uint64_t est_packed = 0;
     for (const auto& f : cfg.input_files) {
         std::error_code ec;
@@ -93,10 +85,9 @@ int run(const Config& cfg)
     const uint64_t avail      = available_ram_bytes();
     const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
 
-    // Disk-mode write-buffer budget per thread.
-    // Use up to 30 % of available RAM for Phase 1 write buffers (across all threads),
-    // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes → matches
-    // KMC's -m behaviour.  Falls back to 64 MB/thread if RAM is not detectable.
+    // Disk-mode write-buffer budget: up to 30% of RAM across all threads,
+    // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes.
+    // Falls back to 64 MB/thread if RAM is not detectable.
     const size_t disk_write_budget = [&]() -> size_t {
         if (avail == 0) return size_t(64) << 20;
         const uint64_t budget = avail * 3 / 10 / cfg.num_threads;
@@ -115,11 +106,8 @@ int run(const Config& cfg)
     const auto t_part = std::chrono::steady_clock::now();
 
     if (use_mem_pipeline) {
-        // In-memory: write to per-partition string buffers.
-        // Pre-reserve each buffer to the estimated final size (with 20% slack).
-        // reserve() allocates capacity without zeroing; physical pages are faulted in
-        // on first write (in workers), so demand-zero is proportional to actual data
-        // written (~695 MB) rather than the full reserved size (~2.3 GB).
+        // Pre-reserve buffers to estimated size (×1.2 slack).
+        // reserve() is demand-zero — pages are faulted in on first write.
         std::vector<std::string> part_bufs(cfg.num_partitions);
         // Pre-reserve only when per-partition buffers are large enough to matter.
         if (est_packed > 0) {

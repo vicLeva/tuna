@@ -47,25 +47,18 @@ static size_t l2_cache_per_core()
 }
 
 
-// Auto-tune the partition count when -n is not given (cfg.num_partitions == 0).
+// Auto-tune partition count when -n is not given.
 //
 // Target: ~2 MB of estimated uncompressed sequence per partition.
 // GZ files are expanded by GZ_EXPAND to approximate uncompressed size.
 //
-// Two caps are applied (in addition to the fd-limit budget):
+// Caps (beyond the fd-limit):
+//   WRITER_CACHE_CAP — keeps n × sizeof(SuperkmerWriter) within per-core L2.
+//     Phase 1 cache-thrashes on the writer array when n exceeds L2 capacity.
+//     Computed from sysfs at runtime; falls back to 4096 (256 KB L2).
+//   small-file cap — next_pow2(n_files) for redundant equal-size genomes.
 //
-//   WRITER_CACHE_CAP — keeps the writer-header array (n×sizeof(SuperkmerWriter))
-//     within the per-core L2 cache.  Phase 1 performance ∝ n_parts when the
-//     array exceeds L2 (cache thrashing on random-access appends):
-//       tara 5.9 GB gz @ n=32768 → phase1 ≈ 387 s
-//       tara 5.9 GB gz @ n= 8192 → phase1 ≈  89 s  (4× fewer → 4× faster)
-//     Cap = prev_pow2(L2_bytes / sizeof(SuperkmerWriter)), clamped to [4096, 32768].
-//     Detected at runtime from sysfs; falls back to 4096 (256 KB L2).
-//
-//   small-file cap — for multi-file runs where average file < 50 MB: cap n at
-//     next_pow2(n_files) to avoid over-partitioning redundant genomes.
-//
-// n is rounded to the next power of 2 and clamped to [16, min(caps)].
+// n is rounded to next power-of-2, clamped to [16, min(caps)].
 static uint32_t auto_tune_partitions(const std::vector<std::string>& input_files)
 {
     namespace fs = std::filesystem;
