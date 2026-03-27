@@ -17,13 +17,36 @@ endif()
 
 find_package(Threads REQUIRED)
 
-# Prefer static zlib — avoids GLIBC symbol-versioning issues in conda/spack
-# environments on clusters. Falls back to dynamic if no static lib is found.
-set(ZLIB_USE_STATIC_LIBS ON)
-find_package(ZLIB QUIET)
-if(NOT ZLIB_FOUND)
-    set(ZLIB_USE_STATIC_LIBS OFF)
-    find_package(ZLIB REQUIRED)
+# ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
+# zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
+# no code changes required. Disable with -DTUNA_USE_ZLIB_NG=OFF to fall back
+# to the system zlib (e.g. if building in an environment where fetching is not
+# possible or a system zlib-ng is already installed).
+option(TUNA_USE_ZLIB_NG "Build against zlib-ng (faster gz) instead of system zlib" ON)
+
+if(TUNA_USE_ZLIB_NG)
+    include(FetchContent)
+    FetchContent_Declare(
+        zlib-ng
+        GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
+        GIT_TAG        2.2.2
+        GIT_SHALLOW    TRUE
+    )
+    set(ZLIB_COMPAT       ON  CACHE INTERNAL "zlib-ng: enable zlib-compat API")
+    set(ZLIB_ENABLE_TESTS OFF CACHE INTERNAL "zlib-ng: skip tests")
+    set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "zlib-ng: static only")
+    FetchContent_MakeAvailable(zlib-ng)
+    set(TUNA_ZLIB_TARGET zlibstatic)
+else()
+    # Fall back to system zlib. Prefer static to avoid GLIBC symbol-versioning
+    # issues in conda/spack environments on clusters.
+    set(ZLIB_USE_STATIC_LIBS ON)
+    find_package(ZLIB QUIET)
+    if(NOT ZLIB_FOUND)
+        set(ZLIB_USE_STATIC_LIBS OFF)
+        find_package(ZLIB REQUIRED)
+    endif()
+    set(TUNA_ZLIB_TARGET ZLIB::ZLIB)
 endif()
 
 # L1 cache line size required by kache-hash internals.
@@ -79,4 +102,4 @@ target_include_directories(tuna PRIVATE
     ${CMAKE_SOURCE_DIR}/include/helicase_cpp
 )
 target_compile_options(tuna PRIVATE ${TUNA_COMPILE_FLAGS})
-target_link_libraries(tuna PRIVATE xxhash ZLIB::ZLIB Threads::Threads)
+target_link_libraries(tuna PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads)
