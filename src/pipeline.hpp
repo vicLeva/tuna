@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 #ifdef __linux__
@@ -70,19 +71,37 @@ int run(const Config& cfg)
     // Saves the disk write (Phase 1) + mmap setup (Phase 2) overhead.
     //
     // Condition: estimated packed superkmer size < 60% of available RAM.
-    // Packed size ≈ 35% of uncompressed sequence size.
-    // .gz files are expanded by GZ_EXPAND=6 for the estimate.
-    uint64_t est_raw = 0;
+    //
+    // Estimation factors:
+    //   GZ inputs  — 35% of GZ_EXPAND-inflated size.  GZ_EXPAND is already
+    //                conservative; packed bases dominate for large gz genomes.
+    //   Plain inputs — 2× file size.  File size ≈ sequence content for FASTA.
+    //                Superkmers store k−1 overlapping bases at every boundary;
+    //                for k=31 and ~6 k-mers/superkmer this inflates stored bytes
+    //                to ~2× the raw sequence (validated: 2000 × 5 MB E. coli →
+    //                ~19 GB in-memory vs 10 GB raw input).
+    uint64_t est_packed = 0;
     for (const auto& f : cfg.input_files) {
         std::error_code ec;
         uint64_t fsz = std::filesystem::file_size(f, ec);
         if (ec) continue;
         const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-        est_raw += is_gz ? fsz * GZ_EXPAND : fsz;
+        est_packed += is_gz
+            ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
+            : fsz * 2;
     }
-    const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
     const uint64_t avail      = available_ram_bytes();
     const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
+
+    // Disk-mode write-buffer budget per thread.
+    // Use up to 30 % of available RAM for Phase 1 write buffers (across all threads),
+    // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes → matches
+    // KMC's -m behaviour.  Falls back to 64 MB/thread if RAM is not detectable.
+    const size_t disk_write_budget = [&]() -> size_t {
+        if (avail == 0) return size_t(64) << 20;
+        const uint64_t budget = avail * 3 / 10 / cfg.num_threads;
+        return static_cast<size_t>(std::min(budget, uint64_t(512) << 20));
+    }();
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
@@ -97,24 +116,18 @@ int run(const Config& cfg)
 
     if (use_mem_pipeline) {
         // In-memory: write to per-partition string buffers.
-        // Pre-reserve each buffer to the estimated final size (with 20% slack) and
-        // touch all pages upfront — converts 12M+ scattered page faults into a single
-        // sequential zero-fill, eliminating the sys-time spike on large partition counts.
+        // Pre-reserve each buffer to the estimated final size (with 20% slack).
+        // reserve() allocates capacity without zeroing; physical pages are faulted in
+        // on first write (in workers), so demand-zero is proportional to actual data
+        // written (~695 MB) rather than the full reserved size (~2.3 GB).
         std::vector<std::string> part_bufs(cfg.num_partitions);
-        // Pre-reserve only when total partition memory > 2 GB.
-        // Below that, buffers fit in L3 and grow cheaply; pre-faulting upfront
-        // would merely increase working-set size and add cache pressure.
-        // Above that threshold, 32K+ growing strings cause O(millions) scattered
-        // page faults (measurable as 100s+ of sys time) that pre-faulting eliminates.
+        // Pre-reserve only when per-partition buffers are large enough to matter.
         if (est_packed > 0) {
             const size_t per_part = static_cast<size_t>(
                 est_packed * 6 / 5 / cfg.num_partitions);   // ×1.2 slack
-            const uint64_t total = static_cast<uint64_t>(per_part) * cfg.num_partitions;
-            if (per_part >= 64 && total > (2ULL << 30)) {
-                for (auto& s : part_bufs) {
-                    s.resize(per_part, '\0');   // allocate + touch all pages
-                    s.clear();                   // size → 0, capacity stays
-                }
+            if (per_part >= 64) {
+                for (size_t p = 0; p < cfg.num_partitions; ++p)
+                    part_bufs[p].reserve(per_part);
             }
         }
         stats = partition_kmers_mem<k, m>(cfg, part_bufs);
@@ -167,7 +180,7 @@ int run(const Config& cfg)
         buckets[p].open(partition_path(cfg.work_dir, p),
                         std::ios::binary);
 
-    stats = partition_kmers<k, m>(cfg, buckets);
+    stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
     for (auto& f : buckets) f.close();
 
     const double t_phase1 = elapsed_s(t_part);

@@ -47,59 +47,150 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 
 
 // ─── Writer ───────────────────────────────────────────────────────────────────
+//
+// SuperkmerWriter uses a raw POD buffer instead of std::string to avoid
+// zero-initialisation on resize.  std::string::resize(n) zeroes new bytes even
+// when the caller will immediately overwrite them; with ~11 bytes zeroed per
+// superkmer this wasted ~5.5% of phase-1 cycles in profiling.
+//
+// The raw buffer grows by doubling when full (same amortised cost as std::string)
+// but skips zero-fill entirely.  Memory is managed with operator new/delete
+// to preserve alignment guarantees without triggering value-init.
 
 struct SuperkmerWriter
 {
-    std::string buf;
+    char*  raw_  = nullptr;
+    size_t sz_   = 0;
+    size_t cap_  = 0;
     // flush_threshold is set per-writer based on n_parts so that total writer
     // memory across all partitions stays bounded to ~64 MB per thread:
     //   max(4 KB, 64 MB / n_parts)
     // Default (512 KB) is used when n_parts is small (≤128).
-    const size_t flush_threshold;
+    size_t flush_threshold;
 
     explicit SuperkmerWriter(size_t flush_thresh = 512u << 10)
-        : flush_threshold(flush_thresh) {}
+        : cap_(flush_thresh), flush_threshold(flush_thresh)
+    {
+        raw_ = static_cast<char*>(::operator new(cap_));
+    }
 
-    // Serialise one superkmer.
-    // `data` is ASCII DNA (ACGT, any case); `len` is the number of bases;
-    // `min_pos` is the 0-indexed start of the minimizer m-mer within the superkmer.
+    // Copy constructor: used by vector(n, template) — allocates a fresh buffer
+    // of the same capacity (preserving the pre-allocation invariant).
+    SuperkmerWriter(const SuperkmerWriter& o)
+        : sz_(o.sz_), cap_(o.cap_), flush_threshold(o.flush_threshold)
+    {
+        raw_ = static_cast<char*>(::operator new(cap_));
+        if (sz_) std::memcpy(raw_, o.raw_, sz_);
+    }
+
+    SuperkmerWriter(SuperkmerWriter&& o) noexcept
+        : raw_(o.raw_), sz_(o.sz_), cap_(o.cap_), flush_threshold(o.flush_threshold)
+    { o.raw_ = nullptr; o.sz_ = 0; o.cap_ = 0; }
+
+    SuperkmerWriter& operator=(const SuperkmerWriter&) = delete;
+    SuperkmerWriter& operator=(SuperkmerWriter&&)      = delete;
+
+    ~SuperkmerWriter() { ::operator delete(raw_); }
+
+    const char* data()  const noexcept { return raw_; }
+    size_t      size()  const noexcept { return sz_; }
+    bool        empty() const noexcept { return sz_ == 0; }
+    void        clear()       noexcept { sz_ = 0; }
+
+    // Grow the buffer if sz_ + extra would exceed cap_.
+    // Only called on the slow path (amortised O(1): doubles each time).
+    [[gnu::cold, gnu::noinline]]
+    void grow(size_t extra)
+    {
+        const size_t need = sz_ + extra;
+        cap_ = std::max(need, cap_ * 2);
+        char* n = static_cast<char*>(::operator new(cap_));
+        std::memcpy(n, raw_, sz_);
+        ::operator delete(raw_);
+        raw_ = n;
+    }
+
+    // Inline fast-path: capacity check + advance sz_.
+    // Returns pointer to the newly reserved region (caller fills it).
+    char* reserve_inline(size_t extra) noexcept
+    {
+        if (__builtin_expect(sz_ + extra > cap_, 0)) grow(extra);
+        char* dst = raw_ + sz_;
+        sz_ += extra;
+        return dst;
+    }
+
+    // Serialise one superkmer from ASCII DNA (ACGT, any case).
+    // Kept for call sites that don't pre-encode; prefer append_kache when possible.
     void append(const char* data, uint8_t len, uint8_t min_pos)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
-        const size_t off = buf.size();
-        buf.resize(off + 2u + packed_bytes);
+        char* dst = reserve_inline(2u + packed_bytes);
+        dst[0] = static_cast<char>(len);
+        dst[1] = static_cast<char>(min_pos);
+        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + 2);
 
-        // Two header bytes: length then minimizer position.
-        buf[off]     = static_cast<char>(len);
-        buf[off + 1] = static_cast<char>(min_pos);
-
-        // Pack 4 bases per byte, kache encoding: ((c>>2)^(c>>1))&3 = A=0,C=1,G=2,T=3.
-        uint8_t* packed = reinterpret_cast<uint8_t*>(buf.data() + off + 2u);
-        std::memset(packed, 0, packed_bytes);
-        for (uint8_t i = 0; i < len; ++i) {
-            const uint8_t b = ((uint8_t(data[i]) >> 2) ^ (uint8_t(data[i]) >> 1)) & 3u;
-            packed[i >> 2] |= static_cast<uint8_t>(b << (6u - 2u * (i & 3u)));
+        // Direct 4-bases-per-byte writes: no memset, no read-modify-write in the
+        // main loop → compiler auto-vectorizes (no loop-carried dependency).
+        size_t i = 0;
+        for (; i + 4 <= static_cast<size_t>(len); i += 4) {
+            const uint8_t b0 = ((uint8_t(data[i  ]) >> 2) ^ (uint8_t(data[i  ]) >> 1)) & 3u;
+            const uint8_t b1 = ((uint8_t(data[i+1]) >> 2) ^ (uint8_t(data[i+1]) >> 1)) & 3u;
+            const uint8_t b2 = ((uint8_t(data[i+2]) >> 2) ^ (uint8_t(data[i+2]) >> 1)) & 3u;
+            const uint8_t b3 = ((uint8_t(data[i+3]) >> 2) ^ (uint8_t(data[i+3]) >> 1)) & 3u;
+            packed[i >> 2] = static_cast<uint8_t>((b0 << 6) | (b1 << 4) | (b2 << 2) | b3);
+        }
+        if (i < static_cast<size_t>(len)) {
+            uint8_t tail = 0;
+            for (size_t j = i; j < static_cast<size_t>(len); ++j) {
+                const uint8_t b = ((uint8_t(data[j]) >> 2) ^ (uint8_t(data[j]) >> 1)) & 3u;
+                tail |= static_cast<uint8_t>(b << (6u - 2u * (j - i)));
+            }
+            packed[i >> 2] = tail;
         }
     }
 
-    bool needs_flush() const { return buf.size() >= flush_threshold; }
+    // Serialise one superkmer from pre-encoded kache bytes (A=0,C=1,G=2,T=3).
+    // Caller pre-converts the entire sequence ASCII→kache once; this path
+    // skips all re-encoding — only shift+OR to pack 4 bases into 1 byte.
+    void append_kache(const uint8_t* kdata, uint8_t len, uint8_t min_pos)
+    {
+        const size_t packed_bytes = (len + 3u) / 4u;
+        char* dst = reserve_inline(2u + packed_bytes);
+        dst[0] = static_cast<char>(len);
+        dst[1] = static_cast<char>(min_pos);
+        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + 2);
+
+        size_t i = 0;
+        for (; i + 4 <= static_cast<size_t>(len); i += 4)
+            packed[i >> 2] = static_cast<uint8_t>(
+                (kdata[i] << 6) | (kdata[i+1] << 4) | (kdata[i+2] << 2) | kdata[i+3]);
+        if (i < static_cast<size_t>(len)) {
+            uint8_t tail = 0;
+            for (size_t j = i; j < static_cast<size_t>(len); ++j)
+                tail |= static_cast<uint8_t>(kdata[j] << (6u - 2u * (j - i)));
+            packed[i >> 2] = tail;
+        }
+    }
+
+    bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
 
     // Flush to the shared file under its mutex; no-op if buffer is empty.
     void flush_to(std::ofstream& file, std::mutex& mtx)
     {
-        if (buf.empty()) return;
+        if (sz_ == 0) return;
         std::lock_guard<std::mutex> g(mtx);
-        file.write(buf.data(), static_cast<std::streamsize>(buf.size()));
-        buf.clear();
+        file.write(raw_, static_cast<std::streamsize>(sz_));
+        sz_ = 0;
     }
 
     // Flush to an in-memory string sink (streaming mode — avoids disk I/O).
     void flush_to_mem(std::string& dst, std::mutex& mtx)
     {
-        if (buf.empty()) return;
+        if (sz_ == 0) return;
         std::lock_guard<std::mutex> g(mtx);
-        dst.append(buf);
-        buf.clear();
+        dst.append(raw_, sz_);
+        sz_ = 0;
     }
 };
 

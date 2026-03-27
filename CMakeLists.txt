@@ -60,7 +60,7 @@ endif()
 set(TUNA_COMPILE_FLAGS -Wall -Wextra -Wno-unused-function ${CONSTEXPR_FLAG})
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    list(APPEND TUNA_COMPILE_FLAGS -funroll-loops -march=native)
+    list(APPEND TUNA_COMPILE_FLAGS -funroll-loops -march=native -fomit-frame-pointer)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
         list(APPEND TUNA_COMPILE_FLAGS -mavx -msse4.1 -msse3)
     endif()

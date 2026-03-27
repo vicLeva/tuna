@@ -149,6 +149,16 @@ int main(int argc, char* argv[])
     if (cfg.num_partitions == 0)
         cfg.num_partitions = auto_tune_partitions(cfg.input_files);
 
+    // Round up to next power of 2 so partition_fn can use bitmask instead of division.
+    {
+        uint32_t n = cfg.num_partitions;
+        if (n > 1 && (n & (n - 1)) != 0) {
+            while (n & (n - 1)) n &= n - 1;
+            n <<= 1;
+            cfg.num_partitions = n;
+        }
+    }
+
     // ── Working directory ──────────────────────────────────────────────────
     bool own_work_dir = false;
     if (cfg.work_dir.empty()) {
