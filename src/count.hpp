@@ -9,8 +9,10 @@
 //   count_and_write<k,m>   — parallel harness (threading / scheduling).
 
 #include "Config.hpp"
+#include "kff_output.hpp"
 #include "superkmer_io.hpp"
 
+#include <array>
 #include <fstream>
 #include <string>
 #include <mutex>
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <unordered_map>
+#include <vector>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -194,6 +197,68 @@ uint64_t write_counts(
 }
 
 
+// ─── KFF output brick ─────────────────────────────────────────────────────────
+//
+// Encodes each k-mer from the table as 2-bit MSB-first bytes and flushes to
+// a KffOutput in batches of ~1 MB.  Thread-safe via KffOutput::write_batch.
+
+template <uint16_t k, uint16_t m, bool mt_ = false>
+uint64_t write_counts_kff(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg,
+    KffOutput&    kff_out)
+{
+    constexpr size_t KMER_BYTES  = (k + 3) / 4;
+    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);
+
+    // Lookup table: ASCII → 2-bit value (A=0, C=1, G=2, T=3).
+    static constexpr std::array<uint8_t, 256> B2B = []() constexpr {
+        std::array<uint8_t, 256> t{};
+        t['C'] = t['c'] = 1;
+        t['G'] = t['g'] = 2;
+        t['T'] = t['t'] = 3;
+        return t;
+    }();
+
+    std::vector<uint8_t>  seq_buf;
+    std::vector<uint32_t> cnt_buf;
+    seq_buf.reserve(BATCH_KMERS * KMER_BYTES);
+    cnt_buf.reserve(BATCH_KMERS);
+
+    const auto flush = [&]() {
+        if (!cnt_buf.empty()) {
+            kff_out.write_batch(seq_buf.data(), cnt_buf.data(), cnt_buf.size());
+            seq_buf.clear();
+            cnt_buf.clear();
+        }
+    };
+
+    std::string label;
+    uint64_t written = 0;
+
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt < cfg.ci || cnt > cfg.cx) return;
+
+        entry.first.get_label(label);
+
+        // Pack label into 2-bit bytes (MSB = first base).
+        seq_buf.resize(seq_buf.size() + KMER_BYTES, 0);
+        uint8_t* dst = seq_buf.data() + seq_buf.size() - KMER_BYTES;
+        for (size_t i = 0; i < k; ++i)
+            dst[i >> 2] |= B2B[(uint8_t)label[i]] << (6 - 2 * (i & 3));
+
+        cnt_buf.push_back(static_cast<uint32_t>(cnt));
+        ++written;
+
+        if (cnt_buf.size() >= BATCH_KMERS) flush();
+    });
+    flush();
+
+    return written;
+}
+
+
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
 // Workers steal partitions round-robin (p = tid, tid+n_threads, …).
@@ -204,7 +269,8 @@ template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
-    std::ofstream& out)
+    std::ofstream* out,       // non-null for TSV output
+    KffOutput*     kff_out)   // non-null for KFF output
 {
     using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
@@ -256,7 +322,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = kff_out
+                ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
 
             // Collect per-partition overflow stats.
@@ -470,7 +538,8 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
-    std::ofstream&            out)
+    std::ofstream*            out,       // non-null for TSV output
+    KffOutput*                kff_out)   // non-null for KFF output
 {
     using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
@@ -510,7 +579,9 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
 
-            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = kff_out
+                ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };

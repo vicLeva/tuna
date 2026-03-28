@@ -16,6 +16,34 @@ endif()
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
 find_package(Threads REQUIRED)
+include(FetchContent)
+
+# ── kff-cpp-api for KFF output format ─────────────────────────────────────────
+# We skip kff's own CMakeLists (which would pull in unneeded benchmarks/executables)
+# and build the library directly from the two source files we need.
+FetchContent_Declare(
+    kff_src
+    GIT_REPOSITORY https://github.com/Kmer-File-Format/kff-cpp-api.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+)
+FetchContent_GetProperties(kff_src)
+if(NOT kff_src_POPULATED)
+    FetchContent_Populate(kff_src)
+endif()
+
+set(KFF_VERSION_MAJOR 1)
+set(KFF_VERSION_MINOR 0)
+configure_file(
+    ${kff_src_SOURCE_DIR}/kff_io.hpp.in
+    ${CMAKE_BINARY_DIR}/kff_io.hpp
+    @ONLY
+)
+add_library(kff_io STATIC ${kff_src_SOURCE_DIR}/kff_io.cpp)
+target_include_directories(kff_io PUBLIC
+    ${kff_src_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}
+)
 
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
@@ -102,4 +130,4 @@ target_include_directories(tuna PRIVATE
     ${CMAKE_SOURCE_DIR}/include/helicase_cpp
 )
 target_compile_options(tuna PRIVATE ${TUNA_COMPILE_FLAGS})
-target_link_libraries(tuna PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads)
+target_link_libraries(tuna PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)

@@ -15,6 +15,8 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 - [Installation](#installation)
 - [Usage](#usage)
 - [Output format](#output-format)
+  - [TSV (default)](#tsv-default)
+  - [KFF binary](#kff-binary--kff-or-kff-extension)
 - [Benchmarks](#benchmarks)
 
 ---
@@ -27,7 +29,7 @@ tuna runs a two-phase pipeline:
 
 2. **Count (Phase 2)** — replays each partition, upserting every k-mer into a Kache-hash table with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time.
 
-3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes `<kmer>\t<count>` to the output file.
+3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
 
 Partitions are processed in parallel across threads (up to `-n` partitions at a time), keeping peak memory proportional to a single partition's k-mer set.
 
@@ -39,6 +41,7 @@ Partitions are processed in parallel across threads (up to `-n` partitions at a 
 - C++20 compiler: [GCC](https://gcc.gnu.org/) >= 9.1 or [Clang](https://clang.llvm.org) >= 9.0
 - [CMake](https://cmake.org/) >= 3.17
 - [zlib-ng](https://github.com/zlib-ng/zlib-ng) (fetched automatically by CMake; a system zlib is no longer required)
+- [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) (fetched automatically by CMake; required for KFF output)
 
 **Debian/Ubuntu:**
 ```bash
@@ -106,6 +109,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files. |
+| `-kff` | — | off | Write output in [KFF binary format](https://github.com/Kmer-File-Format/kff-reference) instead of TSV. Auto-detected from a `.kff` output extension. |
 | `-h` / `--help` | — | — | Print usage |
 
 <details>
@@ -141,11 +145,19 @@ Count from a list of files:
 tuna -k 31 -t 8 @genomes.list counts.tsv
 ```
 
-> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers, so the output file can reach ~20–30 GB.
+Write KFF binary output (auto-detected from extension):
+
+```bash
+tuna -k 31 -t 8 @genomes.list counts.kff
+```
+
+> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; in KFF binary (~12 bytes/k-mer) it is ~6 GB.
 
 ---
 
 ## Output format
+
+### TSV (default)
 
 Plain text, tab-separated, one k-mer per line:
 
@@ -154,6 +166,14 @@ ACGTACGTACGTACGTACGTACGTACGTACG	42
 TGCATGCATGCATGCATGCATGCATGCATGC	7
 ...
 ```
+
+### KFF binary (`-kff` or `.kff` extension)
+
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3, MSB-first) with a 4-byte big-endian count. The file is marked `canonical=true` and `unique=true`. Roughly 3–4× smaller than TSV for k=31.
+
+KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
+
+---
 
 Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographically smaller of forward/reverse-complement) form of each k-mer is reported.
 
@@ -166,14 +186,14 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 
 | dataset | type | tuna median | KMC median | speedup | tuna p1 | tuna p2 |
 |---------|------|-------------|------------|---------|---------|---------|
-| *E. coli* | genomes (plain FASTA) | 0.54 s | 1.24 s | **2.3×** | 0.18 s | 0.30 s |
-| *Salmonella* | genomes (gz) | 0.54 s | 1.23 s | **2.3×** | 0.20 s | 0.28 s |
-| Gut | metagenome assemblies (plain FASTA) | 0.26 s | 0.74 s | **2.9×** | 0.09 s | 0.13 s |
-| Human | genomes (gz) | 161 s | 208 s | **1.3×** | 75 s | 82 s |
-| Tara | metagenome reads (gz, 5.9 GB) | 105 s | 179 s | **1.7×** | 43 s | 60 s |
+| *E. coli* | genomes (plain FASTA) | 0.50 s | 1.24 s | **2.5×** | 0.14 s | 0.30 s |
+| *Salmonella* | genomes (gz) | 0.47 s | 1.25 s | **2.7×** | 0.12 s | 0.29 s |
+| Gut | metagenome assemblies (plain FASTA) | 0.23 s | 0.75 s | **3.3×** | 0.07 s | 0.13 s |
+| Human | genomes (gz) | 134 s | 208 s | **1.5×** | 42 s | 88 s |
+| Tara | metagenome reads (gz, 5.9 GB) | 93 s | 177 s | **1.9×** | 28 s | 62 s |
 
 tuna is consistently faster than KMC across all dataset types.
-Memory usage scales with unique k-mers per partition rather than total input size.  
+Memory usage scales with unique k-mers per partition rather than total input size.
 KMC tends to be faster on scaling set of datasets rather than counting k-mers inside individual files.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)

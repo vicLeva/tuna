@@ -8,6 +8,7 @@
 //   superkmer_io.hpp    — on-disk partition file format
 
 #include "Config.hpp"
+#include "kff_output.hpp"
 #include "partition_hash.hpp"
 #include "count.hpp"
 
@@ -140,13 +141,24 @@ int run(const Config& cfg)
                       << (p2_threads > 1 ? "s" : "") << ", in-memory) ...\n";
 
         const auto t2 = std::chrono::steady_clock::now();
-        std::ofstream out(cfg.output_file);
-        if (!out) {
-            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
-            return 1;
+
+        std::ofstream tsv_out;
+        if (!cfg.output_kff) {
+            tsv_out.open(cfg.output_file);
+            if (!tsv_out) {
+                std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+                return 1;
+            }
         }
-        const auto [total_inserted, total_written] =
-            count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, out);
+
+        const auto [total_inserted, total_written] = cfg.output_kff
+            ? [&]() {
+                KffOutput kff_out(cfg.output_file, cfg.k);
+                auto r = count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
+                kff_out.close();
+                return r;
+              }()
+            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
@@ -193,13 +205,23 @@ int run(const Config& cfg)
 
     const auto t2 = std::chrono::steady_clock::now();
 
-    std::ofstream out(cfg.output_file);
-    if (!out) {
-        std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
-        return 1;
+    std::ofstream tsv_out;
+    if (!cfg.output_kff) {
+        tsv_out.open(cfg.output_file);
+        if (!tsv_out) {
+            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+            return 1;
+        }
     }
 
-    const auto [total_inserted, total_written] = count_and_write<k, m>(cfg, stats.kmers, out);
+    const auto [total_inserted, total_written] = cfg.output_kff
+        ? [&]() {
+            KffOutput kff_out(cfg.output_file, cfg.k);
+            auto r = count_and_write<k, m>(cfg, stats.kmers, nullptr, &kff_out);
+            kff_out.close();
+            return r;
+          }()
+        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)

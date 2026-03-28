@@ -36,10 +36,11 @@ void print_usage(const char* prog)
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
+        "  -kff        write output in KFF binary format (auto-detected from .kff extension)\n"
         "  -h/--help   show this help\n"
         "  -v/--version print version\n"
         "\n"
-        "Output: plain text, one k-mer per line: <kmer>\\t<count>\n";
+        "Output: plain text TSV (<kmer>\\t<count>) by default; use -kff for KFF binary.\n";
 }
 
 
@@ -91,6 +92,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.work_dir = v;
         } else if (arg == "-dbg") {
             cfg.debug_stats = true;
+        } else if (arg == "-kff") {
+            cfg.output_kff = true;
         } else if (arg == "-hp") {
             cfg.hide_progress = true;
         } else if (arg == "-kt") {
@@ -138,6 +141,13 @@ bool parse_args(int argc, char* argv[], Config& cfg)
     if (cfg.input_files.empty()) {
         std::cerr << "tuna: error: no input files\n";
         return false;
+    }
+
+    // Auto-detect KFF output from .kff extension.
+    if (!cfg.output_kff) {
+        const auto& of = cfg.output_file;
+        if (of.size() >= 4 && of.compare(of.size() - 4, 4, ".kff") == 0)
+            cfg.output_kff = true;
     }
 
     if (cfg.k % 2 == 0 || cfg.k < 11 || cfg.k > 31) {
