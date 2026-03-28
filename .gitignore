@@ -34,3 +34,5 @@ perf.data.*
 
 # Plot outputs
 tools/*.png
+
+.claude/
