@@ -21,4 +21,5 @@ struct Config {
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
+    bool         output_kff    = false; // write output in KFF binary format instead of TSV
 };

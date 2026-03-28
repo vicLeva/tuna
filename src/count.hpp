@@ -9,8 +9,10 @@
 //   count_and_write<k,m>   — parallel harness (threading / scheduling).
 
 #include "Config.hpp"
+#include "kff_output.hpp"
 #include "superkmer_io.hpp"
 
+#include <array>
 #include <fstream>
 #include <string>
 #include <mutex>
@@ -20,16 +22,14 @@
 #include <algorithm>
 #include <iomanip>
 #include <unordered_map>
+#include <vector>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
 
 // ─── Debug stats ──────────────────────────────────────────────────────────────
-//
-// Populated by count_partition when dbg != nullptr.
-// coverage_hist: maps (k-mers sharing one minimizer) → (number of minimizers
-// with that coverage).  Aggregated globally in count_and_write and written to
-// <work_dir>/debug_min_coverage.csv.
+// Populated by count_partition when dbg != nullptr (-dbg flag).
+// coverage_hist is aggregated globally and written to debug_min_coverage.csv.
 
 struct PartitionDebugInfo {
     uint64_t n_inserted  = 0;   // total k-mer insertions (with multiplicity)
@@ -48,14 +48,9 @@ struct PartitionDebugInfo {
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
 //
-// Drain an already-open SuperkmerReader into the caller-provided hash table.
-// The table must be private to the calling thread (mt_=false, no locking).
-//
-// The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(m)
-// instead of running MinimizerWindow::reset() in O(k).  All k-mers in the
-// superkmer share the same minimizer, so init_packed_with_hash sets the bucket
-// hash once and advance() skips nt_min entirely.  A single prefetch() hides
-// the LLC miss (~200 ns) behind the O(m) lmer hash computation.
+// Drains a superkmer reader into the caller-provided hash table (mt_=false).
+// The stored min_pos byte lets Phase 2 init the bucket hash in O(m) rather than
+// O(k), and a 1-ahead prefetch_packed hides the ~40 ns LLC miss per superkmer.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
@@ -74,18 +69,9 @@ uint64_t count_partition(
     // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
 
-    // 1-ahead prefetch: for each superkmer N, issue prefetch_packed for N+1
-    // BEFORE processing N, hiding the ~40 ns LLC miss behind N's hot loop.
-    //
-    // Timing model (k=31, m=21, typical superkmer = 11 k-mers):
-    //   T+0:   prefetch_packed(nxt)  — O(m≈21) hash, ~5 ns, miss starts
-    //   T+5:   process cur: 11 upserts × ~2 ns ≈ 22 ns
-    //   T+27:  init_packed_with_min(nxt) — O(k+m≈52) ≈ 20 ns
-    //   T+47:  first upsert(nxt)  — LLC miss resolves at T+45 ns → ~2 ns stall
-    //   vs current: 0 ns of overlap → 40 ns stall per superkmer.
-    //
-    // For min_pos==0xFF (KMC sentinel, no precomputed minimizer): falls back to
-    // the original prefetch-after-init pattern for those superkmers.
+    // 1-ahead prefetch: issue prefetch_packed for superkmer N+1 before processing N
+    // to hide the ~40 ns LLC miss behind N's processing time.
+    // min_pos==0xFF (no precomputed minimizer): falls back to prefetch-after-init.
 
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
@@ -211,26 +197,210 @@ uint64_t write_counts(
 }
 
 
+// ─── KFF output brick ─────────────────────────────────────────────────────────
+//
+// Encodes each k-mer from the table as 2-bit MSB-first bytes and flushes to
+// a KffOutput in batches of ~1 MB.  Thread-safe via KffOutput::write_batch.
+
+template <uint16_t k, uint16_t m, bool mt_ = false>
+uint64_t write_counts_kff(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg,
+    KffOutput&    kff_out)
+{
+    constexpr size_t KMER_BYTES  = (k + 3) / 4;
+    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);
+
+    // Lookup table: ASCII → 2-bit value (A=0, C=1, G=2, T=3).
+    static constexpr std::array<uint8_t, 256> B2B = []() constexpr {
+        std::array<uint8_t, 256> t{};
+        t['C'] = t['c'] = 1;
+        t['G'] = t['g'] = 2;
+        t['T'] = t['t'] = 3;
+        return t;
+    }();
+
+    std::vector<uint8_t>  seq_buf;
+    std::vector<uint32_t> cnt_buf;
+    seq_buf.reserve(BATCH_KMERS * KMER_BYTES);
+    cnt_buf.reserve(BATCH_KMERS);
+
+    const auto flush = [&]() {
+        if (!cnt_buf.empty()) {
+            kff_out.write_batch(seq_buf.data(), cnt_buf.data(), cnt_buf.size());
+            seq_buf.clear();
+            cnt_buf.clear();
+        }
+    };
+
+    std::string label;
+    uint64_t written = 0;
+
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt < cfg.ci || cnt > cfg.cx) return;
+
+        entry.first.get_label(label);
+
+        // Pack label into 2-bit bytes (MSB = first base).
+        seq_buf.resize(seq_buf.size() + KMER_BYTES, 0);
+        uint8_t* dst = seq_buf.data() + seq_buf.size() - KMER_BYTES;
+        for (size_t i = 0; i < k; ++i)
+            dst[i >> 2] |= B2B[(uint8_t)label[i]] << (6 - 2 * (i & 3));
+
+        cnt_buf.push_back(static_cast<uint32_t>(cnt));
+        ++written;
+
+        if (cnt_buf.size() >= BATCH_KMERS) flush();
+    });
+    flush();
+
+    return written;
+}
+
+
+// ─── Callback output brick ────────────────────────────────────────────────────
+//
+// Drains the table, applies ci/cx filters, and calls cb(kmer, count) for each
+// passing k-mer.  cb is called from the calling thread only (one table per call),
+// so no internal mutex is used.  If multiple worker threads drain different tables
+// concurrently, cb may be invoked from several threads simultaneously — the caller
+// is responsible for any needed synchronisation.
+
+template <uint16_t k, uint16_t m, bool mt_ = false, typename Callback>
+uint64_t write_counts_callback(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg,
+    Callback& cb)
+{
+    std::string label;
+    uint64_t written = 0;
+
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt < cfg.ci || cnt > cfg.cx) return;
+        entry.first.get_label(label);
+        cb(std::string_view(label), static_cast<uint32_t>(cnt));
+        ++written;
+    });
+
+    return written;
+}
+
+
+// ─── Callback counting harnesses ──────────────────────────────────────────────
+//
+// Same structure as count_and_write / count_and_write_mem but drain tables via
+// a user-supplied callback instead of writing to a file.
+//
+// Thread safety: cb may be called concurrently from multiple worker threads
+// (one per partition).  Each partition's k-mers are disjoint, so there is no
+// risk of duplicate calls for the same k-mer.  The caller must ensure cb is
+// safe to call from multiple threads if num_threads > 1.
+
+template <uint16_t k, uint16_t m, typename Callback>
+std::pair<uint64_t, uint64_t> count_and_callback_mem(
+    const Config&             cfg,
+    uint64_t                  total_kmers,
+    std::vector<std::string>& part_bufs,
+    Callback&&                cb)
+{
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+
+    const size_t n_parts   = cfg.num_partitions;
+    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+
+    std::atomic<uint64_t> total_inserted{0}, total_written{0};
+
+    auto worker = [&](size_t tid) {
+        typename table_t::Token token;
+
+        for (size_t p = tid; p < n_parts; p += n_threads) {
+            const size_t n_files  = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            table_t table(init_sz, 1);
+
+            uint64_t ins;
+            {
+                MemoryReader reader(part_bufs[p]);
+                ins = count_partition<k, m, MemoryReader>(reader, table, token);
+            }
+            { std::string tmp; part_bufs[p].swap(tmp); }
+            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    return { total_inserted.load(), total_written.load() };
+}
+
+
+template <uint16_t k, uint16_t m, typename Callback>
+std::pair<uint64_t, uint64_t> count_and_callback(
+    const Config& cfg,
+    uint64_t      total_kmers,
+    Callback&&    cb)
+{
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+
+    const size_t n_parts   = cfg.num_partitions;
+    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+
+    std::atomic<uint64_t> total_inserted{0}, total_written{0};
+
+    auto worker = [&](size_t tid) {
+        typename table_t::Token token;
+
+        for (size_t p = tid; p < n_parts; p += n_threads) {
+            SuperkmerReader reader(partition_path(cfg.work_dir, p));
+            const size_t n_files  = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            table_t table(init_sz, 1);
+
+            const uint64_t ins = count_partition<k, m>(reader, table, token);
+            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    return { total_inserted.load(), total_written.load() };
+}
+
+
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
-// init_sz scales with partition count: 128M / n_parts, clamped to [256K, 4M].
-// Two competing constraints drive the formula:
-//   (1) Per-bucket occupancy ≤ ~50%: secondary bucket probing triggers when the
-//       primary bucket (B=32 slots) is full.  Secondary probe = 2 XXH3 + 2 cold
-//       cache line accesses.  Keeping occupancy low avoids this path.
-//   (2) Metadata fits in L3: each bucket = 64 B metadata (cs[32] + min_coord[32]).
-//       With 4 active threads, total metadata budget = L3/n_threads ≈ 7.5 MB.
-// Formula target: ~37% per-bucket occupancy at expected unique k-mers / partition.
-//   n=32:   4M → 128K buckets →  8 MB meta (slightly above L3, same as original)
-//   n=64:   2M →  64K buckets →  4 MB meta (fits in L3)
-//   n=128:  1M →  32K buckets →  2 MB meta
-//   n=256: 512K→  16K buckets →  1 MB meta
+// Workers steal partitions round-robin (p = tid, tid+n_threads, …).
+// init_sz = clamp(2 × total_kmers/n_parts, 256K, 4M) for single-file runs;
+// falls back to 128M/n_parts for multi-file runs (where total counts duplicates).
 
 template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
-    std::ofstream& out)
+    std::ofstream* out,       // non-null for TSV output
+    KffOutput*     kff_out)   // non-null for KFF output
 {
     using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
@@ -257,17 +427,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader reader(partition_path(cfg.work_dir, p));
-            // Size the table generously to avoid load-triggered resizes.
-            //
-            // Dynamic formula: 2 × (total_kmers / n_parts) puts the 80% load threshold
-            // at 1.6× the average k-mer load per partition — well above any balanced run.
-            //
-            // Guard: only use the dynamic formula when n_files is small (≤10).
-            // For high-coverage multi-file runs (e.g. 200 E. coli files), total_kmers
-            // counts the same k-mers 200× so total/n_parts >> unique/n_parts, producing
-            // L3-busting tables (4M slots, 8 MB metadata/thread > 7.5 MB L3/thread budget).
-            // With ≤10 files, total ≈ unique (low multiplicity), so the dynamic formula
-            // is an accurate estimate of unique k-mers per partition.
+            // Dynamic init_sz: 2× estimated unique k-mers per partition.
+            // Only use total_kmers when n_files ≤ 10: for multi-file runs total_kmers
+            // counts duplicates across files (total >> unique), over-sizing the table.
             const size_t n_files = cfg.input_files.size();
             const size_t per_part = (total_kmers > 0 && n_files <= 10)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
@@ -290,7 +452,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = kff_out
+                ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
 
             // Collect per-partition overflow stats.
@@ -504,7 +668,8 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
-    std::ofstream&            out)
+    std::ofstream*            out,       // non-null for TSV output
+    KffOutput*                kff_out)   // non-null for KFF output
 {
     using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
 
@@ -544,7 +709,9 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
 
-            const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const uint64_t wrt = kff_out
+                ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };

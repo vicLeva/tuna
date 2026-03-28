@@ -15,6 +15,7 @@
 //   h.roll(out_2bit, in_2bit);         // slide window by 1
 //   uint64_t hc2 = h.canonical();
 
+#include <array>
 #include <cstdint>
 
 namespace nt_hash {
@@ -41,8 +42,8 @@ static constexpr uint64_t REV[4] = {
 
 // ── Bit helpers ───────────────────────────────────────────────────────────────
 
-inline uint64_t rol64(uint64_t x, int s) noexcept { return (x << s) | (x >> (64 - s)); }
-inline uint64_t ror64(uint64_t x, int s) noexcept { return (x >> s) | (x << (64 - s)); }
+constexpr uint64_t rol64(uint64_t x, int s) noexcept { return (x << s) | (x >> (64 - s)); }
+constexpr uint64_t ror64(uint64_t x, int s) noexcept { return (x >> s) | (x << (64 - s)); }
 
 
 // ── DNA helpers ───────────────────────────────────────────────────────────────
@@ -66,21 +67,34 @@ inline bool is_dna(char c) noexcept {
 
 // ── Rolling hash ─────────────────────────────────────────────────────────────
 //
-// Maintains the ntHash of a sliding m-mer window.
-//
-// Forward hash formula:
-//   H_fwd(s[0..m-1]) = XOR_{i=0}^{m-1} rol(FWD[s[i]], m-1-i)
-// Rolling update (drop s_out from left, add s_in on right):
-//   H_fwd_new = rol(H_fwd, 1) ^ rol(FWD[s_out], m) ^ FWD[s_in]
-//
-// Reverse-complement hash formula:
-//   H_rev(s[0..m-1]) = XOR_{i=0}^{m-1} rol(REV[s[i]], i)
-//   (this equals the forward ntHash of the RC m-mer comp(s[m-1])…comp(s[0]))
-// Rolling update:
-//   H_rev_new = ror(H_rev, 1) ^ ror(REV[s_out], 1) ^ rol(REV[s_in], m-1)
+// Maintains forward and reverse-complement ntHash of a sliding m-mer window.
+//   H_fwd = XOR_{i} rol(FWD[s[i]], m-1-i); roll: rol(H_fwd,1) ^ rol(FWD[out],m) ^ FWD[in]
+//   H_rev = XOR_{i} rol(REV[s[i]], i);      roll: ror(H_rev,1) ^ ror(REV[out],1) ^ rol(REV[in],m-1)
 
 template <uint16_t m>
 class Roller {
+    // Precomputed roll contributions indexed by (out_2bit << 2) | in_2bit.
+    // CTAB_FWD[idx] = rol(FWD[out], m) ^ FWD[in]
+    // CTAB_REV[idx] = ror(REV[out], 1) ^ rol(REV[in], m-1)
+    // Halves the number of table lookups/rotations in roll(), keeping fwd_/rev_ in GPRs.
+    static constexpr std::array<uint64_t, 16> make_ctab_fwd() noexcept {
+        std::array<uint64_t, 16> t{};
+        for (int out = 0; out < 4; ++out)
+            for (int in  = 0; in  < 4; ++in )
+                t[out * 4 + in] = rol64(FWD[out], m) ^ FWD[in];
+        return t;
+    }
+    static constexpr std::array<uint64_t, 16> make_ctab_rev() noexcept {
+        std::array<uint64_t, 16> t{};
+        for (int out = 0; out < 4; ++out)
+            for (int in  = 0; in  < 4; ++in )
+                t[out * 4 + in] = ror64(REV[out], 1) ^ rol64(REV[in], m - 1);
+        return t;
+    }
+
+    static constexpr auto CTAB_FWD = make_ctab_fwd();
+    static constexpr auto CTAB_REV = make_ctab_rev();
+
     uint64_t fwd_ = 0, rev_ = 0;
 
 public:
@@ -98,8 +112,9 @@ public:
 
     // Slide the window: `out_2bit` leaves from the left, `in_2bit` enters on the right.
     void roll(uint8_t out_2bit, uint8_t in_2bit) noexcept {
-        fwd_ = rol64(fwd_, 1) ^ rol64(FWD[out_2bit], m) ^ FWD[in_2bit];
-        rev_ = ror64(rev_, 1) ^ ror64(REV[out_2bit], 1) ^ rol64(REV[in_2bit], m - 1);
+        const uint8_t idx = static_cast<uint8_t>((out_2bit << 2) | in_2bit);
+        fwd_ = rol64(fwd_, 1) ^ CTAB_FWD[idx];
+        rev_ = ror64(rev_, 1) ^ CTAB_REV[idx];
     }
 
     uint64_t fwd()       const noexcept { return fwd_; }

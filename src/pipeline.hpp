@@ -8,6 +8,7 @@
 //   superkmer_io.hpp    — on-disk partition file format
 
 #include "Config.hpp"
+#include "kff_output.hpp"
 #include "partition_hash.hpp"
 #include "count.hpp"
 
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 #ifdef __linux__
@@ -63,26 +65,35 @@ int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
 
-    // ── Decide pipeline mode: in-memory (no disk round-trip) vs disk ──────
+    // ── Decide pipeline mode: in-memory vs disk ───────────────────────────
     //
-    // In-memory mode: Phase 1 writes packed superkmers to per-partition
-    // std::string buffers; Phase 2 reads from them via MemoryReader.
-    // Saves the disk write (Phase 1) + mmap setup (Phase 2) overhead.
+    // In-memory: Phase 1 writes superkmers to per-partition std::string buffers;
+    // Phase 2 reads via MemoryReader — no disk round-trip.
+    // Selected when estimated packed superkmer size < 60% of available RAM.
     //
-    // Condition: estimated packed superkmer size < 60% of available RAM.
-    // Packed size ≈ 35% of uncompressed sequence size.
-    // .gz files are expanded by GZ_EXPAND=6 for the estimate.
-    uint64_t est_raw = 0;
+    // Estimation: gz → fsz × GZ_EXPAND × 35%; plain → fsz × 2
+    // (superkmers store k-1 overlapping bases per boundary ≈ 2× raw sequence).
+    uint64_t est_packed = 0;
     for (const auto& f : cfg.input_files) {
         std::error_code ec;
         uint64_t fsz = std::filesystem::file_size(f, ec);
         if (ec) continue;
         const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-        est_raw += is_gz ? fsz * GZ_EXPAND : fsz;
+        est_packed += is_gz
+            ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
+            : fsz * 2;
     }
-    const uint64_t est_packed = static_cast<uint64_t>(est_raw * 0.35);
     const uint64_t avail      = available_ram_bytes();
     const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
+
+    // Disk-mode write-buffer budget: up to 30% of RAM across all threads,
+    // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes.
+    // Falls back to 64 MB/thread if RAM is not detectable.
+    const size_t disk_write_budget = [&]() -> size_t {
+        if (avail == 0) return size_t(64) << 20;
+        const uint64_t budget = avail * 3 / 10 / cfg.num_threads;
+        return static_cast<size_t>(std::min(budget, uint64_t(512) << 20));
+    }();
 
     // ── Phase 1: partition ─────────────────────────────────────────────────
 
@@ -96,25 +107,16 @@ int run(const Config& cfg)
     const auto t_part = std::chrono::steady_clock::now();
 
     if (use_mem_pipeline) {
-        // In-memory: write to per-partition string buffers.
-        // Pre-reserve each buffer to the estimated final size (with 20% slack) and
-        // touch all pages upfront — converts 12M+ scattered page faults into a single
-        // sequential zero-fill, eliminating the sys-time spike on large partition counts.
+        // Pre-reserve buffers to estimated size (×1.2 slack).
+        // reserve() is demand-zero — pages are faulted in on first write.
         std::vector<std::string> part_bufs(cfg.num_partitions);
-        // Pre-reserve only when total partition memory > 2 GB.
-        // Below that, buffers fit in L3 and grow cheaply; pre-faulting upfront
-        // would merely increase working-set size and add cache pressure.
-        // Above that threshold, 32K+ growing strings cause O(millions) scattered
-        // page faults (measurable as 100s+ of sys time) that pre-faulting eliminates.
+        // Pre-reserve only when per-partition buffers are large enough to matter.
         if (est_packed > 0) {
             const size_t per_part = static_cast<size_t>(
                 est_packed * 6 / 5 / cfg.num_partitions);   // ×1.2 slack
-            const uint64_t total = static_cast<uint64_t>(per_part) * cfg.num_partitions;
-            if (per_part >= 64 && total > (2ULL << 30)) {
-                for (auto& s : part_bufs) {
-                    s.resize(per_part, '\0');   // allocate + touch all pages
-                    s.clear();                   // size → 0, capacity stays
-                }
+            if (per_part >= 64) {
+                for (size_t p = 0; p < cfg.num_partitions; ++p)
+                    part_bufs[p].reserve(per_part);
             }
         }
         stats = partition_kmers_mem<k, m>(cfg, part_bufs);
@@ -139,13 +141,24 @@ int run(const Config& cfg)
                       << (p2_threads > 1 ? "s" : "") << ", in-memory) ...\n";
 
         const auto t2 = std::chrono::steady_clock::now();
-        std::ofstream out(cfg.output_file);
-        if (!out) {
-            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
-            return 1;
+
+        std::ofstream tsv_out;
+        if (!cfg.output_kff) {
+            tsv_out.open(cfg.output_file);
+            if (!tsv_out) {
+                std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+                return 1;
+            }
         }
-        const auto [total_inserted, total_written] =
-            count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, out);
+
+        const auto [total_inserted, total_written] = cfg.output_kff
+            ? [&]() {
+                KffOutput kff_out(cfg.output_file, cfg.k);
+                auto r = count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
+                kff_out.close();
+                return r;
+              }()
+            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
@@ -167,7 +180,7 @@ int run(const Config& cfg)
         buckets[p].open(partition_path(cfg.work_dir, p),
                         std::ios::binary);
 
-    stats = partition_kmers<k, m>(cfg, buckets);
+    stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
     for (auto& f : buckets) f.close();
 
     const double t_phase1 = elapsed_s(t_part);
@@ -192,13 +205,23 @@ int run(const Config& cfg)
 
     const auto t2 = std::chrono::steady_clock::now();
 
-    std::ofstream out(cfg.output_file);
-    if (!out) {
-        std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
-        return 1;
+    std::ofstream tsv_out;
+    if (!cfg.output_kff) {
+        tsv_out.open(cfg.output_file);
+        if (!tsv_out) {
+            std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+            return 1;
+        }
     }
 
-    const auto [total_inserted, total_written] = count_and_write<k, m>(cfg, stats.kmers, out);
+    const auto [total_inserted, total_written] = cfg.output_kff
+        ? [&]() {
+            KffOutput kff_out(cfg.output_file, cfg.k);
+            auto r = count_and_write<k, m>(cfg, stats.kmers, nullptr, &kff_out);
+            kff_out.close();
+            return r;
+          }()
+        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)
@@ -217,18 +240,76 @@ int run(const Config& cfg)
 }
 
 
+// ─── Callback pipeline ────────────────────────────────────────────────────────
+//
+// run_callback<k, m> mirrors run<k, m> but delivers counted k-mers via a
+// user-supplied callback instead of writing to a file.  The same pipeline-mode
+// selection (in-memory vs disk) applies.
+
+template <uint16_t k, uint16_t m, typename Callback>
+void run_callback(const Config& cfg, Callback&& cb)
+{
+    // ── Decide pipeline mode (same logic as run<k, m>) ────────────────────
+    uint64_t est_packed = 0;
+    for (const auto& f : cfg.input_files) {
+        std::error_code ec;
+        uint64_t fsz = std::filesystem::file_size(f, ec);
+        if (ec) continue;
+        const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
+        est_packed += is_gz
+            ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
+            : fsz * 2;
+    }
+    const uint64_t avail   = available_ram_bytes();
+    const bool     use_mem = avail > 0 && est_packed < avail * 6 / 10;
+
+    PartitionStats stats;
+
+    if (use_mem) {
+        std::vector<std::string> part_bufs(cfg.num_partitions);
+        if (est_packed > 0) {
+            const size_t per_part = static_cast<size_t>(
+                est_packed * 6 / 5 / cfg.num_partitions);
+            if (per_part >= 64)
+                for (size_t p = 0; p < cfg.num_partitions; ++p)
+                    part_bufs[p].reserve(per_part);
+        }
+        stats = partition_kmers_mem<k, m>(cfg, part_bufs);
+        count_and_callback_mem<k, m>(cfg, stats.kmers, part_bufs,
+                                     std::forward<Callback>(cb));
+    } else {
+        const size_t disk_write_budget = [&]() -> size_t {
+            if (avail == 0) return size_t(64) << 20;
+            const uint64_t budget = avail * 3 / 10 / cfg.num_threads;
+            return static_cast<size_t>(std::min(budget, uint64_t(512) << 20));
+        }();
+
+        std::vector<std::ofstream> buckets(cfg.num_partitions);
+        for (size_t p = 0; p < cfg.num_partitions; ++p)
+            buckets[p].open(partition_path(cfg.work_dir, p), std::ios::binary);
+        stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
+        for (auto& f : buckets) f.close();
+
+        count_and_callback<k, m>(cfg, stats.kmers, std::forward<Callback>(cb));
+    }
+}
+
+
 // ─── Runtime dispatch (k × m) ────────────────────────────────────────────────
 // kache-hash Kmer<k> encodes bases as 2 bits in a single uint64_t → k ≤ 32.
 // Only odd k and odd m (even values admit reverse-complement palindromes).
 // Supported k: 11..31 (odd)
 // Supported m:  9..k-2 (odd, strictly less than k)
+//
+// dispatch_generic is a single dispatch table used by both the CLI (dispatch)
+// and the library API (dispatch_callback), avoiding duplication.
+// It invokes f.template operator()<K, L>() for the matching (K, L) pair.
+// Requires C++20 template lambdas at the call site.
 
-#define TUNA_DISPATCH(K, L)  if (k == (K) && m == (L)) return run<K, L>(cfg)
-
-inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
+template <typename F>
+inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
 {
 #if defined(FIXED_K)
-    // Binary compiled for a single k — reject any other value at runtime.
     if (k != FIXED_K) {
         std::cerr << "tuna: error: binary compiled for k=" << FIXED_K
                   << " only; pass -k " << FIXED_K
@@ -238,49 +319,51 @@ inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
 #endif
     // Each k block is guarded by #if so that only the selected k's templates
     // are instantiated — keeping compile time and binary size minimal with FIXED_K.
+#define TDG(K, L)  if (k == (K) && m == (L)) { f.template operator()<K, L>(); return 0; }
 #if !defined(FIXED_K) || FIXED_K == 11
-    TUNA_DISPATCH(11,  9);
+    TDG(11,  9);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 13
-    TUNA_DISPATCH(13,  9); TUNA_DISPATCH(13, 11);
+    TDG(13,  9); TDG(13, 11);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 15
-    TUNA_DISPATCH(15,  9); TUNA_DISPATCH(15, 11); TUNA_DISPATCH(15, 13);
+    TDG(15,  9); TDG(15, 11); TDG(15, 13);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 17
-    TUNA_DISPATCH(17,  9); TUNA_DISPATCH(17, 11); TUNA_DISPATCH(17, 13); TUNA_DISPATCH(17, 15);
+    TDG(17,  9); TDG(17, 11); TDG(17, 13); TDG(17, 15);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 19
-    TUNA_DISPATCH(19,  9); TUNA_DISPATCH(19, 11); TUNA_DISPATCH(19, 13); TUNA_DISPATCH(19, 15);
-    TUNA_DISPATCH(19, 17);
+    TDG(19,  9); TDG(19, 11); TDG(19, 13); TDG(19, 15);
+    TDG(19, 17);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 21
-    TUNA_DISPATCH(21,  9); TUNA_DISPATCH(21, 11); TUNA_DISPATCH(21, 13); TUNA_DISPATCH(21, 15);
-    TUNA_DISPATCH(21, 17); TUNA_DISPATCH(21, 19);
+    TDG(21,  9); TDG(21, 11); TDG(21, 13); TDG(21, 15);
+    TDG(21, 17); TDG(21, 19);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 23
-    TUNA_DISPATCH(23,  9); TUNA_DISPATCH(23, 11); TUNA_DISPATCH(23, 13); TUNA_DISPATCH(23, 15);
-    TUNA_DISPATCH(23, 17); TUNA_DISPATCH(23, 19); TUNA_DISPATCH(23, 21);
+    TDG(23,  9); TDG(23, 11); TDG(23, 13); TDG(23, 15);
+    TDG(23, 17); TDG(23, 19); TDG(23, 21);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 25
-    TUNA_DISPATCH(25,  9); TUNA_DISPATCH(25, 11); TUNA_DISPATCH(25, 13); TUNA_DISPATCH(25, 15);
-    TUNA_DISPATCH(25, 17); TUNA_DISPATCH(25, 19); TUNA_DISPATCH(25, 21); TUNA_DISPATCH(25, 23);
+    TDG(25,  9); TDG(25, 11); TDG(25, 13); TDG(25, 15);
+    TDG(25, 17); TDG(25, 19); TDG(25, 21); TDG(25, 23);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 27
-    TUNA_DISPATCH(27,  9); TUNA_DISPATCH(27, 11); TUNA_DISPATCH(27, 13); TUNA_DISPATCH(27, 15);
-    TUNA_DISPATCH(27, 17); TUNA_DISPATCH(27, 19); TUNA_DISPATCH(27, 21); TUNA_DISPATCH(27, 23);
-    TUNA_DISPATCH(27, 25);
+    TDG(27,  9); TDG(27, 11); TDG(27, 13); TDG(27, 15);
+    TDG(27, 17); TDG(27, 19); TDG(27, 21); TDG(27, 23);
+    TDG(27, 25);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 29
-    TUNA_DISPATCH(29,  9); TUNA_DISPATCH(29, 11); TUNA_DISPATCH(29, 13); TUNA_DISPATCH(29, 15);
-    TUNA_DISPATCH(29, 17); TUNA_DISPATCH(29, 19); TUNA_DISPATCH(29, 21); TUNA_DISPATCH(29, 23);
-    TUNA_DISPATCH(29, 25); TUNA_DISPATCH(29, 27);
+    TDG(29,  9); TDG(29, 11); TDG(29, 13); TDG(29, 15);
+    TDG(29, 17); TDG(29, 19); TDG(29, 21); TDG(29, 23);
+    TDG(29, 25); TDG(29, 27);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 31
-    TUNA_DISPATCH(31,  9); TUNA_DISPATCH(31, 11); TUNA_DISPATCH(31, 13); TUNA_DISPATCH(31, 15);
-    TUNA_DISPATCH(31, 17); TUNA_DISPATCH(31, 19); TUNA_DISPATCH(31, 21); TUNA_DISPATCH(31, 23);
-    TUNA_DISPATCH(31, 25); TUNA_DISPATCH(31, 27); TUNA_DISPATCH(31, 29);
+    TDG(31,  9); TDG(31, 11); TDG(31, 13); TDG(31, 15);
+    TDG(31, 17); TDG(31, 19); TDG(31, 21); TDG(31, 23);
+    TDG(31, 25); TDG(31, 27); TDG(31, 29);
 #endif
+#undef TDG
 
     std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
               << "  k must be odd in [11,31]  (kache-hash Kmer fits in 64 bits, k ≤ 32)\n"
@@ -288,4 +371,20 @@ inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
     return 1;
 }
 
-#undef TUNA_DISPATCH
+
+// CLI dispatcher: run the full pipeline and return its exit code.
+inline int dispatch(uint16_t k, uint16_t m, const Config& cfg)
+{
+    int rc = 1;
+    dispatch_generic(k, m, [&]<uint16_t K, uint16_t L>() { rc = run<K, L>(cfg); });
+    return rc;
+}
+
+// API dispatcher: run the callback pipeline for the given (k, m) pair.
+template <typename Callback>
+void dispatch_callback(uint16_t k, uint16_t m, const Config& cfg, Callback&& cb)
+{
+    dispatch_generic(k, m, [&]<uint16_t K, uint16_t L>() {
+        run_callback<K, L>(cfg, std::forward<Callback>(cb));
+    });
+}
