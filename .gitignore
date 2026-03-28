@@ -24,7 +24,7 @@ benchmark/results/
 .DS_Store
 
 # Binaries
-tuna
+/tuna
 *.o
 *.a
 
