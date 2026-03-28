@@ -37,7 +37,8 @@ configure_file(
     @ONLY
 )
 add_library(kff_io STATIC ${kff_src_SOURCE_DIR}/kff_io.cpp)
-target_include_directories(kff_io PUBLIC
+target_compile_options(kff_io PRIVATE -w)
+target_include_directories(kff_io SYSTEM PUBLIC
     ${kff_src_SOURCE_DIR}
     ${CMAKE_BINARY_DIR}
 )
