@@ -17,6 +17,7 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 - [Output format](#output-format)
   - [TSV (default)](#tsv-default)
   - [KFF binary](#kff-binary--kff-or-kff-extension)
+- [C++ library API](#c-library-api)
 - [Benchmarks](#benchmarks)
 
 ---
@@ -176,6 +177,32 @@ KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff
 ---
 
 Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographically smaller of forward/reverse-complement) form of each k-mer is reported.
+
+---
+
+## C++ library API
+
+tuna can be embedded directly in a C++ project
+
+```cpp
+#include <tuna/tuna.hpp>
+
+// Collect all k-mers into a map (simple)
+auto kmers = tuna::count_to<31>({"genome.fa"});   // std::unordered_map<std::string, uint32_t>
+
+// Stream k-mers through a callback (memory-efficient)
+tuna::count<31>({"genome.fa"}, [](std::string_view kmer, uint32_t count) {
+    // called for every canonical k-mer; may run from multiple threads
+});
+```
+
+CMake integration:
+```cmake
+add_subdirectory(tuna)                                    # or use FetchContent
+target_link_libraries(my_target PRIVATE tuna::tuna)
+```
+
+For a full walkthrough — CMake setup, FetchContent, container customisation, thread safety — see the **[wiki: Using tuna as a library](https://github.com/vicLeva/tuna/wiki/Using-tuna-as-a-library)**.
 
 ---
 

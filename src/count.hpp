@@ -259,6 +259,136 @@ uint64_t write_counts_kff(
 }
 
 
+// ─── Callback output brick ────────────────────────────────────────────────────
+//
+// Drains the table, applies ci/cx filters, and calls cb(kmer, count) for each
+// passing k-mer.  cb is called from the calling thread only (one table per call),
+// so no internal mutex is used.  If multiple worker threads drain different tables
+// concurrently, cb may be invoked from several threads simultaneously — the caller
+// is responsible for any needed synchronisation.
+
+template <uint16_t k, uint16_t m, bool mt_ = false, typename Callback>
+uint64_t write_counts_callback(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg,
+    Callback& cb)
+{
+    std::string label;
+    uint64_t written = 0;
+
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt < cfg.ci || cnt > cfg.cx) return;
+        entry.first.get_label(label);
+        cb(std::string_view(label), static_cast<uint32_t>(cnt));
+        ++written;
+    });
+
+    return written;
+}
+
+
+// ─── Callback counting harnesses ──────────────────────────────────────────────
+//
+// Same structure as count_and_write / count_and_write_mem but drain tables via
+// a user-supplied callback instead of writing to a file.
+//
+// Thread safety: cb may be called concurrently from multiple worker threads
+// (one per partition).  Each partition's k-mers are disjoint, so there is no
+// risk of duplicate calls for the same k-mer.  The caller must ensure cb is
+// safe to call from multiple threads if num_threads > 1.
+
+template <uint16_t k, uint16_t m, typename Callback>
+std::pair<uint64_t, uint64_t> count_and_callback_mem(
+    const Config&             cfg,
+    uint64_t                  total_kmers,
+    std::vector<std::string>& part_bufs,
+    Callback&&                cb)
+{
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+
+    const size_t n_parts   = cfg.num_partitions;
+    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+
+    std::atomic<uint64_t> total_inserted{0}, total_written{0};
+
+    auto worker = [&](size_t tid) {
+        typename table_t::Token token;
+
+        for (size_t p = tid; p < n_parts; p += n_threads) {
+            const size_t n_files  = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            table_t table(init_sz, 1);
+
+            uint64_t ins;
+            {
+                MemoryReader reader(part_bufs[p]);
+                ins = count_partition<k, m, MemoryReader>(reader, table, token);
+            }
+            { std::string tmp; part_bufs[p].swap(tmp); }
+            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    return { total_inserted.load(), total_written.load() };
+}
+
+
+template <uint16_t k, uint16_t m, typename Callback>
+std::pair<uint64_t, uint64_t> count_and_callback(
+    const Config& cfg,
+    uint64_t      total_kmers,
+    Callback&&    cb)
+{
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+
+    const size_t n_parts   = cfg.num_partitions;
+    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+
+    std::atomic<uint64_t> total_inserted{0}, total_written{0};
+
+    auto worker = [&](size_t tid) {
+        typename table_t::Token token;
+
+        for (size_t p = tid; p < n_parts; p += n_threads) {
+            SuperkmerReader reader(partition_path(cfg.work_dir, p));
+            const size_t n_files  = cfg.input_files.size();
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                : size_t(1u << 27) / n_parts;
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            table_t table(init_sz, 1);
+
+            const uint64_t ins = count_partition<k, m>(reader, table, token);
+            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+
+    return { total_inserted.load(), total_written.load() };
+}
+
+
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
 // Workers steal partitions round-robin (p = tid, tid+n_threads, …).

@@ -1,16 +1,13 @@
 cmake_minimum_required(VERSION 3.17)
 project(tuna VERSION 1.0.0 LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 # Default to Release if no build type is specified.
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+# Only set when tuna is the top-level project — do not override the parent's choice.
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    endif()
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
@@ -92,42 +89,72 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         OUTPUT_VARIABLE L1_CACHE_LINE_SIZE
     )
 endif()
-add_compile_definitions(L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE})
-
-# ── Optional: single-k build (-DFIXED_K=31) ───────────────────────────────────
-add_compile_definitions(TUNA_VERSION="${PROJECT_VERSION}")
-
-if(FIXED_K)
-    add_compile_definitions(FIXED_K=${FIXED_K})
-endif()
-
 # ── Compile flags ──────────────────────────────────────────────────────────────
+#
+# TUNA_SIMD_FLAGS   — instruction-set flags required to compile tuna's SIMD
+#                     headers (helicase, kache-hash).  Propagated to users via
+#                     INTERFACE because the headers themselves use the intrinsics.
+#
+# TUNA_PRIVATE_FLAGS — warnings, optimisations, constexpr limits.  Applied only
+#                      to tuna's own compiled targets; never leaked to the parent.
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
+    set(TUNA_SIMD_FLAGS -msse3 -msse4.1 -mavx -mavx2)
+else()
+    set(TUNA_SIMD_FLAGS "")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(CONSTEXPR_FLAG -fconstexpr-ops-limit=99000100)
 else()
     set(CONSTEXPR_FLAG -fconstexpr-steps=99000100)
 endif()
-set(TUNA_COMPILE_FLAGS -Wall -Wextra -Wno-unused-function ${CONSTEXPR_FLAG})
+set(TUNA_PRIVATE_FLAGS -Wall -Wextra -Wno-unused-function ${CONSTEXPR_FLAG})
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    list(APPEND TUNA_COMPILE_FLAGS -funroll-loops -march=native -fomit-frame-pointer)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
-        list(APPEND TUNA_COMPILE_FLAGS -mavx -msse4.1 -msse3)
-    endif()
+    list(APPEND TUNA_PRIVATE_FLAGS -funroll-loops -march=native -fomit-frame-pointer)
 endif()
 
 # ── Targets ────────────────────────────────────────────────────────────────────
 
-add_library(xxhash STATIC external/xxHash/xxhash.c)
-target_include_directories(xxhash PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_library(xxhash STATIC ${CMAKE_CURRENT_SOURCE_DIR}/external/xxHash/xxhash.c)
+target_include_directories(xxhash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(xxhash PRIVATE -O3)
+set_target_properties(xxhash PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 
-add_executable(tuna src/main.cpp src/CLI.cpp)
-target_include_directories(tuna PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/include/helicase_cpp
+# ── tuna::tuna — embeddable library target ─────────────────────────────────────
+# Header-only INTERFACE target: all tuna logic lives in templates.
+# Link against this to embed tuna's k-mer counting in your own project.
+#
+# Usage (CMake):
+#   add_subdirectory(tuna)
+#   target_link_libraries(my_target PRIVATE tuna::tuna)
+#
+# Usage (C++):
+#   #include <tuna/tuna.hpp>
+#   auto kmers = tuna::count_to<31>({"genome.fa"});
+add_library(tuna_lib INTERFACE)
+add_library(tuna::tuna ALIAS tuna_lib)
+target_include_directories(tuna_lib INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/helicase_cpp
 )
-target_compile_options(tuna PRIVATE ${TUNA_COMPILE_FLAGS})
-target_link_libraries(tuna PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+# C++ standard and definitions are propagated so users get the right dialect
+# and tuna's required macros, but compile flags (warnings, optimisations) are
+# not — those are tuna's internal concern.
+target_compile_features(tuna_lib INTERFACE cxx_std_20)
+target_compile_options(tuna_lib INTERFACE ${TUNA_SIMD_FLAGS})
+target_compile_definitions(tuna_lib INTERFACE
+    L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
+    TUNA_VERSION="${PROJECT_VERSION}"
+    $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
+)
+target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+
+# ── tuna — CLI executable (only when tuna is the top-level project) ────────────
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    add_executable(tuna ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/CLI.cpp)
+    target_compile_options(tuna PRIVATE ${TUNA_PRIVATE_FLAGS})
+    target_link_libraries(tuna PRIVATE tuna_lib)
+endif()
