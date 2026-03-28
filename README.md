@@ -202,7 +202,7 @@ add_subdirectory(tuna)                                    # or use FetchContent
 target_link_libraries(my_target PRIVATE tuna::tuna)
 ```
 
-For a full walkthrough — CMake setup, FetchContent, container customisation, thread safety — see the **[wiki: Using tuna as a library](https://github.com/vicLeva/tuna/wiki/Using-tuna-as-a-library)**.
+For a full walkthrough: CMake setup, FetchContent, container customisation, thread safety, see the **[wiki: Using tuna as a library](https://github.com/vicLeva/tuna/wiki/Using%E2%80%90tuna%E2%80%90as%E2%80%90a%E2%80%90library)**.
 
 ---
 
