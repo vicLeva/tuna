@@ -21,7 +21,7 @@ void print_usage(const char* prog)
         "              compiled with -DFIXED_K=k: only that value is accepted\n"
         "              compiled with -DFIXED_K + -DFIXED_M: any k in [2,256]\n"
         "  -m  <int>   minimizer length            [default: 21]\n"
-        "              any value in [1,k-1]; must match -DFIXED_M if set\n"
+        "              any value in [1, min(k-1, 32)]; must match -DFIXED_M if set\n"
         "              m=21 is a good default; use m=23-25 for highly repetitive\n"
         "              or low-complexity data (e.g. individual human genomes)\n"
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
@@ -158,9 +158,9 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         return false;
     }
 
-    if (cfg.l < 1) {
+    if (cfg.l < 1 || cfg.l > 32) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l
-                  << ") must be >= 1\n";
+                  << ") must be in [1, 32]\n";
         return false;
     }
 

@@ -75,7 +75,7 @@ k=31
 while (( k <= K_MAX )); do
     K_VALUES+=("$k")
     m1=21
-    m2=$(( k - 10 ))
+    m2=$(( k - 10 < 32 ? k - 10 : 32 ))
     if (( m1 == m2 )); then
         K_M_LIST[$k]="$m1"
         KM_PAIRS+=("$k:$m1")
