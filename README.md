@@ -91,6 +91,16 @@ This produces a single-instantiation binary locked to that (k, m) pair. Those va
 cmake .. -DFIXED_K=31 -DFIXED_M=21
 ```
 
+If you want to experiment with multiple (k, m) combinations, use a separate build directory for each:
+
+```bash
+cmake -S . -B build_k31_m21  -DFIXED_K=31  -DFIXED_M=21  && cmake --build build_k31_m21  --target tuna -j$(nproc)
+cmake -S . -B build_k63_m21  -DFIXED_K=63  -DFIXED_M=21  && cmake --build build_k63_m21  --target tuna -j$(nproc)
+cmake -S . -B build_k127_m25 -DFIXED_K=127 -DFIXED_M=25  && cmake --build build_k127_m25 --target tuna -j$(nproc)
+```
+
+Each directory contains its own `tuna` binary: `build_k31_m21/tuna`, `build_k63_m21/tuna`, etc.
+
 <details>
 <summary><strong>Other compile-time options</strong></summary>
 
