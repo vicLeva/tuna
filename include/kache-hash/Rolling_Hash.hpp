@@ -47,8 +47,8 @@ private:
     // Returns the rotation of `x` to the right by `r` bits.
     static constexpr uint64_t rotr(const uint64_t x, const uint32_t r) { return (x >> r) | (x << (64 - r)); }
 
-    static constexpr uint64_t rotl_k[]   = {rotl(s_a, k), rotl(s_c, k), rotl(s_g, k), rotl(s_t, k)};    // Left-rotation result by `k`.
-    static constexpr uint64_t rotl_km1[] = {rotl(s_a, k - 1), rotl(s_c, k - 1), rotl(s_g, k - 1), rotl(s_t, k - 1)};    // Left-rotation result by `k - 1`.
+    static constexpr uint64_t rotl_k[]   = {rotl(s_a, k % 64), rotl(s_c, k % 64), rotl(s_g, k % 64), rotl(s_t, k % 64)};    // Left-rotation result by `k % 64` (rotation is cyclic mod 64).
+    static constexpr uint64_t rotl_km1[] = {rotl(s_a, (k - 1) % 64), rotl(s_c, (k - 1) % 64), rotl(s_g, (k - 1) % 64), rotl(s_t, (k - 1) % 64)};    // Left-rotation result by `(k-1) % 64`.
     static constexpr uint64_t rotr_1[]   = {rotr(s_a, 1), rotr(s_c, 1), rotr(s_g, 1), rotr(s_t, 1)};    // Right-rotation result.
 
     uint64_t h_f;   // Hash of the current k-mer in the forward-strand.

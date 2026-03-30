@@ -150,15 +150,15 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.output_kff = true;
     }
 
-    if (cfg.k % 2 == 0 || cfg.k < 11 || cfg.k > 31) {
+    if (cfg.k < 2 || cfg.k > 256) {
         std::cerr << "tuna: error: k-mer length (-k " << cfg.k
-                  << ") must be an odd value in [11, 31]\n";
+                  << ") must be in [2, 256]\n";
         return false;
     }
 
-    if (cfg.l % 2 == 0 || cfg.l < 9) {
+    if (cfg.l < 1) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l
-                  << ") must be an odd value >= 9\n";
+                  << ") must be >= 1\n";
         return false;
     }
 

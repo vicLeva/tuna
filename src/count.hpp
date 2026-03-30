@@ -41,7 +41,7 @@ struct PartitionDebugInfo {
     std::vector<kache_hash::ResizeEvent> resize_log;
 
     // coverage → count_of_minimizers_with_that_coverage
-    // Only populated for superkmers with min_pos != 0xFF.
+    // Only populated for superkmers with min_pos != 0xFFFF.
     std::unordered_map<uint32_t, uint64_t> coverage_hist;
 };
 
@@ -54,35 +54,36 @@ struct PartitionDebugInfo {
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader>
+template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader<k, m>>
 uint64_t count_partition(
     Reader&                                                               reader,
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
     typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
+    using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
+    static constexpr hdr_t NO_MIN = sk_no_min<k, m>;  // sentinel: no precomputed minimizer hash
 
     auto inc = [](uint32_t v) { return v + 1; };
     uint64_t inserted = 0;
 
     // Per-minimizer k-mer count (only allocated when debug is requested).
-    // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
 
     // 1-ahead prefetch: issue prefetch_packed for superkmer N+1 before processing N
     // to hide the ~40 ns LLC miss behind N's processing time.
-    // min_pos==0xFF (no precomputed minimizer): falls back to prefetch-after-init.
+    // min_pos == NO_MIN (sentinel): falls back to prefetch-after-init.
 
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
 
-    const uint8_t* cur_packed  = reader.packed_data();
+    const uint8_t* cur_packed  = reader.packed_data();  // packed bases of current superkmer
     size_t         cur_len     = reader.size();
-    uint8_t        cur_min_pos = reader.min_pos();
+    hdr_t          cur_min_pos = reader.min_pos();       // minimizer position in current superkmer
 
     kache_hash::Kmer_Window<k, m> win;
     if (cur_len >= k) {
-        if (cur_min_pos != 0xFF) {
+        if (cur_min_pos != NO_MIN) {
             const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
             if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
         } else {
@@ -93,12 +94,12 @@ uint64_t count_partition(
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     while (reader.next()) {
-        const uint8_t* nxt_packed  = reader.packed_data();
+        const uint8_t* nxt_packed  = reader.packed_data();  // packed bases of next superkmer (prefetch target)
         const size_t   nxt_len     = reader.size();
-        const uint8_t  nxt_min_pos = reader.min_pos();
+        const hdr_t    nxt_min_pos = reader.min_pos();
 
         // Issue prefetch for NEXT bucket BEFORE processing CURRENT superkmer.
-        if (nxt_len >= k && nxt_min_pos != 0xFF)
+        if (nxt_len >= k && nxt_min_pos != NO_MIN)
             table.prefetch_packed(nxt_packed, nxt_min_pos);
 
         // Process CURRENT superkmer.
@@ -124,12 +125,12 @@ uint64_t count_partition(
         cur_len     = nxt_len;
         cur_min_pos = nxt_min_pos;
         if (cur_len >= k) {
-            if (cur_min_pos != 0xFF) {
+            if (cur_min_pos != NO_MIN) {
                 const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
                 if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
             } else {
                 win.init_packed(cur_packed);
-                table.prefetch(win);  // 0xFF fallback: prefetch after init
+                table.prefetch(win);  // NO_MIN fallback: prefetch after init
             }
         }
     }
@@ -208,8 +209,8 @@ uint64_t write_counts_kff(
     const Config& cfg,
     KffOutput&    kff_out)
 {
-    constexpr size_t KMER_BYTES  = (k + 3) / 4;
-    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);
+    constexpr size_t KMER_BYTES  = (k + 3) / 4;                            // bytes per k-mer (2-bit packed)
+    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);  // k-mers per KFF write batch
 
     // Lookup table: ASCII → 2-bit value (A=0, C=1, G=2, T=3).
     static constexpr std::array<uint8_t, 256> B2B = []() constexpr {
@@ -305,7 +306,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
     std::vector<std::string>& part_bufs,
     Callback&&                cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;  // hash table type (local alias)
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -317,21 +318,21 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             const size_t n_files  = cfg.input_files.size();
-            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+            const size_t per_part = (total_kmers > 0 && n_files <= 10)  // estimated unique k-mers per partition
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));  // initial table size (slots)
             table_t table(init_sz, 1);
 
-            uint64_t ins;
+            uint64_t ins;  // k-mers inserted into this partition
             {
-                MemoryReader reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader>(reader, table, token);
+                MemoryReader<k, m> reader(part_bufs[p]);
+                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
             }
             { std::string tmp; part_bufs[p].swap(tmp); }
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
-            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);  // k-mers written to output
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };
@@ -363,7 +364,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
         typename table_t::Token token;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            SuperkmerReader reader(partition_path(cfg.work_dir, p));
+            SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
             const size_t n_files  = cfg.input_files.size();
             const size_t per_part = (total_kmers > 0 && n_files <= 10)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
@@ -413,7 +414,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
     // Overflow statistics accumulated across all partitions.
     std::mutex                                     ov_stats_mutex;
     std::vector<std::pair<uint32_t, uint64_t>>     ov_top_global;   // merged top minimizers
-    std::atomic<uint64_t>                          ov_total{0};
+    std::atomic<uint64_t>                          ov_total{0};     // total k-mers sent to overflow table
 
     // Debug statistics (only used when cfg.debug_stats).
     std::mutex                                     dbg_mutex;
@@ -426,7 +427,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            SuperkmerReader reader(partition_path(cfg.work_dir, p));
+            SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
             // Dynamic init_sz: 2× estimated unique k-mers per partition.
             // Only use total_kmers when n_files ≤ 10: for multi-file runs total_kmers
             // counts duplicates across files (total >> unique), over-sizing the table.
@@ -699,8 +700,8 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             uint64_t ins;
             {
-                MemoryReader reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader>(reader, table, token);
+                MemoryReader<k, m> reader(part_bufs[p]);
+                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }

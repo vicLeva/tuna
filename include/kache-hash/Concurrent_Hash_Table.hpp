@@ -33,7 +33,9 @@ struct Hash
 template <typename T_key_, typename T_val_, typename T_hasher_>
 class Concurrent_Hash_Table
 {
-    static_assert(sizeof(T_key_) <= 8, "Key for concurrent hash table must have size at most 8 bytes for atomic-read guarantees to hold.");
+    // Note: keys larger than 8 bytes (e.g. Kmer<k> for k > 32) are supported.
+    // The atomicity guarantee is provided by the per-slot Spin_Lock; there is no
+    // lock-free CAS on the key itself, so key size is not constrained.
 
     class Iterator;
     friend class Iterator;

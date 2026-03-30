@@ -150,6 +150,7 @@ target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
+    $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
 )
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
 

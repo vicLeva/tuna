@@ -369,12 +369,12 @@ public:
     // O(l) work — cheaper than prefetch(Kmer_Window) which needs a fully
     // initialised window.  Call this one superkmer ahead to hide the LLC miss
     // behind the current superkmer's hot loop.
-    void prefetch_packed(const uint8_t* packed, const uint8_t min_pos) const
+    void prefetch_packed(const uint8_t* packed, const uint16_t min_pos) const
     {
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf_l[l];
         for (uint16_t i = 0; i < l; ++i) {
-            const uint16_t pos = static_cast<uint16_t>(min_pos) + i;
+            const uint16_t pos = min_pos + i;
             buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
         }
         nt_hash::Roller<l> roller;
@@ -502,7 +502,7 @@ public:
     // Returns the canonical ntHash of the minimizer l-mer.
     // Replaces the two-call pattern: lmer_nt_hash(packed, min_pos) then
     // init_packed_with_hash(packed, mh) — eliminates one full decode pass.
-    uint64_t init_packed_with_min(const uint8_t* packed, uint8_t min_pos)
+    uint64_t init_packed_with_min(const uint8_t* packed, uint16_t min_pos)
     {
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf[k];

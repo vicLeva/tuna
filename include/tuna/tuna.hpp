@@ -22,9 +22,10 @@
 //
 // ── Template parameters ───────────────────────────────────────────────────────
 //
-//   k — k-mer length, odd value in [11, 31]  (fixed at compile time)
-//   m — minimizer length, odd value in [9, k-2]; default 21
-//       Use m=23–25 for highly repetitive / low-complexity data.
+//   k — k-mer length in [2, 256]  (fixed at compile time via FIXED_K)
+//       Kmer<k> uses ceil(k/32) uint64 words (1 for k≤32, 2 for k≤64, …).
+//   m — minimizer length in [1, k-1]; default 21
+//       Odd values recommended; use m=21–25 for standard genomics work.
 
 #include <cstdint>
 #include <limits>
@@ -70,10 +71,8 @@ struct Options {
 template <uint16_t k, uint16_t m = 21, typename Callback>
 void count(const std::vector<std::string>& files, Callback&& cb, Options opts = {})
 {
-    static_assert(k % 2 == 1 && k >= 11 && k <= 31,
-                  "tuna: k must be an odd value in [11, 31]");
-    static_assert(m % 2 == 1 && m >= 9 && m < k,
-                  "tuna: m must be an odd value in [9, k-2]");
+    static_assert(k >= 2 && k <= 256, "tuna: k must be in [2, 256]");
+    static_assert(m >= 1 && m < k,   "tuna: m must be in [1, k-1]");
 
     if (files.empty())
         throw std::invalid_argument("tuna::count: no input files");
