@@ -91,7 +91,7 @@ This produces a single-instantiation binary locked to that (k, m) pair. Those va
 cmake .. -DFIXED_K=31 -DFIXED_M=21
 ```
 
-If you want to experiment with multiple (k, m) combinations, use a separate build directory for each:
+If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
 
 ```bash
 cmake -S . -B build_k31_m21  -DFIXED_K=31  -DFIXED_M=21  && cmake --build build_k31_m21  --target tuna -j$(nproc)
@@ -127,8 +127,8 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
-| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 31]` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match compile-time value if set) |
-| `-m` | `<int>` | `21` | Minimizer length. Any value in `[1, k-1]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes). Must match `-DFIXED_M` if set |
+| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 31]` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match compile-time value if set, default is compile-time value if set) |
+| `-m` | `<int>` | `21` | Minimizer length. Any value in `[1, k-1]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes). Must match `-DFIXED_M` if set, default is compile-time value if set |
 | `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files; Phase 2 over partitions |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
