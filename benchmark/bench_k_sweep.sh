@@ -16,20 +16,13 @@
 #   REBUILD=1       force recompile all binaries [default: off]
 #
 # Path overrides (env vars):
-#   TUNA_SRC=<dir>      tuna source directory
-#                       [default: directory above this script]
-#   KMC_BIN=<path>      kmc binary
-#                       [default: script/../../kmc/bin/kmc]
-#   KMC_DUMP_BIN=<path> kmc_dump binary
-#                       [default: script/../../kmc/bin/kmc_dump]
-#   BUILD_CACHE=<dir>   pre-built binary cache directory
-#                       [default: TUNA_SRC/build_k_sweep]
-#   WORK=<dir>          scratch and results directory
-#                       [default: ~/tuna_bench_tmp]
-#   HUMAN_FOF=<path>    human genome fof (first file is used)
-#                       [default: /WORKS/vlevallois/data/dataset_genome_human/fof.list]
-#   ECOLI_FOF=<path>    E.coli genome fof (first file is used)
-#                       [default: /WORKS/vlevallois/data/dataset_genome_ecoli/fof.list]
+#   TUNA_SRC=<dir>    tuna source directory     [default: directory above this script]
+#   KMC=<path>        kmc binary                [default: kmc  (resolved via PATH)]
+#   KMC_DUMP=<path>   kmc_dump binary           [default: kmc_dump (resolved via PATH)]
+#   BUILD_CACHE=<dir> pre-built binary cache    [default: TUNA_SRC/build_k_sweep]
+#   WORK=<dir>        scratch and results dir   [default: ~/tuna_bench_tmp]
+#   HUMAN_FOF=<path>  human genome fof          [default: /WORKS/vlevallois/data/dataset_genome_human/fof.list]
+#   ECOLI_FOF=<path>  E.coli genome fof         [default: /WORKS/vlevallois/data/dataset_genome_ecoli/fof.list]
 
 set -euo pipefail
 
@@ -53,8 +46,8 @@ K_MAX="${K_MAX:-71}"
 REBUILD="${REBUILD:-0}"
 
 TUNA_SRC="${TUNA_SRC:-$SCRIPT_DIR/..}"
-KMC="${KMC_BIN:-$SCRIPT_DIR/../../kmc/bin/kmc}"
-KMC_DUMP="${KMC_DUMP_BIN:-$SCRIPT_DIR/../../kmc/bin/kmc_dump}"
+KMC="${KMC:-kmc}"
+KMC_DUMP="${KMC_DUMP:-kmc_dump}"
 BUILD_CACHE="${BUILD_CACHE:-$TUNA_SRC/build_k_sweep}"
 WORK="${WORK:-$HOME/tuna_bench_tmp}"
 HUMAN_FOF="${HUMAN_FOF:-/WORKS/vlevallois/data/dataset_genome_human/fof.list}"
@@ -66,8 +59,8 @@ mkdir -p "$RESULTS" "$BUILD_CACHE"
 # ── Validate external tools ───────────────────────────────────────────────────
 KMC=$(command -v "$KMC"      2>/dev/null || echo "$KMC")
 KMC_DUMP=$(command -v "$KMC_DUMP" 2>/dev/null || echo "$KMC_DUMP")
-[[ -x "$KMC"      ]] || { echo "ERROR: kmc not found at $KMC"           >&2; exit 1; }
-[[ -x "$KMC_DUMP" ]] || { echo "ERROR: kmc_dump not found at $KMC_DUMP" >&2; exit 1; }
+[[ -x "$KMC"      ]] || { echo "ERROR: kmc not found: $KMC"      >&2; exit 1; }
+[[ -x "$KMC_DUMP" ]] || { echo "ERROR: kmc_dump not found: $KMC_DUMP" >&2; exit 1; }
 /usr/bin/time -v true 2>/dev/null \
     || { echo "ERROR: /usr/bin/time -v not available (need GNU time)" >&2; exit 1; }
 
