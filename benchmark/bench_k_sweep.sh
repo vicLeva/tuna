@@ -74,15 +74,13 @@ declare -A K_M_LIST  # k -> space-separated list of m values
 k=31
 while (( k <= K_MAX )); do
     K_VALUES+=("$k")
-    m1=21
-    m2=$(( k - 10 < 32 ? k - 10 : 32 ))
-    if (( m1 == m2 )); then
-        K_M_LIST[$k]="$m1"
-        KM_PAIRS+=("$k:$m1")
-    else
-        K_M_LIST[$k]="$m1 $m2"
-        KM_PAIRS+=("$k:$m1" "$k:$m2")
-    fi
+    ms=""
+    for candidate in 17 21 25; do
+        (( candidate < k )) && ms="$ms $candidate"
+    done
+    ms="${ms# }"  # trim leading space
+    K_M_LIST[$k]="$ms"
+    for m in $ms; do KM_PAIRS+=("$k:$m"); done
     (( k += 5 ))
 done
 
