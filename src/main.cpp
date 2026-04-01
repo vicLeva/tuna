@@ -43,7 +43,8 @@ int main(int argc, char* argv[])
     static_assert(sizeof(SuperkmerWriter<31, 21>) >= 8 && sizeof(SuperkmerWriter<31, 21>) <= 64,
                   "SuperkmerWriter size out of expected range");
     if (cfg.num_partitions == 0)
-        cfg.num_partitions = auto_tune_partitions(cfg.input_files, sizeof(SuperkmerWriter<31, 21>));
+        cfg.num_partitions = auto_tune_partitions(
+            cfg.input_files, sizeof(SuperkmerWriter<31, 21>), cfg.k, cfg.num_threads);
 
     // Round up to next power of 2 so partition_fn can use bitmask instead of division.
     cfg.num_partitions = round_pow2(cfg.num_partitions);
