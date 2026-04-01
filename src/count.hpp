@@ -321,7 +321,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
             const size_t per_part = (total_kmers > 0 && n_files <= 10)  // estimated unique k-mers per partition
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));  // initial table size (slots)
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));  // initial table size (slots)
             table_t table(init_sz, 1);
 
             uint64_t ins;  // k-mers inserted into this partition
@@ -369,7 +369,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
             const size_t per_part = (total_kmers > 0 && n_files <= 10)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 18), size_t(1u << 22));
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
             table_t table(init_sz, 1);
 
             const uint64_t ins = count_partition<k, m>(reader, table, token);
@@ -437,7 +437,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
-                size_t(1u << 18),   // min 256K
+                size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
                 size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
 
@@ -694,8 +694,8 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
-                size_t(1u << 18),
-                size_t(1u << 22));
+                size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
+                size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
 
             uint64_t ins;
