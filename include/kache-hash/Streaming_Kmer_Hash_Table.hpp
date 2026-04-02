@@ -32,7 +32,7 @@
 #include <algorithm>
 #include <cassert>
 
-#include <immintrin.h>
+#include "simd_compat.hpp"
 
 
 namespace kache_hash
@@ -206,7 +206,7 @@ private:
     static constexpr bool key_equals(const flat_t& e, const Kmer<k>& key) { return Streaming_Kmer_Hash_Table::key(e) == key; }
 
     // Returns the 32-bit equality mask of the vectors `x` and `y`.
-    static uint32_t eq_mask(__m256i x, __m256i y);
+    static uint32_t eq_mask(simd256_t x, simd256_t y);
 
     // Returns the size of the `b`'th bucket.
     std::size_t bucket_size(std::size_t b) const;
@@ -716,13 +716,13 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::clear()
 
 
 template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::eq_mask(const __m256i x, const __m256i y)
+inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::eq_mask(const simd256_t x, const simd256_t y)
 {
 #ifdef AVX_512
-    return _mm256_cmpeq_epi8_mask(x, y);
+    return _mm256_cmpeq_epi8_mask(x, y);  // x86-only path, simd256_t == __m256i here
 #else
-    const auto cmp = _mm256_cmpeq_epi8(x, y);
-    return static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
+    const auto cmp = simd256_cmpeq(x, y);
+    return simd256_movemask(cmp);
 #endif
 }
 
@@ -730,8 +730,8 @@ inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::eq_mask(const __m256i 
 template <uint16_t k, bool mt_, typename T_, uint16_t l>
 inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::bucket_size(const std::size_t b) const
 {
-    const auto zero  = _mm256_setzero_si256();
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[b].cs));
+    const auto zero  = simd256_zero();
+    const auto c_vec = simd256_load(M[b].cs);
     const auto cmp   = eq_mask(c_vec, zero);
 
     assert(std::countr_zero(cmp) + std::countl_one(cmp) == B);
@@ -833,8 +833,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer<k> key, co
 {
     assert(i < cap_);
 
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[i].cs));
-    const auto query = _mm256_set1_epi8(static_cast<char>(c));
+    const auto c_vec = simd256_load(M[i].cs);
+    const auto query = simd256_set1(static_cast<char>(c));
     const auto cmp = eq_mask(c_vec, query);
 
     const auto j = cmp ? __builtin_ctz(cmp) : 0;
@@ -880,8 +880,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find_and_update(const Kmer
 {
     assert(i < cap_);
 
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[i].cs));
-    const auto query = _mm256_set1_epi8(static_cast<char>(c));
+    const auto c_vec = simd256_load(M[i].cs);
+    const auto query = simd256_set1(static_cast<char>(c));
     auto cmp = eq_mask(c_vec, query);
 
     while(cmp)
@@ -914,8 +914,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at(const flat_t
         return false;
     }
 
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[i].cs));
-    const auto zero = _mm256_setzero_si256();
+    const auto c_vec = simd256_load(M[i].cs);
+    const auto zero = simd256_zero();
     const auto cmp = eq_mask(c_vec, zero);
 
     const auto j = std::countr_zero(cmp);
@@ -937,8 +937,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at_resize(const
 {
     lock<true>(i);
 
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M_new[i].cs));
-    const auto zero = _mm256_setzero_si256();
+    const auto c_vec = simd256_load(M_new[i].cs);
+    const auto zero = simd256_zero();
     const auto cmp = eq_mask(c_vec, zero);
 
     const auto j = std::countr_zero(cmp);
@@ -967,8 +967,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_upsert_at(const Kmer<k
         return true;
     }
 
-    const auto c_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[i].cs));
-    const auto zero = _mm256_setzero_si256();
+    const auto c_vec = simd256_load(M[i].cs);
+    const auto zero = simd256_zero();
     const auto cmp = eq_mask(c_vec, zero);
 
     const auto j = std::countr_zero(cmp);
@@ -1143,10 +1143,10 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, co
         }
         else
         {
-            const auto zero = _mm256_setzero_si256();
+            const auto zero = simd256_zero();
 
-            const auto c_vec_p = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[p].cs));
-            const auto c_vec_q = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[q].cs));
+            const auto c_vec_p = simd256_load(M[p].cs);
+            const auto c_vec_q = simd256_load(M[q].cs);
 
             const auto cmp_p = eq_mask(c_vec_p, zero);
             const auto cmp_q = eq_mask(c_vec_q, zero);
@@ -1218,10 +1218,10 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
 
     lock_ordered<true>(p, q);
 
-    const auto zero = _mm256_setzero_si256();
+    const auto zero = simd256_zero();
 
-    const auto c_vec_p = _mm256_load_si256(reinterpret_cast<const __m256i*>(M_new[p].cs));
-    const auto c_vec_q = _mm256_load_si256(reinterpret_cast<const __m256i*>(M_new[q].cs));
+    const auto c_vec_p = simd256_load(M_new[p].cs);
+    const auto c_vec_q = simd256_load(M_new[q].cs);
 
     const auto cmp_p = eq_mask(c_vec_p, zero);
     const auto cmp_q = eq_mask(c_vec_q, zero);
@@ -1283,10 +1283,10 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
         }
         else
         {
-            const auto zero = _mm256_setzero_si256();
+            const auto zero = simd256_zero();
 
-            const auto c_vec_p = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[p].cs));
-            const auto c_vec_q = _mm256_load_si256(reinterpret_cast<const __m256i*>(M[q].cs));
+            const auto c_vec_p = simd256_load(M[p].cs);
+            const auto c_vec_q = simd256_load(M[q].cs);
 
             const auto cmp_p = eq_mask(c_vec_p, zero);
             const auto cmp_q = eq_mask(c_vec_q, zero);
