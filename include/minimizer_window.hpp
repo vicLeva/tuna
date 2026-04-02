@@ -23,7 +23,9 @@
 
 template <uint16_t k, uint16_t m>
 class MinimizerWindow {
-    static_assert(m < k, "minimizer length m must be strictly less than k-mer length k");
+    static_assert(m < k,  "minimizer length m must be strictly less than k-mer length k");
+    // lmer_ stores the 2-bit packed m-mer in a uint64_t — limits m to 32.
+    static_assert(m <= 32, "minimizer length m must be <= 32 (lmer_ is uint64_t; 2*m bits required)");
 
     // Window size: number of m-mers in a k-mer window.
     static constexpr uint16_t w = k - m;

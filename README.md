@@ -73,13 +73,36 @@ make -j$(nproc)
 
 The `tuna` binary will be at `build/tuna`.
 
-<details>
-<summary><strong>Compile-time options</strong></summary>
+### k range and compile-time specialisation
 
-**Single-k binary** — compile only the templates for one k value. Roughly 10× faster to build and produces a much smaller binary. Passing any other `-k` at runtime prints an error:
+The default build embeds a dispatch table for **odd k in `[11, 31]`** — you can pass any of those values at runtime with no extra flags.
+
+To use **k > 31**, **even k**, or any k up to 256, compile with explicit `-DFIXED_K` and `-DFIXED_M`:
+
 ```bash
-cmake .. -DFIXED_K=31
+cmake .. -DFIXED_K=63  -DFIXED_M=21
+cmake .. -DFIXED_K=127 -DFIXED_M=21
+cmake .. -DFIXED_K=256 -DFIXED_M=31
 ```
+
+This produces a single-instantiation binary locked to that (k, m) pair. Those values become the defaults — `-k` and `-m` at runtime must match or the binary exits with an error. Build is faster and the binary is smaller. The same mechanism works for k ≤ 31 if you want a leaner binary:
+
+```bash
+cmake .. -DFIXED_K=31 -DFIXED_M=21
+```
+
+If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
+
+```bash
+cmake -S . -B build_k31_m21  -DFIXED_K=31  -DFIXED_M=21  && cmake --build build_k31_m21  --target tuna -j$(nproc)
+cmake -S . -B build_k63_m21  -DFIXED_K=63  -DFIXED_M=21  && cmake --build build_k63_m21  --target tuna -j$(nproc)
+cmake -S . -B build_k127_m25 -DFIXED_K=127 -DFIXED_M=25  && cmake --build build_k127_m25 --target tuna -j$(nproc)
+```
+
+Each directory contains its own `tuna` binary: `build_k31_m21/tuna`, `build_k63_m21/tuna`, etc.
+
+<details>
+<summary><strong>Other compile-time options</strong></summary>
 
 **Debug build** — disables optimisations, enables debug symbols for gdb/valgrind:
 ```bash
@@ -104,8 +127,8 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
-| `-k` | `<int>` | `31` | k-mer length. Any odd value in `[11,31]` (fits in 64-bit word) |
-| `-m` | `<int>` | `21` | Minimizer length. Any odd value in `[9, k-2]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes) |
+| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 31]` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match compile-time value if set, default is compile-time value if set) |
+| `-m` | `<int>` | `21` | Minimizer length. Any value in `[1, min(k-1, 32)]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes). Must match `-DFIXED_M` if set, default is compile-time value if set |
 | `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files; Phase 2 over partitions |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
@@ -194,6 +217,9 @@ auto kmers = tuna::count_to<31>({"genome.fa"});   // std::unordered_map<std::str
 tuna::count<31>({"genome.fa"}, [](std::string_view kmer, uint32_t count) {
     // called for every canonical k-mer; may run from multiple threads
 });
+
+// Large k: any value in [2, 256], both k and m are template parameters
+tuna::count<127, 21>({"genome.fa"}, [](std::string_view kmer, uint32_t count) { ... });
 ```
 
 CMake integration:

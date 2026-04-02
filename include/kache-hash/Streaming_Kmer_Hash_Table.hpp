@@ -27,6 +27,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <algorithm>
 #include <cassert>
@@ -80,6 +81,43 @@ private:
 
     static constexpr auto& key(const flat_t& e) { if constexpr(is_map_) return e.first; else return e; }    // Returns the key from a table-element `e`.
     static constexpr auto& val(const flat_t& e) { if constexpr(is_map_) return e.second; else return e; }   // Returns the value from a table-element `e`.
+
+    // ── Concurrency-conditonal helpers ────────────────────────────────────────
+    //
+    // When mt_=false (the common case in tuna) the concurrency infrastructure
+    // adds real overhead: the checkpoint vector is pointer-chased on every
+    // upsert, and the approx_sz atomics incur unnecessary cache-coherency
+    // traffic.  Using conditional types eliminates that overhead at zero cost
+    // to the mt_=true path.
+
+    // PlainU64: mirrors std::atomic_uint64_t's API but with no atomic overhead.
+    // Used as the approx_sz / ov_approx_sz_ type when mt_=false.
+    struct PlainU64 {
+        uint64_t v = 0;
+        PlainU64() = default;
+        PlainU64(uint64_t x) : v(x) {}
+        operator uint64_t() const { return v; }
+        void operator=(uint64_t x) { v = x; }
+        void operator+=(uint64_t x) { v += x; }
+        bool operator>=(uint64_t x) const { return v >= x; }
+        uint64_t load(std::memory_order) const { return v; }
+        void store(uint64_t x, std::memory_order) { v = x; }
+        uint64_t fetch_add(uint64_t x, std::memory_order) { uint64_t old = v; v += x; return old; }
+    };
+
+    using approx_sz_t = std::conditional_t<mt_, std::atomic_uint64_t, PlainU64>;
+
+    // NoLock: zero-size stand-in for RW_Lock when mt_=false.
+    // [[no_unique_address]] collapses it to zero bytes in the table object,
+    // recovering the 4 KB that RW_Lock<64> occupies.
+    struct NoLock {
+        void lock() {}
+        void unlock() {}
+        void lock_shared(std::size_t) {}
+        void unlock_shared(std::size_t) {}
+    };
+
+    using lock_t = std::conditional_t<mt_, RW_Lock<64>, NoLock>;
 
     static constexpr uint8_t min_orientation_mask = 0b0100'0000;
 
@@ -136,9 +174,9 @@ private:
     ov_t* ov_new;    // New overflow table after a resize.
 
     std::atomic_uint16_t registered_thread_count;   // Number of threads registered to use the table.
-    std::atomic_uint64_t approx_sz; // Approximate size (lower bound) of the hash table.
-    std::atomic_uint64_t ov_approx_sz_;    // Overflow inserts since last resize (drives ov_resize_th_; resets on resize).
-    std::atomic_uint64_t ov_total_inserts_; // Cumulative overflow inserts across all resizes (never reset).
+    approx_sz_t approx_sz;        // Approximate size (lower bound) of the hash table.
+    approx_sz_t ov_approx_sz_;    // Overflow inserts since last resize (drives ov_resize_th_; resets on resize).
+    approx_sz_t ov_total_inserts_; // Cumulative overflow inserts across all resizes (never reset).
     uint64_t ov_resize_th_;                // Overflow insert count at which to trigger resize.
 
     // Histogram of overflow inserts by minimizer hash (top 16 bits of nt_h → 65536 bins).
@@ -149,13 +187,17 @@ private:
 
     // Thread-local flag: set by the overflow insert path, read by the public upsert.
     static thread_local bool tl_ov_happened_;
-    std::vector<Padded<uint64_t>> checkpoint;   // `checkpoint[i]` is the number of elements remaining to be added by the `i`'th user thread before it checks for a resize.
+    // mt_=true: one padded counter per registered thread (avoids false sharing).
+    // mt_=false: single plain uint64_t — no heap allocation, no pointer-chase per upsert.
+    std::vector<Padded<uint64_t>> checkpoint;   // used only when mt_=true
+    uint64_t resize_ctr_;                       // used only when mt_=false
     static constexpr uint64_t resize_checkpoint = 16384;    // Checkpoint number of elements for a user thread to add before checking for resize.
 
     static constexpr uint64_t max_user = 64;    // Maximum number of users allowed to use the table.
-    RW_Lock<max_user> table_lock; // Readers-writers lock to resize the table exclusively.
+    [[no_unique_address]] lock_t table_lock; // Readers-writers lock; zero-size for mt_=false.
 
     const uint64_t resize_worker_c; // Number of worker threads to spawn for a concurrent resize.
+    std::mutex ov_insert_mutex_; // Guards the find_and_update+insert combo on the overflow path (mt_=true only).
 
     std::vector<ResizeEvent> resize_log_; // Per-table resize event log (populated by try_resize).
 
@@ -210,8 +252,17 @@ private:
 
     // Directly places the element `e` with checksum `c` and minimizer-
     // coordinate `m` into the `i`'th bucket at index `j`.
+    // When mt_=true, min_coord[0] holds the per-bucket lock bit (bit 7).
+    // Writing to slot 0 must preserve that bit to avoid corrupting the spinlock.
     void place_at(const flat_t& e, const uint8_t c, const uint8_t m, const std::size_t i, const std::size_t j)
-    { T[i * B + j] = e, M[i].cs[j] = c, M[i].min_coord[j] = m; }
+    {
+        T[i * B + j] = e;
+        M[i].cs[j] = c;
+        if constexpr(mt_)
+            M[i].min_coord[j] = (j == 0) ? (M[i].min_coord[0] & Metadata::lock_mask) | m : m;
+        else
+            M[i].min_coord[j] = m;
+    }
 
     // Directly places the element `e` with checksum `c` and minimizer-
     // coordinate `m` into the `i`'th bucket at index `j` of the new resized
@@ -369,12 +420,12 @@ public:
     // O(l) work — cheaper than prefetch(Kmer_Window) which needs a fully
     // initialised window.  Call this one superkmer ahead to hide the LLC miss
     // behind the current superkmer's hot loop.
-    void prefetch_packed(const uint8_t* packed, const uint8_t min_pos) const
+    void prefetch_packed(const uint8_t* packed, const uint16_t min_pos) const
     {
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf_l[l];
         for (uint16_t i = 0; i < l; ++i) {
-            const uint16_t pos = static_cast<uint16_t>(min_pos) + i;
+            const uint16_t pos = min_pos + i;
             buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
         }
         nt_hash::Roller<l> roller;
@@ -502,7 +553,7 @@ public:
     // Returns the canonical ntHash of the minimizer l-mer.
     // Replaces the two-call pattern: lmer_nt_hash(packed, min_pos) then
     // init_packed_with_hash(packed, mh) — eliminates one full decode pass.
-    uint64_t init_packed_with_min(const uint8_t* packed, uint8_t min_pos)
+    uint64_t init_packed_with_min(const uint8_t* packed, uint16_t min_pos)
     {
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf[k];
@@ -632,7 +683,8 @@ inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Streaming_Kmer_Hash_Table(const
     , ov_total_inserts_(0)
     , ov_resize_th_(static_cast<uint64_t>(capacity() * of_default * 0.5))
     , ov_min_hist_(OV_HIST_SIZE)
-    , checkpoint(std::thread::hardware_concurrency(), resize_checkpoint)
+    , checkpoint(mt_ ? std::thread::hardware_concurrency() : 0, resize_checkpoint)
+    , resize_ctr_(resize_checkpoint)
     , resize_worker_c(resize_worker_c)
 {
     clear();
@@ -654,7 +706,10 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::clear()
     approx_sz = 0;
     ov_approx_sz_.store(0, std::memory_order_relaxed);
     for(auto& bin : ov_min_hist_) bin.store(0, std::memory_order_relaxed);
-    std::for_each(checkpoint.begin(), checkpoint.end(), [](auto& c){ c = resize_checkpoint; });
+    if constexpr(mt_)
+        std::for_each(checkpoint.begin(), checkpoint.end(), [](auto& c){ c = resize_checkpoint; });
+    else
+        resize_ctr_ = resize_checkpoint;
 
     ov->clear();
 }
@@ -765,7 +820,10 @@ inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::size() const
 {
     // return main_table_size() + overflow_size();
     std::size_t sz = approx_sz;
-    std::for_each(checkpoint.cbegin(), checkpoint.cend(), [&](auto& c){ sz += c.unwrap() > 0 ? resize_checkpoint - c.unwrap() : 0; });
+    if constexpr(mt_)
+        std::for_each(checkpoint.cbegin(), checkpoint.cend(), [&](auto& c){ sz += c.unwrap() > 0 ? resize_checkpoint - c.unwrap() : 0; });
+    else
+        sz += resize_ctr_ > 0 ? resize_checkpoint - resize_ctr_ : 0;
     return sz;
 }
 
@@ -941,14 +999,25 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto r = insert(w.v.canonical(), c, h, m);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
 
-    auto& cp = checkpoint[token.id].unwrap();
-    cp -= (r == null_val);
-    if(KACHE_HASH_UNLIKELY(cp == 0))
-    {
-        approx_sz += resize_checkpoint;
-        cp = resize_checkpoint;
-        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
-            try_resize();
+    if constexpr(mt_) {
+        auto& cp = checkpoint[token.id].unwrap();
+        cp -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(cp == 0))
+        {
+            approx_sz += resize_checkpoint;
+            cp = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
+                try_resize();
+        }
+    } else {
+        resize_ctr_ -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(resize_ctr_ == 0))
+        {
+            approx_sz += resize_checkpoint;
+            resize_ctr_ = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_ >= ov_resize_th_)
+                try_resize();
+        }
     }
 
     return r;
@@ -969,14 +1038,25 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto r = insert(std::make_pair(w.v.canonical(), val), c, h, m);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
 
-    auto& cp = checkpoint[token.id].unwrap();
-    cp -= (r == null_val);
-    if(KACHE_HASH_UNLIKELY(cp == 0))
-    {
-        approx_sz += resize_checkpoint;
-        cp = resize_checkpoint;
-        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
-            try_resize();
+    if constexpr(mt_) {
+        auto& cp = checkpoint[token.id].unwrap();
+        cp -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(cp == 0))
+        {
+            approx_sz += resize_checkpoint;
+            cp = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
+                try_resize();
+        }
+    } else {
+        resize_ctr_ -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(resize_ctr_ == 0))
+        {
+            approx_sz += resize_checkpoint;
+            resize_ctr_ = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_ >= ov_resize_th_)
+                try_resize();
+        }
     }
 
     return r;
@@ -1002,14 +1082,25 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     if(tl_ov_happened_)
         ov_min_hist_[nt_h >> (64 - OV_HIST_BITS)].fetch_add(1, std::memory_order_relaxed);
 
-    auto& cp = checkpoint[token.id].unwrap();
-    cp -= (r == null_val);
-    if(KACHE_HASH_UNLIKELY(cp == 0))
-    {
-        approx_sz += resize_checkpoint;
-        cp = resize_checkpoint;
-        if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
-            try_resize();
+    if constexpr(mt_) {
+        auto& cp = checkpoint[token.id].unwrap();
+        cp -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(cp == 0))
+        {
+            approx_sz += resize_checkpoint;
+            cp = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_.load(std::memory_order_relaxed) >= ov_resize_th_)
+                try_resize();
+        }
+    } else {
+        resize_ctr_ -= (r == null_val);
+        if(KACHE_HASH_UNLIKELY(resize_ctr_ == 0))
+        {
+            approx_sz += resize_checkpoint;
+            resize_ctr_ = resize_checkpoint;
+            if(approx_sz >= resize_th || ov_approx_sz_ >= ov_resize_th_)
+                try_resize();
+        }
     }
 
     return r;
@@ -1219,12 +1310,21 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
                 unlock_ordered(p, q);
                 // Use find_and_update so that `f` is applied to the existing
                 // overflow value rather than blindly overwriting it with `val`.
+                // When mt_=true, guard the find+insert combo with a mutex to
+                // prevent two concurrent threads from both missing the key and
+                // both inserting it, causing the second insert to overwrite the
+                // first with the initial value (count off by 1 per race).
+                if constexpr(mt_) ov_insert_mutex_.lock();
                 const auto r = ov->find_and_update(key,
                     [&f](const Overflow_Map_Val& ov_val) -> Overflow_Map_Val {
                         return {ov_val.cs, ov_val.min_coord, f(ov_val.val)};
                     });
-                if(r) return val_t(r->val);
+                if(r) {
+                    if constexpr(mt_) ov_insert_mutex_.unlock();
+                    return val_t(r->val);
+                }
                 ov->insert(key, Overflow_Map_Val(c, m, val));
+                if constexpr(mt_) ov_insert_mutex_.unlock();
                 ov_approx_sz_.fetch_add(1, std::memory_order_relaxed);
                 ov_total_inserts_.fetch_add(1, std::memory_order_relaxed);
                 tl_ov_happened_ = true;

@@ -17,9 +17,10 @@ void print_usage(const char* prog)
         "\n"
         "Options:\n"
         "  -k  <int>   k-mer length               [default: 31]\n"
-        "              odd values in [11,31]  (k ≤ 32, fits in 64-bit word)\n"
+        "              this build accepts: odd values in [11,31]\n"
+        "              for other values recompile with -DFIXED_K=<k> -DFIXED_M=<m>\n"
         "  -m  <int>   minimizer length            [default: 21]\n"
-        "              odd values in [9,k-2]  (must be odd and < k)\n"
+        "              any odd value in [1, min(k-1, 32)]\n"
         "              m=21 is a good default; use m=23-25 for highly repetitive\n"
         "              or low-complexity data (e.g. individual human genomes)\n"
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
@@ -150,15 +151,15 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.output_kff = true;
     }
 
-    if (cfg.k % 2 == 0 || cfg.k < 11 || cfg.k > 31) {
+    if (cfg.k < 2 || cfg.k > 256) {
         std::cerr << "tuna: error: k-mer length (-k " << cfg.k
-                  << ") must be an odd value in [11, 31]\n";
+                  << ") must be in [2, 256]\n";
         return false;
     }
 
-    if (cfg.l % 2 == 0 || cfg.l < 9) {
+    if (cfg.l < 1 || cfg.l > 32) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l
-                  << ") must be an odd value >= 9\n";
+                  << ") must be in [1, 32]\n";
         return false;
     }
 

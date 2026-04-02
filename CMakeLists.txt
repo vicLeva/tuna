@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.17)
-project(tuna VERSION 1.1.0 LANGUAGES CXX C)
+project(tuna VERSION 1.2.0 LANGUAGES CXX C)
 
 # Default to Release if no build type is specified.
 # Only set when tuna is the top-level project — do not override the parent's choice.
@@ -150,6 +150,7 @@ target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
+    $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
 )
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
 

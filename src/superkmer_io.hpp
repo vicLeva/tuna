@@ -1,25 +1,32 @@
 #pragma once
 
-// On-disk superkmer format: [uint8_t len_bases][uint8_t min_pos][ceil(len/4) packed bytes]
+// On-disk / in-memory superkmer format:
+//   [hdr_t len_bases][hdr_t min_pos][ceil(len/4) packed bytes]
 //
-// Each superkmer is stored as two header bytes followed by the bases packed 4
-// per byte in kache-hash encoding (A=0, C=1, G=2, T=3), MSB-first.
+// hdr_t is uint8_t when max superkmer length fits in 8 bits (2k-m ≤ 255),
+// uint16_t otherwise.  The type is a compile-time constant deduced from k and m,
+// so the header is as compact as possible without ever truncating a value.
 //
-//   len_bases — number of bases (max 255; superkmers are at most 2k−m bases).
-//   min_pos   — 0-indexed start of the minimizer m-mer within the superkmer.
-//               Stored so Phase 2 can compute ntHash(minimizer) in O(m) instead
-//               of O(k) via MinimizerWindow::reset().
+//   Max superkmer length : 2k − m  (two k-mers sharing the boundary minimizer)
+//   Max min_pos          : 2(k−m)  < 2k−m, so same type covers both fields
 //
-// Packed encoding: base i is at bits 7-2*(i%4) of byte i/4.
+// For k ≤ 138 with m ≥ 21 (the common genomics range), hdr_t = uint8_t → 2-byte
+// header per superkmer.  For larger k, hdr_t = uint16_t → 4-byte header.
+//
+// The sentinel value hdr_t::max() in min_pos means "no precomputed minimizer
+// hash stored" — Phase 2 falls back to a full MinimizerWindow::reset().
+//
+// Packed encoding: base i is at bits 7-2*(i%4) of byte i/4, MSB-first.
 
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 // Returns the path to the superkmer file for partition p under work_dir.
-// Used in pipeline setup, counting, and cleanup — centralises the naming convention.
 inline std::string partition_path(const std::string& work_dir, size_t p)
 {
     return work_dir + "hash_" + std::to_string(p) + ".superkmers";
@@ -34,6 +41,16 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 #  define MAP_POPULATE 0
 #endif
 
+// Deduce the header integer type for a given (k, m) pair.
+// uint8_t  when 2k − m ≤ 255  (header fits in one byte, 2-byte header total)
+// uint16_t otherwise           (4-byte header, required for k ≥ 139 at m=21)
+template <uint16_t k, uint16_t m>
+using sk_hdr_t = std::conditional_t<(2u * k - m <= 255u), uint8_t, uint16_t>;
+
+// Sentinel stored in min_pos when no precomputed minimizer hash is available.
+template <uint16_t k, uint16_t m>
+static constexpr sk_hdr_t<k, m> sk_no_min = std::numeric_limits<sk_hdr_t<k, m>>::max();
+
 
 // ─── Writer ───────────────────────────────────────────────────────────────────
 //
@@ -41,11 +58,15 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 // zero-initialisation on resize.  std::string::resize zeroes new bytes even when
 // immediately overwritten; this buffer grows by doubling but skips zero-fill.
 
+template <uint16_t k, uint16_t m>
 struct SuperkmerWriter
 {
-    char*  raw_  = nullptr;
-    size_t sz_   = 0;
-    size_t cap_  = 0;
+    using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);  // header bytes per record
+
+    char*  raw_  = nullptr;  // raw buffer pointer
+    size_t sz_   = 0;        // used bytes
+    size_t cap_  = 0;        // allocated bytes
     // flush_threshold is set per-writer based on n_parts so that total writer
     // memory across all partitions stays bounded to ~64 MB per thread:
     //   max(4 KB, 64 MB / n_parts)
@@ -82,7 +103,6 @@ struct SuperkmerWriter
     void        clear()       noexcept { sz_ = 0; }
 
     // Grow the buffer if sz_ + extra would exceed cap_.
-    // Only called on the slow path (amortised O(1): doubles each time).
     [[gnu::cold, gnu::noinline]]
     void grow(size_t extra)
     {
@@ -95,7 +115,6 @@ struct SuperkmerWriter
     }
 
     // Inline fast-path: capacity check + advance sz_.
-    // Returns pointer to the newly reserved region (caller fills it).
     char* reserve_inline(size_t extra) noexcept
     {
         if (__builtin_expect(sz_ + extra > cap_, 0)) grow(extra);
@@ -105,17 +124,14 @@ struct SuperkmerWriter
     }
 
     // Serialise one superkmer from ASCII DNA (ACGT, any case).
-    // Kept for call sites that don't pre-encode; prefer append_kache when possible.
-    void append(const char* data, uint8_t len, uint8_t min_pos)
+    void append(const char* data, hdr_t len, hdr_t min_pos)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
-        char* dst = reserve_inline(2u + packed_bytes);
-        dst[0] = static_cast<char>(len);
-        dst[1] = static_cast<char>(min_pos);
-        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + 2);
+        char* dst = reserve_inline(HDR_BYTES + packed_bytes);
+        std::memcpy(dst,                &len,     sizeof(hdr_t));
+        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
-        // Direct 4-bases-per-byte writes: no memset, no read-modify-write in the
-        // main loop → compiler auto-vectorizes (no loop-carried dependency).
         size_t i = 0;
         for (; i + 4 <= static_cast<size_t>(len); i += 4) {
             const uint8_t b0 = ((uint8_t(data[i  ]) >> 2) ^ (uint8_t(data[i  ]) >> 1)) & 3u;
@@ -135,15 +151,13 @@ struct SuperkmerWriter
     }
 
     // Serialise one superkmer from pre-encoded kache bytes (A=0,C=1,G=2,T=3).
-    // Caller pre-converts the entire sequence ASCII→kache once; this path
-    // skips all re-encoding — only shift+OR to pack 4 bases into 1 byte.
-    void append_kache(const uint8_t* kdata, uint8_t len, uint8_t min_pos)
+    void append_kache(const uint8_t* kdata, hdr_t len, hdr_t min_pos)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
-        char* dst = reserve_inline(2u + packed_bytes);
-        dst[0] = static_cast<char>(len);
-        dst[1] = static_cast<char>(min_pos);
-        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + 2);
+        char* dst = reserve_inline(HDR_BYTES + packed_bytes);
+        std::memcpy(dst,                 &len,     sizeof(hdr_t));
+        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         size_t i = 0;
         for (; i + 4 <= static_cast<size_t>(len); i += 4)
@@ -159,7 +173,6 @@ struct SuperkmerWriter
 
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
 
-    // Flush to the shared file under its mutex; no-op if buffer is empty.
     void flush_to(std::ofstream& file, std::mutex& mtx)
     {
         if (sz_ == 0) return;
@@ -168,7 +181,6 @@ struct SuperkmerWriter
         sz_ = 0;
     }
 
-    // Flush to an in-memory string sink (streaming mode — avoids disk I/O).
     void flush_to_mem(std::string& dst, std::mutex& mtx)
     {
         if (sz_ == 0) return;
@@ -181,8 +193,12 @@ struct SuperkmerWriter
 
 // ─── Reader ───────────────────────────────────────────────────────────────────
 
+template <uint16_t k, uint16_t m>
 struct SuperkmerReader
 {
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+
     explicit SuperkmerReader(const std::string& path)
     {
         fd_ = open(path.c_str(), O_RDONLY);
@@ -192,10 +208,10 @@ struct SuperkmerReader
         if (fstat(fd_, &sb) < 0 || sb.st_size == 0) return;
         size_ = static_cast<size_t>(sb.st_size);
 
-        void* m = mmap(nullptr, size_, PROT_READ,
+        void* p = mmap(nullptr, size_, PROT_READ,
                        MAP_PRIVATE | MAP_POPULATE, fd_, 0);
-        if (m == MAP_FAILED) return;
-        map_ = static_cast<const char*>(m);
+        if (p == MAP_FAILED) return;
+        map_ = static_cast<const char*>(p);
 
         madvise(const_cast<char*>(map_), size_,
                 MADV_SEQUENTIAL | MADV_WILLNEED);
@@ -213,81 +229,75 @@ struct SuperkmerReader
     SuperkmerReader(const SuperkmerReader&)            = delete;
     SuperkmerReader& operator=(const SuperkmerReader&) = delete;
 
-    // Advance to the next superkmer.  Returns false at EOF.
     bool next()
     {
-        if (cur_ + 2 > end_) return false;
-        const uint8_t len8 = static_cast<uint8_t>(*cur_);
-        if (len8 == 0) return false;
-        min_pos_ = static_cast<uint8_t>(cur_[1]);
-        cur_ += 2;
+        if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
+        hdr_t len, mp;
+        std::memcpy(&len, cur_,                sizeof(hdr_t));
+        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        if (len == 0) return false;
+        min_pos_ = mp;
+        cur_ += HDR_BYTES;
 
-        const size_t packed_bytes = (static_cast<size_t>(len8) + 3u) / 4u;
+        const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
         if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
 
         ptr_ = reinterpret_cast<const uint8_t*>(cur_);
-        len_ = len8;
+        len_ = len;
         cur_ += packed_bytes;
         return true;
     }
 
-    // Pointer to the packed bases of the current superkmer (kache encoding,
-    // 4 bases/byte MSB-first).  Valid until the next call to next().
     const uint8_t* packed_data() const { return ptr_; }
-
-    // Number of bases in the current superkmer.
-    size_t size() const { return len_; }
-
-    // 0-indexed start position of the minimizer m-mer within the current superkmer.
-    uint8_t min_pos() const { return min_pos_; }
-
-    // Total mapped bytes — available for diagnostics / capacity estimation.
-    size_t file_size() const { return size_; }
-
-    bool ok() const { return map_ != nullptr; }
+    size_t         size()        const { return len_; }
+    hdr_t          min_pos()     const { return min_pos_; }
+    size_t         file_size()   const { return size_; }
+    bool           ok()          const { return map_ != nullptr; }
 
 private:
-    int         fd_   = -1;
-    size_t      size_ = 0;
-    const char* map_  = nullptr;
-    const char* cur_  = nullptr;
-    const char* end_  = nullptr;
-    const uint8_t* ptr_ = nullptr;
-    size_t      len_     = 0;
-    uint8_t     min_pos_ = 0;
+    int            fd_      = -1;      // file descriptor
+    size_t         size_    = 0;       // file size in bytes
+    const char*    map_     = nullptr; // mmap base pointer
+    const char*    cur_     = nullptr; // read cursor
+    const char*    end_     = nullptr; // one past last byte
+    const uint8_t* ptr_     = nullptr; // packed data of current superkmer
+    size_t         len_     = 0;       // length of current superkmer (bases)
+    hdr_t          min_pos_ = 0;       // minimizer position in current superkmer
 };
 
 
 // ─── In-memory reader (streaming mode) ───────────────────────────────────────
-//
-// Same interface as SuperkmerReader but backed by an existing std::string
-// rather than an mmap'd file.  Used by the streaming pipeline to avoid the
-// disk write + mmap round-trip between Phase 1 and Phase 2.
 
+template <uint16_t k, uint16_t m>
 struct MemoryReader
 {
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+
     MemoryReader() = default;
     explicit MemoryReader(const std::string& data) noexcept
         : cur_(data.data()), end_(data.data() + data.size()) {}
 
     bool next() noexcept
     {
-        if (cur_ + 2 > end_) return false;
-        const uint8_t len8 = static_cast<uint8_t>(*cur_);
-        if (len8 == 0) return false;
-        min_pos_ = static_cast<uint8_t>(cur_[1]);
-        cur_ += 2;
-        const size_t packed_bytes = (static_cast<size_t>(len8) + 3u) / 4u;
+        if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
+        hdr_t len, mp;
+        std::memcpy(&len, cur_,                sizeof(hdr_t));
+        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        if (len == 0) return false;
+        min_pos_ = mp;
+        cur_ += HDR_BYTES;
+        const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
         if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
         ptr_  = reinterpret_cast<const uint8_t*>(cur_);
-        len_  = len8;
+        len_  = len;
         cur_ += packed_bytes;
         return true;
     }
 
     const uint8_t* packed_data() const noexcept { return ptr_; }
     size_t         size()        const noexcept { return len_; }
-    uint8_t        min_pos()     const noexcept { return min_pos_; }
+    hdr_t          min_pos()     const noexcept { return min_pos_; }
     bool           ok()          const noexcept { return cur_ != nullptr; }
 
 private:
@@ -295,5 +305,5 @@ private:
     const char*    end_     = nullptr;
     const uint8_t* ptr_     = nullptr;
     size_t         len_     = 0;
-    uint8_t        min_pos_ = 0;
+    hdr_t          min_pos_ = 0;
 };
