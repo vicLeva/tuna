@@ -31,11 +31,16 @@ N_HUMAN=(512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288)
 
 # ── Dataset paths ─────────────────────────────────────────────────────────────
 # Adjust if your cluster copies use different filenames.
-ECOLI_INPUT="@/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list"
-HUMAN_INPUT="/WORKS/vlevallois/data/dataset_genome_human/HG00438.maternal.f1_assembly_v2_genbank.fa.gz"
+ECOLI_FOF="/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list"
+HUMAN_INPUT="/WORKS/vlevallois/data/dataset_genome_human/data/HG00438.maternal.f1_assembly_v2_genbank.fa.gz"
 
 # ── E. coli sweep ─────────────────────────────────────────────────────────────
-echo "=== E. coli sweep  (t=$THREADS, ${#N_ECOLI[@]} n-values × $RUNS runs) ===" >&2
+# Use first 200 files only (consistent with local benchmarks).
+ECOLI_FOF_200="$OUT/ecoli_fof_200.list"
+head -200 "$ECOLI_FOF" > "$ECOLI_FOF_200"
+ECOLI_INPUT="@${ECOLI_FOF_200}"
+
+echo "=== E. coli sweep  (t=$THREADS, ${#N_ECOLI[@]} n-values × $RUNS runs, 200 files) ===" >&2
 bash "$SCRIPT" ecoli "$ECOLI_INPUT" "$THREADS" "$RUNS" "${N_ECOLI[@]}" \
     > "$OUT/n_sweep_ecoli.tsv"
 echo "Saved: $OUT/n_sweep_ecoli.tsv" >&2

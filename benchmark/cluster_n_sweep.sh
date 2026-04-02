@@ -9,7 +9,7 @@
 #       128 256 512 1024 2048 4096 8192 16384 32768 65536 131072
 #
 #   bash cluster_n_sweep.sh human \
-#       /WORKS/vlevallois/data/dataset_genome_human/HG00438.maternal.f1_assembly_v2_genbank.fa.gz \
+#       /WORKS/vlevallois/data/dataset_genome_human/data/HG00438.maternal.f1_assembly_v2_genbank.fa.gz \
 #       8 3 512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288
 #
 # Output: TSV to stdout — redirect to a file:
