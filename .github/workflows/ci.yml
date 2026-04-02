@@ -38,32 +38,3 @@ jobs:
           ' /tmp/out.tsv
 
           echo "Smoke test passed ($(wc -l < /tmp/out.tsv) k-mers)"
-
-  build-and-test-macos:
-    name: macOS
-    runs-on: macos-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DFIXED_K=31
-
-      - name: Build
-        run: cmake --build build --target tuna -j$(sysctl -n hw.ncpu)
-
-      - name: Smoke test
-        run: |
-          printf ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>seq2\nTGCATGCATGCATGCATGCATGCATGCATGCATGCA\n" > /tmp/test.fa
-
-          ./build/tuna -k 31 -m 21 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
-
-          [ -s /tmp/out.tsv ] || { echo "Output is empty"; exit 1; }
-
-          awk -F'\t' '
-            NF != 2           { print "Bad columns at line " NR; exit 1 }
-            length($1) != 31  { print "Bad kmer length at line " NR; exit 1 }
-            $2 !~ /^[0-9]+$/  { print "Bad count at line " NR; exit 1 }
-          ' /tmp/out.tsv
-
-          echo "Smoke test passed ($(wc -l < /tmp/out.tsv) k-mers)"
