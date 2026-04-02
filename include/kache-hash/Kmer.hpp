@@ -234,7 +234,9 @@ inline void Kmer<k>::left_shift()
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline void Kmer<k>::right_shift()
 {
     constexpr uint64_t mask_LSN = 0b11;
@@ -248,7 +250,9 @@ inline void Kmer<k>::right_shift()
 
 template <uint16_t k>
 template <uint16_t B>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline void Kmer<k>::left_shift()
 {
     static_assert(B < 32, "invalid bit-shift amount");
@@ -295,7 +299,9 @@ inline constexpr Kmer<k>::Kmer(const char* const label, const std::size_t kmer_i
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline constexpr Kmer<k>::Kmer(const char* const label)
 {
     constexpr uint16_t packed_word_count = k / 32;
@@ -339,7 +345,9 @@ inline constexpr uint16_t Kmer<k>::num_words()
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline void Kmer<k>::from_super_kmer(const uint64_t* const super_kmer, const std::size_t word_count)
 {
     constexpr uint16_t t = 32 - (k & 31);   // Trailing (little-endian) empty characters in KMC representation.
@@ -396,7 +404,9 @@ inline Kmer<k> Kmer<k>::reverse_complement() const
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline void Kmer<k>::as_reverse_complement(const Kmer<k>& other)
 {
     // Working with bytes instead of 64-bit words at a time.
@@ -426,7 +436,9 @@ inline void Kmer<k>::as_reverse_complement(const Kmer<k>& other)
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline bool Kmer<k>::operator<(const Kmer<k>& rhs) const
 {
     if constexpr(k <= 32)
@@ -441,7 +453,9 @@ inline bool Kmer<k>::operator<(const Kmer<k>& rhs) const
 
 
 template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline bool Kmer<k>::operator>(const Kmer<k>& rhs) const
 {
     if constexpr(k <= 32)
@@ -640,7 +654,9 @@ inline uint64_t Kmer<k>::lmer_at(const std::size_t idx) const
 
 template <uint16_t k>
 template <typename T_container_>
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("unroll-loops")))
+#endif
 inline void Kmer<k>::get_label(T_container_& label) const
 {
     label.resize(k);
