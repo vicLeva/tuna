@@ -21,6 +21,7 @@
 #include <utility>
 #include <algorithm>
 #include <iomanip>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -274,14 +275,18 @@ uint64_t write_counts_callback(
     const Config& cfg,
     Callback& cb)
 {
-    std::string label;
     uint64_t written = 0;
+    [[maybe_unused]] std::string label;
 
     table.for_each([&](const auto& entry) {
         const uint64_t cnt = entry.second;
         if (cnt < cfg.ci || cnt > cfg.cx) return;
-        entry.first.get_label(label);
-        cb(std::string_view(label), static_cast<uint32_t>(cnt));
+        if constexpr (std::is_invocable_v<Callback, const kache_hash::Kmer<k>&, uint32_t>) {
+            cb(entry.first, static_cast<uint32_t>(cnt));
+        } else {
+            entry.first.get_label(label);
+            cb(std::string_view(label), static_cast<uint32_t>(cnt));
+        }
         ++written;
     });
 

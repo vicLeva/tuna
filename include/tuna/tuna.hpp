@@ -34,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <filesystem>
 
@@ -43,6 +44,15 @@
 #include "superkmer_io.hpp"   // SuperkmerWriter (for sizeof in auto-tune)
 
 namespace tuna {
+
+// ─── K-mer type ───────────────────────────────────────────────────────────────
+//
+// tuna::Kmer<k> is the packed binary representation of a k-mer.
+// Use it as the argument type in binary-mode callbacks (see count() below).
+// Internally: ceil(k/32) uint64 words, 2 bits per base, canonical form.
+
+template <uint16_t k>
+using Kmer = kache_hash::Kmer<k>;
 
 // ─── Options ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +68,15 @@ struct Options {
 // ─── count() ──────────────────────────────────────────────────────────────────
 //
 // Invokes cb(kmer, count) for each canonical k-mer that passes the count filters.
+//
+// Two callback signatures are supported — the right path is selected at compile
+// time based on what the callback accepts:
+//
+//   ASCII  (default): cb(std::string_view kmer, uint32_t count)
+//   Binary           : cb(const tuna::Kmer<k>& kmer, uint32_t count)
+//
+// Binary mode skips the packed→string conversion and is slightly faster.
+// Use tuna::Kmer<k>::get_label(std::string&) to decode a binary k-mer if needed.
 //
 // cb is called concurrently: with num_threads > 1, multiple worker threads process
 // different partitions in parallel and each calls cb independently.  K-mers are
@@ -144,6 +163,29 @@ Container count_to(const std::vector<std::string>& files, Options opts = {})
         [&](std::string_view kmer, uint32_t cnt) {
             std::lock_guard<std::mutex> lg(mtx);
             result.emplace(std::string(kmer), cnt);
+        },
+        opts);
+    return result;
+}
+
+// ─── count_to_raw() ───────────────────────────────────────────────────────────
+//
+// Binary variant of count_to(): collects (Kmer<k>, count) pairs into a
+// std::vector and returns it.  No packed→string conversion is performed.
+//
+// Use kmer.get_label(str) on any entry to decode back to ASCII if needed.
+
+template <uint16_t k, uint16_t m = 21>
+std::vector<std::pair<Kmer<k>, uint32_t>>
+count_to_raw(const std::vector<std::string>& files, Options opts = {})
+{
+    std::vector<std::pair<Kmer<k>, uint32_t>> result;
+    std::mutex mtx;
+    count<k, m>(
+        files,
+        [&](const Kmer<k>& kmer, uint32_t cnt) {
+            std::lock_guard<std::mutex> lg(mtx);
+            result.emplace_back(kmer, cnt);
         },
         opts);
     return result;
