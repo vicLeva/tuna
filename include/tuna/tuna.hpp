@@ -108,11 +108,11 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
     cfg.num_partitions = opts.partitions;
     cfg.hide_progress  = true;
 
-    static_assert(sizeof(SuperkmerWriter) >= 8 && sizeof(SuperkmerWriter) <= 64,
+    static_assert(sizeof(SuperkmerWriter<k, m>) >= 8 && sizeof(SuperkmerWriter<k, m>) <= 64,
                   "SuperkmerWriter size out of expected range");
     if (cfg.num_partitions == 0)
         cfg.num_partitions = auto_tune_partitions(
-            cfg.input_files, sizeof(SuperkmerWriter), cfg.k, cfg.num_threads);
+            cfg.input_files, sizeof(SuperkmerWriter<k, m>), cfg.k, cfg.num_threads);
     cfg.num_partitions = round_pow2(cfg.num_partitions);
 
     // ── Work directory ─────────────────────────────────────────────────────

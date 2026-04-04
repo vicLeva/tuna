@@ -402,112 +402,76 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
     TDG(35,  9); TDG(35, 11); TDG(35, 13); TDG(35, 15);
     TDG(35, 17); TDG(35, 19); TDG(35, 21); TDG(35, 23);
     TDG(35, 25); TDG(35, 27); TDG(35, 29); TDG(35, 31);
-    TDG(35, 33);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 37
     TDG(37,  9); TDG(37, 11); TDG(37, 13); TDG(37, 15);
     TDG(37, 17); TDG(37, 19); TDG(37, 21); TDG(37, 23);
     TDG(37, 25); TDG(37, 27); TDG(37, 29); TDG(37, 31);
-    TDG(37, 33); TDG(37, 35);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 39
     TDG(39,  9); TDG(39, 11); TDG(39, 13); TDG(39, 15);
     TDG(39, 17); TDG(39, 19); TDG(39, 21); TDG(39, 23);
     TDG(39, 25); TDG(39, 27); TDG(39, 29); TDG(39, 31);
-    TDG(39, 33); TDG(39, 35); TDG(39, 37);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 41
     TDG(41,  9); TDG(41, 11); TDG(41, 13); TDG(41, 15);
     TDG(41, 17); TDG(41, 19); TDG(41, 21); TDG(41, 23);
     TDG(41, 25); TDG(41, 27); TDG(41, 29); TDG(41, 31);
-    TDG(41, 33); TDG(41, 35); TDG(41, 37); TDG(41, 39);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 43
     TDG(43,  9); TDG(43, 11); TDG(43, 13); TDG(43, 15);
     TDG(43, 17); TDG(43, 19); TDG(43, 21); TDG(43, 23);
     TDG(43, 25); TDG(43, 27); TDG(43, 29); TDG(43, 31);
-    TDG(43, 33); TDG(43, 35); TDG(43, 37); TDG(43, 39);
-    TDG(43, 41);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 45
     TDG(45,  9); TDG(45, 11); TDG(45, 13); TDG(45, 15);
     TDG(45, 17); TDG(45, 19); TDG(45, 21); TDG(45, 23);
     TDG(45, 25); TDG(45, 27); TDG(45, 29); TDG(45, 31);
-    TDG(45, 33); TDG(45, 35); TDG(45, 37); TDG(45, 39);
-    TDG(45, 41); TDG(45, 43);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 47
     TDG(47,  9); TDG(47, 11); TDG(47, 13); TDG(47, 15);
     TDG(47, 17); TDG(47, 19); TDG(47, 21); TDG(47, 23);
     TDG(47, 25); TDG(47, 27); TDG(47, 29); TDG(47, 31);
-    TDG(47, 33); TDG(47, 35); TDG(47, 37); TDG(47, 39);
-    TDG(47, 41); TDG(47, 43); TDG(47, 45);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 49
     TDG(49,  9); TDG(49, 11); TDG(49, 13); TDG(49, 15);
     TDG(49, 17); TDG(49, 19); TDG(49, 21); TDG(49, 23);
     TDG(49, 25); TDG(49, 27); TDG(49, 29); TDG(49, 31);
-    TDG(49, 33); TDG(49, 35); TDG(49, 37); TDG(49, 39);
-    TDG(49, 41); TDG(49, 43); TDG(49, 45); TDG(49, 47);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 51
     TDG(51,  9); TDG(51, 11); TDG(51, 13); TDG(51, 15);
     TDG(51, 17); TDG(51, 19); TDG(51, 21); TDG(51, 23);
     TDG(51, 25); TDG(51, 27); TDG(51, 29); TDG(51, 31);
-    TDG(51, 33); TDG(51, 35); TDG(51, 37); TDG(51, 39);
-    TDG(51, 41); TDG(51, 43); TDG(51, 45); TDG(51, 47);
-    TDG(51, 49);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 53
     TDG(53,  9); TDG(53, 11); TDG(53, 13); TDG(53, 15);
     TDG(53, 17); TDG(53, 19); TDG(53, 21); TDG(53, 23);
     TDG(53, 25); TDG(53, 27); TDG(53, 29); TDG(53, 31);
-    TDG(53, 33); TDG(53, 35); TDG(53, 37); TDG(53, 39);
-    TDG(53, 41); TDG(53, 43); TDG(53, 45); TDG(53, 47);
-    TDG(53, 49); TDG(53, 51);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 55
     TDG(55,  9); TDG(55, 11); TDG(55, 13); TDG(55, 15);
     TDG(55, 17); TDG(55, 19); TDG(55, 21); TDG(55, 23);
     TDG(55, 25); TDG(55, 27); TDG(55, 29); TDG(55, 31);
-    TDG(55, 33); TDG(55, 35); TDG(55, 37); TDG(55, 39);
-    TDG(55, 41); TDG(55, 43); TDG(55, 45); TDG(55, 47);
-    TDG(55, 49); TDG(55, 51); TDG(55, 53);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 57
     TDG(57,  9); TDG(57, 11); TDG(57, 13); TDG(57, 15);
     TDG(57, 17); TDG(57, 19); TDG(57, 21); TDG(57, 23);
     TDG(57, 25); TDG(57, 27); TDG(57, 29); TDG(57, 31);
-    TDG(57, 33); TDG(57, 35); TDG(57, 37); TDG(57, 39);
-    TDG(57, 41); TDG(57, 43); TDG(57, 45); TDG(57, 47);
-    TDG(57, 49); TDG(57, 51); TDG(57, 53); TDG(57, 55);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 59
     TDG(59,  9); TDG(59, 11); TDG(59, 13); TDG(59, 15);
     TDG(59, 17); TDG(59, 19); TDG(59, 21); TDG(59, 23);
     TDG(59, 25); TDG(59, 27); TDG(59, 29); TDG(59, 31);
-    TDG(59, 33); TDG(59, 35); TDG(59, 37); TDG(59, 39);
-    TDG(59, 41); TDG(59, 43); TDG(59, 45); TDG(59, 47);
-    TDG(59, 49); TDG(59, 51); TDG(59, 53); TDG(59, 55);
-    TDG(59, 57);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 61
     TDG(61,  9); TDG(61, 11); TDG(61, 13); TDG(61, 15);
     TDG(61, 17); TDG(61, 19); TDG(61, 21); TDG(61, 23);
     TDG(61, 25); TDG(61, 27); TDG(61, 29); TDG(61, 31);
-    TDG(61, 33); TDG(61, 35); TDG(61, 37); TDG(61, 39);
-    TDG(61, 41); TDG(61, 43); TDG(61, 45); TDG(61, 47);
-    TDG(61, 49); TDG(61, 51); TDG(61, 53); TDG(61, 55);
-    TDG(61, 57); TDG(61, 59);
 #endif
 #if !defined(FIXED_K) || FIXED_K == 63
     TDG(63,  9); TDG(63, 11); TDG(63, 13); TDG(63, 15);
     TDG(63, 17); TDG(63, 19); TDG(63, 21); TDG(63, 23);
     TDG(63, 25); TDG(63, 27); TDG(63, 29); TDG(63, 31);
-    TDG(63, 33); TDG(63, 35); TDG(63, 37); TDG(63, 39);
-    TDG(63, 41); TDG(63, 43); TDG(63, 45); TDG(63, 47);
-    TDG(63, 49); TDG(63, 51); TDG(63, 53); TDG(63, 55);
-    TDG(63, 57); TDG(63, 59); TDG(63, 61);
 #endif
 #undef TDG
 
