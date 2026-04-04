@@ -83,7 +83,8 @@ int run(const Config& cfg)
             ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
             : fsz * 2;
     }
-    const uint64_t avail      = available_ram_bytes();
+    const uint64_t avail = cfg.ram_budget_bytes > 0
+        ? cfg.ram_budget_bytes : available_ram_bytes();
     const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
 
     // Disk-mode write-buffer budget: up to 30% of RAM across all threads,
@@ -260,7 +261,8 @@ void run_callback(const Config& cfg, Callback&& cb)
             ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
             : fsz * 2;
     }
-    const uint64_t avail   = available_ram_bytes();
+    const uint64_t avail   = cfg.ram_budget_bytes > 0
+        ? cfg.ram_budget_bytes : available_ram_bytes();
     const bool     use_mem = avail > 0 && est_packed < avail * 6 / 10;
 
     PartitionStats stats;

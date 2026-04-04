@@ -22,4 +22,5 @@ struct Config {
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
+    uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
 };

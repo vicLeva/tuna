@@ -61,6 +61,7 @@ struct Options {
     uint32_t    min_count  = 1;     // only yield k-mers with count ≥ min_count
     uint32_t    max_count  = std::numeric_limits<uint32_t>::max(); // ...and ≤ max_count
     uint32_t    partitions = 0;     // 0 = auto-tune (recommended)
+    uint32_t    ram_gb     = 0;     // RAM budget in GB; 0 = auto-detect available RAM
     std::string work_dir;           // "" = auto-managed temp dir, deleted on return
 };
 
@@ -102,11 +103,13 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
     cfg.output_file    = "";
     cfg.k              = k;
     cfg.l              = m;
-    cfg.num_threads    = opts.threads > 0 ? opts.threads : 1;
-    cfg.ci             = opts.min_count;
-    cfg.cx             = opts.max_count;
-    cfg.num_partitions = opts.partitions;
-    cfg.hide_progress  = true;
+    cfg.num_threads       = opts.threads > 0 ? opts.threads : 1;
+    cfg.ci                = opts.min_count;
+    cfg.cx                = opts.max_count;
+    cfg.num_partitions    = opts.partitions;
+    cfg.ram_budget_bytes  = opts.ram_gb > 0
+        ? static_cast<uint64_t>(opts.ram_gb) << 30 : 0;
+    cfg.hide_progress     = true;
 
     static_assert(sizeof(SuperkmerWriter<k, m>) >= 8 && sizeof(SuperkmerWriter<k, m>) <= 64,
                   "SuperkmerWriter size out of expected range");

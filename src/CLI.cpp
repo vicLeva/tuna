@@ -29,6 +29,10 @@ void print_usage(const char* prog)
         "              phase 2: parallel over partitions  (capped at -n)\n"
         "  -ci <int>   minimum k-mer count         [default: 1]\n"
         "  -cx <int>   maximum k-mer count         [default: max]\n"
+        "  -ram <int>  RAM budget in GB            [default: auto-detect available RAM]\n"
+        "              controls in-memory vs disk pipeline selection and write-buffer\n"
+        "              sizing; set lower than physical RAM to leave headroom for other\n"
+        "              processes, or higher to force the in-memory pipeline\n"
         "  -w  <dir>   working directory for temp files\n"
         "              [default: tuna_tmp/ next to output file]\n"
         "\n"
@@ -88,6 +92,9 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         } else if (arg == "-t") {
             const char* v = next_val("-t"); if (!v) return false;
             cfg.num_threads = static_cast<uint32_t>(std::stoul(v));
+        } else if (arg == "-ram") {
+            const char* v = next_val("-ram"); if (!v) return false;
+            cfg.ram_budget_bytes = static_cast<uint64_t>(std::stoul(v)) << 30;
         } else if (arg == "-w") {
             const char* v = next_val("-w"); if (!v) return false;
             cfg.work_dir = v;
