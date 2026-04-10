@@ -33,9 +33,11 @@
 // coverage_hist is aggregated globally and written to debug_min_coverage.csv.
 
 struct PartitionDebugInfo {
+    uint64_t init_sz     = 0;   // initial hash table capacity (slots) at construction
     uint64_t n_inserted  = 0;   // total k-mer insertions (with multiplicity)
+    uint64_t n_unique    = 0;   // unique k-mers stored (table.size() after counting)
     uint64_t n_overflow  = 0;   // insertions that went to overflow table
-    uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots)
+    uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots, after any resizes)
     uint64_t n_buckets   = 0;   // table_cap / B
 
     // Resize events recorded during count_partition for this partition.
@@ -395,6 +397,250 @@ std::pair<uint64_t, uint64_t> count_and_callback(
 }
 
 
+// ─── Debug output helper ──────────────────────────────────────────────────────
+//
+// Called by count_and_write (disk) and count_and_write_mem (in-memory) after
+// all partitions have been processed.  Prints per-partition table stats,
+// aggregate load-factor analysis, resize summary, and minimizer coverage.
+// Also writes to cfg.work_dir:
+//   debug_table_stats.csv   — one row per partition (all partitions)
+//   debug_min_coverage.csv  — minimizer coverage histogram
+
+inline void emit_debug_stats(
+    const std::vector<PartitionDebugInfo>& part_infos,
+    size_t n_parts,
+    const Config& cfg)
+{
+    // ── Per-partition table summary (first 20) ────────────────────────────────
+    std::cerr << "\n[debug] per-partition table stats (first 20):\n";
+    std::cerr << "  part   init_sz   table_cap   n_inserted    n_unique  load%  n_resizes\n";
+    for (size_t p = 0; p < std::min(n_parts, size_t(20)); ++p) {
+        const auto& d = part_infos[p];
+        const double lf = d.table_cap ? 100.0 * d.n_unique / d.table_cap : 0.0;
+        std::cerr << "  " << std::setw(5)  << p
+                  << "  " << std::setw(8)  << d.init_sz
+                  << "  " << std::setw(9)  << d.table_cap
+                  << "  " << std::setw(11) << d.n_inserted
+                  << "  " << std::setw(10) << d.n_unique
+                  << "  " << std::fixed << std::setprecision(1) << std::setw(5) << lf << "%"
+                  << "  " << d.resize_log.size() << "\n";
+    }
+    if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
+
+    // ── Aggregate stats ───────────────────────────────────────────────────────
+    double   sum_lf = 0.0,                    min_lf = 2.0,                    max_lf = -1.0;
+    double   sum_or = 0.0,                    min_or = 1e18,                   max_or = -1e18;
+    uint64_t sum_unique = 0,                  min_unique = static_cast<uint64_t>(-1), max_unique = 0;
+    uint64_t sum_init   = 0,                  min_init   = static_cast<uint64_t>(-1), max_init   = 0;
+    size_t   n_valid = 0, n_nonempty = 0;
+    uint64_t total_resizes = 0;
+    size_t   n_parts_resized = 0;
+
+    for (size_t p = 0; p < n_parts; ++p) {
+        const auto& d = part_infos[p];
+        if (d.table_cap == 0) continue;
+        ++n_valid;
+        const double lf = static_cast<double>(d.n_unique) / d.table_cap;
+        sum_lf     += lf;
+        min_lf      = std::min(min_lf, lf);
+        max_lf      = std::max(max_lf, lf);
+        sum_init   += d.init_sz;
+        min_init    = std::min(min_init, d.init_sz);
+        max_init    = std::max(max_init, d.init_sz);
+        sum_unique += d.n_unique;
+        min_unique  = std::min(min_unique, d.n_unique);
+        max_unique  = std::max(max_unique, d.n_unique);
+        if (d.n_unique > 0) {
+            ++n_nonempty;
+            const double or_ = static_cast<double>(d.init_sz) / d.n_unique;
+            sum_or += or_;
+            min_or  = std::min(min_or, or_);
+            max_or  = std::max(max_or, or_);
+        }
+        if (!d.resize_log.empty()) ++n_parts_resized;
+        total_resizes += d.resize_log.size();
+    }
+
+    if (n_valid > 0) {
+        const double mean_lf     = sum_lf / n_valid;
+        const double mean_or     = n_nonempty ? sum_or    / n_nonempty : 0.0;
+        const double mean_unique = static_cast<double>(sum_unique) / n_valid;
+        const double mean_init   = static_cast<double>(sum_init)   / n_valid;
+
+        std::cerr << "\n[debug] aggregate table stats (" << n_parts << " partitions):\n"
+                  << std::fixed;
+        std::cerr << "  load_factor:    mean=" << std::setprecision(3) << mean_lf
+                  << "  min=" << min_lf << "  max=" << max_lf << "\n";
+        if (n_nonempty > 0)
+            std::cerr << "  oversize_ratio: mean=" << std::setprecision(1) << mean_or
+                      << "  min=" << min_or << "  max=" << max_or
+                      << "  (init_sz / n_unique)\n";
+        std::cerr << "  n_unique/part:  mean=" << std::setprecision(0) << mean_unique
+                  << "  min=" << min_unique << "  max=" << max_unique << "\n";
+        std::cerr << "  init_sz/part:   mean=" << mean_init
+                  << "  min=" << min_init << "  max=" << max_init << "\n";
+
+        // Machine-parseable structured lines (grep-friendly for bench scripts).
+        std::cerr << "dbg_load_mean: "     << std::setprecision(6) << mean_lf    << "\n"
+                  << "dbg_load_min: "      << min_lf                              << "\n"
+                  << "dbg_load_max: "      << max_lf                              << "\n"
+                  << "dbg_oversize_mean: " << std::setprecision(2) << mean_or    << "\n"
+                  << "dbg_unique_mean: "   << std::setprecision(0) << mean_unique << "\n"
+                  << "dbg_n_resizes: "     << total_resizes                       << "\n"
+                  << "dbg_parts_resized: " << n_parts_resized                     << "\n";
+    }
+
+    // ── Per-partition CSV (all partitions) ────────────────────────────────────
+    {
+        const std::string csv_path = cfg.work_dir + "debug_table_stats.csv";
+        std::ofstream csv(csv_path);
+        if (csv) {
+            csv << "partition_id,init_sz,table_cap,n_inserted,n_unique,load_factor,n_resizes,resize_s\n";
+            for (size_t p = 0; p < n_parts; ++p) {
+                const auto& d = part_infos[p];
+                const double lf = d.table_cap
+                    ? static_cast<double>(d.n_unique) / d.table_cap : 0.0;
+                double resize_s = 0.0;
+                for (const auto& ev : d.resize_log) resize_s += ev.elapsed_s;
+                csv << p             << ","
+                    << d.init_sz     << ","
+                    << d.table_cap   << ","
+                    << d.n_inserted  << ","
+                    << d.n_unique    << ","
+                    << std::fixed << std::setprecision(6) << lf << ","
+                    << d.resize_log.size() << ","
+                    << std::setprecision(6) << resize_s << "\n";
+            }
+            std::cerr << "[debug] table stats CSV: " << csv_path << "\n";
+        } else {
+            std::cerr << "[debug] warning: could not write table stats CSV to " << csv_path << "\n";
+        }
+    }
+
+    // ── Resize event summary ──────────────────────────────────────────────────
+    {
+        uint64_t total_resize_events = 0;
+        double   total_resize_s      = 0.0;
+        uint64_t n_ov_triggered      = 0;
+        uint64_t n_load_triggered    = 0;
+        size_t   n_parts_resized_    = 0;
+        double   max_resize_s        = 0.0;
+        size_t   max_resize_part     = 0;
+        uint64_t max_resize_count    = 0;
+        size_t   max_resize_count_part = 0;
+
+        struct PartResizeSummary {
+            size_t   part;
+            uint64_t n_resizes;
+            double   total_s;
+            uint64_t n_ov;
+            uint64_t n_load;
+        };
+        std::vector<PartResizeSummary> summaries;
+
+        for (size_t p = 0; p < n_parts; ++p) {
+            const auto& rlog = part_infos[p].resize_log;
+            if (rlog.empty()) continue;
+            ++n_parts_resized_;
+            PartResizeSummary ps{p, rlog.size(), 0.0, 0, 0};
+            for (const auto& ev : rlog) {
+                ps.total_s += ev.elapsed_s;
+                ps.n_ov    += ev.overflow_triggered ? 1 : 0;
+                ps.n_load  += ev.overflow_triggered ? 0 : 1;
+                if (ev.elapsed_s > max_resize_s) { max_resize_s = ev.elapsed_s; max_resize_part = p; }
+            }
+            total_resize_events += ps.n_resizes;
+            total_resize_s      += ps.total_s;
+            n_ov_triggered      += ps.n_ov;
+            n_load_triggered    += ps.n_load;
+            if (ps.n_resizes > max_resize_count) { max_resize_count = ps.n_resizes; max_resize_count_part = p; }
+            summaries.push_back(ps);
+        }
+
+        std::cerr << "\n[debug] resize summary:\n";
+        std::cerr << "  partitions with resizes : " << n_parts_resized_ << " / " << n_parts << "\n";
+        std::cerr << "  total resize events     : " << total_resize_events << "\n";
+        std::cerr << "  total resize time       : " << std::fixed << std::setprecision(3) << total_resize_s << "s\n";
+        std::cerr << "  overflow-triggered      : " << n_ov_triggered << "\n";
+        std::cerr << "  load-triggered          : " << n_load_triggered << "\n";
+        if (total_resize_events > 0) {
+            std::cerr << "  slowest single resize   : " << std::setprecision(3) << max_resize_s
+                      << "s (part " << max_resize_part << ")\n";
+            std::cerr << "  most resizes in one part: " << max_resize_count
+                      << " (part " << max_resize_count_part << ")\n";
+        }
+
+        if (!summaries.empty()) {
+            std::partial_sort(summaries.begin(),
+                              summaries.begin() + std::min(summaries.size(), size_t(10)),
+                              summaries.end(),
+                              [](const auto& a, const auto& b){ return a.total_s > b.total_s; });
+            const size_t show = std::min(summaries.size(), size_t(10));
+            std::cerr << "\n  top " << show << " partitions by resize cost:\n";
+            std::cerr << "  part   n_resizes  resize_s   n_ov_trig  n_load_trig\n";
+            for (size_t i = 0; i < show; ++i) {
+                const auto& ps = summaries[i];
+                std::cerr << "  " << std::setw(5) << ps.part
+                          << "  " << std::setw(9) << ps.n_resizes
+                          << "  " << std::setprecision(3) << std::setw(9) << ps.total_s
+                          << "  " << std::setw(9) << ps.n_ov
+                          << "  " << std::setw(11) << ps.n_load << "\n";
+                for (const auto& ev : part_infos[ps.part].resize_log)
+                    std::cerr << "           "
+                              << ev.old_cap << "->" << (ev.old_cap * 2)
+                              << "  " << (ev.overflow_triggered ? "ov  " : "load")
+                              << "  " << std::setprecision(3) << ev.elapsed_s << "s"
+                              << "  ov_count=" << ev.ov_count
+                              << "  main_sz=" << ev.main_sz << "\n";
+            }
+        }
+    }
+
+    // ── Minimizer coverage histogram summary ──────────────────────────────────
+    {
+        // Aggregate from per-partition histograms (populated by count_partition when dbg != nullptr).
+        std::unordered_map<uint32_t, uint64_t> global_coverage_hist;
+        for (size_t p = 0; p < n_parts; ++p)
+            for (const auto& [cov, cnt] : part_infos[p].coverage_hist)
+                global_coverage_hist[cov] += cnt;
+
+        if (!global_coverage_hist.empty()) {
+            uint64_t total_minimizers = 0, total_kmers_covered = 0;
+            uint32_t max_cov = 0;
+            for (auto& [cov, cnt] : global_coverage_hist) {
+                total_minimizers    += cnt;
+                total_kmers_covered += static_cast<uint64_t>(cov) * cnt;
+                if (cov > max_cov) max_cov = cov;
+            }
+            const double avg_cov = total_minimizers
+                ? static_cast<double>(total_kmers_covered) / total_minimizers : 0.0;
+
+            std::cerr << "\n[debug] minimizer coverage (k-mers sharing one minimizer):\n";
+            std::cerr << "  unique minimizers tracked : " << total_minimizers << "\n";
+            std::cerr << "  total k-mers covered      : " << total_kmers_covered << "\n";
+            std::cerr << "  avg k-mers / minimizer    : " << std::fixed << std::setprecision(2) << avg_cov << "\n";
+            std::cerr << "  max k-mers / minimizer    : " << max_cov << "\n";
+
+            const std::string csv_path = cfg.work_dir + "debug_min_coverage.csv";
+            std::ofstream csv(csv_path);
+            if (csv) {
+                csv << "coverage,n_minimizers,total_kmers\n";
+                std::vector<std::pair<uint32_t, uint64_t>> sorted(
+                    global_coverage_hist.begin(), global_coverage_hist.end());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                for (auto& [cov, cnt] : sorted)
+                    csv << cov << "," << cnt << ","
+                        << (static_cast<uint64_t>(cov) * cnt) << "\n";
+                std::cerr << "[debug] minimizer coverage CSV written to: " << csv_path << "\n";
+            } else {
+                std::cerr << "[debug] warning: could not write CSV to " << csv_path << "\n";
+            }
+        }
+    }
+}
+
+
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
 // Workers steal partitions round-robin (p = tid, tid+n_threads, …).
@@ -422,8 +668,6 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::atomic<uint64_t>                          ov_total{0};     // total k-mers sent to overflow table
 
     // Debug statistics (only used when cfg.debug_stats).
-    std::mutex                                     dbg_mutex;
-    std::unordered_map<uint32_t, uint64_t>         global_coverage_hist;
     std::vector<PartitionDebugInfo>                part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
 
@@ -451,7 +695,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
             if (dbg) {
+                dbg->init_sz     = init_sz;
                 dbg->n_inserted  = ins;
+                dbg->n_unique    = static_cast<uint64_t>(table.size());
                 dbg->n_overflow  = table.overflow_insert_count();
                 dbg->table_cap   = table.capacity();
                 dbg->n_buckets   = table.bucket_count();
@@ -470,7 +716,6 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 ov_total.fetch_add(ov_cnt, std::memory_order_relaxed);
                 auto top = table.overflow_top_minimizers(20);
                 std::lock_guard<std::mutex> lg(ov_stats_mutex);
-                // Merge into global top list.
                 for(auto& [bin, cnt] : top)
                 {
                     auto it = std::find_if(ov_top_global.begin(), ov_top_global.end(),
@@ -478,13 +723,6 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     if(it != ov_top_global.end()) it->second += cnt;
                     else ov_top_global.emplace_back(bin, cnt);
                 }
-            }
-
-            // Merge debug coverage histogram under lock.
-            if (dbg && !dbg->coverage_hist.empty()) {
-                std::lock_guard<std::mutex> lg(dbg_mutex);
-                for (auto& [cov, cnt] : dbg->coverage_hist)
-                    global_coverage_hist[cov] += cnt;
             }
         }
     };
@@ -521,142 +759,8 @@ std::pair<uint64_t, uint64_t> count_and_write(
                       << "     " << ov_top_global[i].second << "\n";
     }
 
-    // ── Debug output ──────────────────────────────────────────────────────────
-    if (cfg.debug_stats) {
-        // Per-partition table summary.
-        std::cerr << "\n[debug] per-partition table stats (first 20):\n";
-        std::cerr << "  part   n_inserted   n_overflow   ov%      table_cap   n_buckets   avg_k/bucket\n";
-        for (size_t p = 0; p < std::min(n_parts, size_t(20)); ++p) {
-            const auto& d = part_infos[p];
-            const double ov_pct = d.n_inserted ? 100.0 * d.n_overflow / d.n_inserted : 0.0;
-            const double avg_kb = d.n_buckets  ? static_cast<double>(d.n_inserted) / d.n_buckets : 0.0;
-            std::cerr << "  " << std::setw(5) << p
-                      << "  " << std::setw(11) << d.n_inserted
-                      << "  " << std::setw(11) << d.n_overflow
-                      << "  " << std::fixed << std::setprecision(1) << std::setw(6) << ov_pct << "%"
-                      << "  " << std::setw(10) << d.table_cap
-                      << "  " << std::setw(10) << d.n_buckets
-                      << "  " << std::setprecision(1) << std::setw(12) << avg_kb << "\n";
-        }
-        if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
-
-        // ── Resize event summary ───────────────────────────────────────────────
-        {
-            uint64_t total_resize_events = 0;
-            double   total_resize_s      = 0.0;
-            uint64_t n_ov_triggered      = 0;
-            uint64_t n_load_triggered    = 0;
-            size_t   n_parts_resized     = 0;
-            double   max_resize_s        = 0.0;
-            size_t   max_resize_part     = 0;
-            uint64_t max_resize_count    = 0;
-            size_t   max_resize_count_part = 0;
-
-            // Per-partition resize totals for the "top-5 by cost" display.
-            struct PartResizeSummary {
-                size_t   part;
-                uint64_t n_resizes;
-                double   total_s;
-                uint64_t n_ov;
-                uint64_t n_load;
-            };
-            std::vector<PartResizeSummary> summaries;
-
-            for (size_t p = 0; p < n_parts; ++p) {
-                const auto& rlog = part_infos[p].resize_log;
-                if (rlog.empty()) continue;
-                ++n_parts_resized;
-                PartResizeSummary ps{p, rlog.size(), 0.0, 0, 0};
-                for (const auto& ev : rlog) {
-                    ps.total_s += ev.elapsed_s;
-                    ps.n_ov    += ev.overflow_triggered ? 1 : 0;
-                    ps.n_load  += ev.overflow_triggered ? 0 : 1;
-                    if (ev.elapsed_s > max_resize_s) { max_resize_s = ev.elapsed_s; max_resize_part = p; }
-                }
-                total_resize_events += ps.n_resizes;
-                total_resize_s      += ps.total_s;
-                n_ov_triggered      += ps.n_ov;
-                n_load_triggered    += ps.n_load;
-                if (ps.n_resizes > max_resize_count) { max_resize_count = ps.n_resizes; max_resize_count_part = p; }
-                summaries.push_back(ps);
-            }
-
-            std::cerr << "\n[debug] resize summary:\n";
-            std::cerr << "  partitions with resizes : " << n_parts_resized << " / " << n_parts << "\n";
-            std::cerr << "  total resize events     : " << total_resize_events << "\n";
-            std::cerr << "  total resize time       : " << std::fixed << std::setprecision(3) << total_resize_s << "s\n";
-            std::cerr << "  overflow-triggered      : " << n_ov_triggered << "\n";
-            std::cerr << "  load-triggered          : " << n_load_triggered << "\n";
-            if (total_resize_events > 0) {
-                std::cerr << "  slowest single resize   : " << std::setprecision(3) << max_resize_s
-                          << "s (part " << max_resize_part << ")\n";
-                std::cerr << "  most resizes in one part: " << max_resize_count
-                          << " (part " << max_resize_count_part << ")\n";
-            }
-
-            if (!summaries.empty()) {
-                // Sort by total resize time descending — top 10.
-                std::partial_sort(summaries.begin(),
-                                  summaries.begin() + std::min(summaries.size(), size_t(10)),
-                                  summaries.end(),
-                                  [](const auto& a, const auto& b){ return a.total_s > b.total_s; });
-                const size_t show = std::min(summaries.size(), size_t(10));
-                std::cerr << "\n  top " << show << " partitions by resize cost:\n";
-                std::cerr << "  part   n_resizes  resize_s   n_ov_trig  n_load_trig  per-event old_cap→new_cap (trigger, s)\n";
-                for (size_t i = 0; i < show; ++i) {
-                    const auto& ps = summaries[i];
-                    std::cerr << "  " << std::setw(5) << ps.part
-                              << "  " << std::setw(9) << ps.n_resizes
-                              << "  " << std::setprecision(3) << std::setw(9) << ps.total_s
-                              << "  " << std::setw(9) << ps.n_ov
-                              << "  " << std::setw(11) << ps.n_load << "\n";
-                    for (const auto& ev : part_infos[ps.part].resize_log)
-                        std::cerr << "           "
-                                  << ev.old_cap << "->" << (ev.old_cap * 2)
-                                  << "  " << (ev.overflow_triggered ? "ov  " : "load")
-                                  << "  " << std::setprecision(3) << ev.elapsed_s << "s"
-                                  << "  ov_count=" << ev.ov_count
-                                  << "  main_sz=" << ev.main_sz << "\n";
-                }
-            }
-        }
-
-        // Global minimizer coverage histogram summary.
-        if (!global_coverage_hist.empty()) {
-            uint64_t total_minimizers = 0, total_kmers_covered = 0;
-            uint32_t max_cov = 0;
-            for (auto& [cov, cnt] : global_coverage_hist) {
-                total_minimizers   += cnt;
-                total_kmers_covered += static_cast<uint64_t>(cov) * cnt;
-                if (cov > max_cov) max_cov = cov;
-            }
-            const double avg_cov = total_minimizers ? static_cast<double>(total_kmers_covered) / total_minimizers : 0.0;
-
-            std::cerr << "\n[debug] minimizer coverage (k-mers sharing one minimizer):\n";
-            std::cerr << "  unique minimizers tracked : " << total_minimizers << "\n";
-            std::cerr << "  total k-mers covered      : " << total_kmers_covered << "\n";
-            std::cerr << "  avg k-mers / minimizer    : " << std::fixed << std::setprecision(2) << avg_cov << "\n";
-            std::cerr << "  max k-mers / minimizer    : " << max_cov << "\n";
-
-            // Write full histogram to CSV.
-            const std::string csv_path = cfg.work_dir + "debug_min_coverage.csv";
-            std::ofstream csv(csv_path);
-            if (csv) {
-                csv << "coverage,n_minimizers,total_kmers\n";
-                // Sort by coverage for readability.
-                std::vector<std::pair<uint32_t, uint64_t>> sorted(
-                    global_coverage_hist.begin(), global_coverage_hist.end());
-                std::sort(sorted.begin(), sorted.end(),
-                          [](const auto& a, const auto& b){ return a.first < b.first; });
-                for (auto& [cov, cnt] : sorted)
-                    csv << cov << "," << cnt << ","
-                        << (static_cast<uint64_t>(cov) * cnt) << "\n";
-                std::cerr << "[debug] minimizer coverage CSV written to: " << csv_path << "\n";
-            } else {
-                std::cerr << "[debug] warning: could not write CSV to " << csv_path << "\n";
-            }
-        }
-    }
+    if (cfg.debug_stats)
+        emit_debug_stats(part_infos, n_parts, cfg);
 
     return { total_inserted.load(), total_written.load() };
 }
@@ -684,9 +788,11 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
-
-    std::mutex            ov_stats_mutex;
     std::atomic<uint64_t> ov_total{0};
+
+    // Debug statistics (only used when cfg.debug_stats).
+    std::vector<PartitionDebugInfo> part_infos;
+    if (cfg.debug_stats) part_infos.resize(n_parts);
 
     auto worker = [&](size_t tid) {
         typename table_t::Token token;
@@ -699,21 +805,32 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
-                size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
+                size_t(1u << 12),   // min 4K slots → 256 buckets minimum
                 size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
+
+            PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
 
             uint64_t ins;
             {
                 MemoryReader<k, m> reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
+                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token, dbg);
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }
 
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
-
             ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
+
+            if (dbg) {
+                dbg->init_sz     = init_sz;
+                dbg->n_inserted  = ins;
+                dbg->n_unique    = static_cast<uint64_t>(table.size());
+                dbg->n_overflow  = table.overflow_insert_count();
+                dbg->table_cap   = table.capacity();
+                dbg->n_buckets   = table.bucket_count();
+                dbg->resize_log  = table.resize_log();
+            }
 
             const uint64_t wrt = kff_out
                 ? write_counts_kff<k, m>(table, cfg, *kff_out)
@@ -730,6 +847,9 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
     if (ov_total.load() > 0)
         std::cerr << "[overflow] " << ov_total.load() << " k-mers went to overflow\n";
+
+    if (cfg.debug_stats)
+        emit_debug_stats(part_infos, n_parts, cfg);
 
     return { total_inserted.load(), total_written.load() };
 }

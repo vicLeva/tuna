@@ -166,9 +166,11 @@ int run(const Config& cfg)
             std::cerr << "      " << total_inserted << " k-mers in  "
                       << total_written << " unique out  " << fmt_s(t_phase2) << "\n";
 
-        std::cerr << "phase1: "     << t_phase1        << "s\n"
-                  << "phase2: "     << t_phase2        << "s\n"
-                  << "superkmers: " << stats.superkmers << "\n";
+        std::cerr << "phase1: "        << t_phase1            << "s\n"
+                  << "phase2: "        << t_phase2            << "s\n"
+                  << "superkmers: "    << stats.superkmers     << "\n"
+                  << "n_parts: "       << cfg.num_partitions   << "\n"
+                  << "unique_kmers: "  << total_written        << "\n";
         if (!cfg.hide_progress)
             std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
         return 0;
