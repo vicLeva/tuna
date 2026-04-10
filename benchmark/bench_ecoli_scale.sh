@@ -1,61 +1,57 @@
 #!/usr/bin/env bash
-# bench_ecoli_scale.sh — how does tuna performance scale with number of E. coli files?
+# bench_ecoli_scale.sh — tuna vs KMC scaling with number of E. coli files
 #
-# Hypothesis: the n_throughput floor in auto_tune_partitions grows O(N files)
-# even when unique k-mer content doesn't (same species, high overlap).
-# This causes over-partitioning and over-sized/under-used hash tables.
+# For each N in N_FILES_LIST, runs both tuna and KMC on the first N files
+# of the E. coli dataset, collecting timing, RSS, and (for tuna) per-partition
+# table diagnostics.
 #
-# Usage: bash bench_ecoli_scale.sh [THREADS] [K] [M]
-# Example: bash bench_ecoli_scale.sh 8 31 21
+# Usage: bash bench_ecoli_scale.sh [THREADS] [K] [M] [KMC_RAM_GB]
+# Example: bash bench_ecoli_scale.sh 8 31 21 250
 #
-# Output:
-#   $RESULTS/bench_scale.csv        — one row per N_FILES run
-#   $RESULTS/table_stats_N.csv      — per-partition table stats for each N
-#   $RESULTS/<tag>.stderr           — full tuna stderr (timing + debug)
+# Output (all under $RESULTS/):
+#   bench_scale.csv              — one row per (tool, N)
+#   table_stats_N<N>.csv         — tuna per-partition stats for each N
+#   ecoli_n<N>.{tuna,kmc}.stderr — raw tool output
 #
 # All intermediate files go under $WORK — never /tmp.
 
-set -euo pipefail
+set -uo pipefail
 
 THREADS=${1:-8}
 K=${2:-31}
 M=${3:-21}
+KMC_RAM=${4:-250}     # GB passed to KMC -m flag
 
 TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
+KMC=kmc
+KMC_DUMP=kmc_dump
 FOF=/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list
 WORK=/WORKS/vlevallois/test_tuna/ecoli_scale
 RESULTS="$WORK/results_$(date +%Y%m%d_%H%M%S)"
 
 mkdir -p "$RESULTS"
 
-# Files to test — geometric progression covering 1..full dataset.
-# Adjust or extend based on how many files exist in the fof.
 N_FILES_LIST=(1 2 5 10 20 50 100 200 500 1000 2000 3600)
 
-# ── Validate inputs ────────────────────────────────────────────────────────────
+# ── Validate ──────────────────────────────────────────────────────────────────
 
-if [ ! -f "$FOF" ]; then
-    echo "ERROR: fof not found: $FOF"
-    exit 1
-fi
-if [ ! -x "$TUNA" ]; then
-    echo "ERROR: tuna binary not found or not executable: $TUNA"
-    exit 1
-fi
+[ -f "$FOF" ]    || { echo "ERROR: fof not found: $FOF"; exit 1; }
+[ -x "$TUNA" ]   || { echo "ERROR: tuna binary not found: $TUNA"; exit 1; }
+command -v "$KMC" >/dev/null || { echo "ERROR: kmc not in PATH"; exit 1; }
 
 TOTAL_FILES=$(wc -l < "$FOF")
-echo "=== E. coli scale experiment ==="
-echo "    k=$K  m=$M  threads=$THREADS"
+echo "=== E. coli scale experiment: tuna vs KMC ==="
+echo "    k=$K  m=$M  threads=$THREADS  kmc_ram=${KMC_RAM}GB"
 echo "    fof: $FOF  ($TOTAL_FILES files total)"
 echo "    results: $RESULTS"
 echo ""
 
-# ── CSV header ────────────────────────────────────────────────────────────────
+# ── CSV ───────────────────────────────────────────────────────────────────────
 
 CSV="$RESULTS/bench_scale.csv"
-echo "n_files,n_parts,wall_s,rss_mb,phase1_s,phase2_s,unique_kmers,\
-dbg_load_mean,dbg_load_min,dbg_load_max,dbg_oversize_mean,dbg_unique_mean,\
-dbg_n_resizes,dbg_parts_resized" > "$CSV"
+echo "tool,n_files,wall_s,rss_mb,phase1_s,phase2_s,unique_kmers,\
+n_parts,dbg_load_mean,dbg_load_min,dbg_load_max,\
+dbg_oversize_mean,dbg_unique_mean,dbg_n_resizes,dbg_parts_resized" > "$CSV"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,78 +66,142 @@ rss_mb() {
     awk "BEGIN{printf \"%.0f\", $kb/1024}"
 }
 
-parse_stderr() {
+wall_from_file() {
+    local t
+    t=$(grep "Elapsed (wall clock)" "$1" | awk '{print $NF}')
+    wall_to_s "$t"
+}
+
+parse_tuna() {   # parse_tuna <stderr_file> <key>   strips trailing 's'
     local f="$1" key="$2"
     grep "^${key}:" "$f" | awk -F': ' '{gsub(/s$/,"",$2); print $2}' | head -1
+}
+
+# ── run_tuna <tag> <fof_path> ─────────────────────────────────────────────────
+
+run_tuna() {
+    local tag="$1" fof="$2" n="$3"
+    local tuna_work="$WORK/tuna_work_${tag}"
+    local stderr_f="$RESULTS/${tag}.tuna.stderr"
+    local time_f="$RESULTS/${tag}.tuna.timefile"
+
+    mkdir -p "$tuna_work"
+
+    /usr/bin/time -v -o "$time_f" \
+        "$TUNA" -k "$K" -m "$M" -t "$THREADS" \
+        -w "$tuna_work/" -hp -dbg -kt \
+        "@${fof}" /dev/null \
+        2>"$stderr_f" || {
+            echo "  [tuna FAIL] check $stderr_f"
+            rm -rf "$tuna_work"
+            return 1
+        }
+
+    local wall rss p1 p2 n_parts unique
+    wall=$(wall_from_file "$time_f")
+    rss=$(rss_mb "$time_f")
+    p1=$(parse_tuna "$stderr_f" "phase1")
+    p2=$(parse_tuna "$stderr_f" "phase2")
+    n_parts=$(parse_tuna "$stderr_f" "n_parts")
+    unique=$(parse_tuna "$stderr_f" "unique_kmers")
+
+    local load_mean load_min load_max ov_mean uq_mean n_resizes parts_resized
+    load_mean=$(parse_tuna "$stderr_f" "dbg_load_mean")
+    load_min=$(parse_tuna  "$stderr_f" "dbg_load_min")
+    load_max=$(parse_tuna  "$stderr_f" "dbg_load_max")
+    ov_mean=$(parse_tuna   "$stderr_f" "dbg_oversize_mean")
+    uq_mean=$(parse_tuna   "$stderr_f" "dbg_unique_mean")
+    n_resizes=$(parse_tuna "$stderr_f" "dbg_n_resizes")
+    parts_resized=$(parse_tuna "$stderr_f" "dbg_parts_resized")
+
+    # Copy per-partition CSV.
+    local table_csv="$tuna_work/debug_table_stats.csv"
+    [ -f "$table_csv" ] && cp "$table_csv" "$RESULTS/table_stats_N${n}.csv" \
+        || echo "  [tuna] WARN: debug_table_stats.csv not found"
+
+    rm -rf "$tuna_work"
+
+    echo "  [tuna]  wall=${wall}s  p1=${p1}s  p2=${p2}s  RSS=${rss}MB  n_parts=${n_parts}  unique=${unique}"
+
+    echo "tuna,${n},${wall},${rss},${p1},${p2},${unique},\
+${n_parts},${load_mean},${load_min},${load_max},\
+${ov_mean},${uq_mean},${n_resizes},${parts_resized}" >> "$CSV"
+}
+
+# ── run_kmc <tag> <fof_path> ──────────────────────────────────────────────────
+# KMC phase1 = counting, phase2 = kmc_dump (scan all unique k-mers to output).
+# Both phases write to /dev/null or temp to keep I/O fair with tuna.
+# Unique k-mer count is parsed from KMC's own log (avoids writing a 6 GB dump).
+
+run_kmc() {
+    local tag="$1" fof="$2" n="$3"
+    local kmc_db="$WORK/kmc_db_${tag}"
+    local kmc_tmp="$WORK/kmc_tmp_${tag}"
+    local kmc_log="$RESULTS/${tag}.kmc.log"
+    local kmc_time_f="$RESULTS/${tag}.kmc.timefile"
+    local dump_time_f="$RESULTS/${tag}.kmc_dump.timefile"
+
+    mkdir -p "$kmc_tmp"
+
+    # Phase 1: count k-mers.
+    /usr/bin/time -v -o "$kmc_time_f" \
+        "$KMC" -k"$K" -m"$KMC_RAM" -ci1 -fm -t"$THREADS" \
+        "@${fof}" "$kmc_db" "$kmc_tmp" \
+        >"$kmc_log" 2>&1 || {
+            echo "  [kmc  FAIL] check $kmc_log"
+            rm -rf "$kmc_tmp" "${kmc_db}.kmc_pre" "${kmc_db}.kmc_suf"
+            return 1
+        }
+    rm -rf "$kmc_tmp"
+
+    # Parse unique k-mer count from KMC log (avoids writing the full dump to disk).
+    local unique
+    unique=$(grep -i "unique k-mers" "$kmc_log" | grep -v "below\|above" \
+             | awk '{print $NF}' | head -1)
+    [ -z "$unique" ] && unique=$(grep -i "No\. of unique" "$kmc_log" \
+             | awk '{print $NF}' | head -1)
+    [ -z "$unique" ] && unique=0
+
+    # Phase 2: dump to /dev/null — measures time to scan and format all k-mers.
+    /usr/bin/time -v -o "$dump_time_f" \
+        "$KMC_DUMP" -ci1 "$kmc_db" /dev/null \
+        >>"$kmc_log" 2>&1 || {
+            echo "  [kmc_dump FAIL] check $kmc_log"
+        }
+
+    rm -f "${kmc_db}.kmc_pre" "${kmc_db}.kmc_suf"
+
+    local p1 p2 wall rss
+    p1=$(wall_from_file "$kmc_time_f")
+    p2=$(wall_from_file "$dump_time_f")
+    wall=$(awk "BEGIN{printf \"%.3f\", $p1 + $p2}")
+    rss=$(rss_mb "$kmc_time_f")
+
+    echo "  [kmc]   wall=${wall}s  count=${p1}s  dump=${p2}s  RSS=${rss}MB  unique=${unique}"
+
+    echo "kmc,${n},${wall},${rss},${p1},${p2},${unique},\
+na,na,na,na,na,na,na,na" >> "$CSV"
 }
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 for N in "${N_FILES_LIST[@]}"; do
 
-    # Cap at actual number of available files.
     if [ "$N" -gt "$TOTAL_FILES" ]; then
         echo "  [SKIP] N=$N > available files ($TOTAL_FILES)"
         continue
     fi
 
     TAG="ecoli_n$(printf '%05d' $N)"
-    TUNA_WORK="$WORK/work_${TAG}"
     TEMP_FOF="$WORK/fof_${TAG}.list"
-
-    # Build temp fof with first N files.
-    mkdir -p "$TUNA_WORK"
     head -n "$N" "$FOF" > "$TEMP_FOF"
 
     echo "── N=$N files ──────────────────────────────────────────────────────────────"
 
-    # Run tuna with -dbg to get per-partition stats, -kt to keep work dir for CSV.
-    /usr/bin/time -v -o "$RESULTS/${TAG}.timefile" \
-        "$TUNA" -k "$K" -m "$M" -t "$THREADS" \
-        -w "$TUNA_WORK/" -hp -dbg -kt \
-        "@${TEMP_FOF}" /dev/null \
-        2>"$RESULTS/${TAG}.stderr" || {
-            echo "  [FAIL] tuna failed — check $RESULTS/${TAG}.stderr"
-            rm -f "$TEMP_FOF"
-            continue
-        }
+    run_tuna "$TAG" "$TEMP_FOF" "$N" || true
+    run_kmc  "$TAG" "$TEMP_FOF" "$N" || true
 
-    # Parse timing from stderr.
-    WALL=$(wall_to_s "$(grep 'Elapsed (wall clock)' "$RESULTS/${TAG}.timefile" | awk '{print $NF}')")
-    RSS=$(rss_mb "$RESULTS/${TAG}.timefile")
-    P1=$(parse_stderr "$RESULTS/${TAG}.stderr" "phase1")
-    P2=$(parse_stderr "$RESULTS/${TAG}.stderr" "phase2")
-    N_PARTS=$(parse_stderr "$RESULTS/${TAG}.stderr" "n_parts")
-    UNIQUE=$(parse_stderr "$RESULTS/${TAG}.stderr" "unique_kmers")
-
-    # Parse debug aggregate lines.
-    DBG_LOAD_MEAN=$(parse_stderr "$RESULTS/${TAG}.stderr" "dbg_load_mean")
-    DBG_LOAD_MIN=$(parse_stderr  "$RESULTS/${TAG}.stderr" "dbg_load_min")
-    DBG_LOAD_MAX=$(parse_stderr  "$RESULTS/${TAG}.stderr" "dbg_load_max")
-    DBG_OV_MEAN=$(parse_stderr   "$RESULTS/${TAG}.stderr" "dbg_oversize_mean")
-    DBG_UQ_MEAN=$(parse_stderr   "$RESULTS/${TAG}.stderr" "dbg_unique_mean")
-    DBG_RESIZES=$(parse_stderr   "$RESULTS/${TAG}.stderr" "dbg_n_resizes")
-    DBG_PARTS_R=$(parse_stderr   "$RESULTS/${TAG}.stderr" "dbg_parts_resized")
-
-    # Copy per-partition CSV from work dir.
-    TABLE_CSV="$TUNA_WORK/debug_table_stats.csv"
-    if [ -f "$TABLE_CSV" ]; then
-        cp "$TABLE_CSV" "$RESULTS/table_stats_N${N}.csv"
-    else
-        echo "  [WARN] debug_table_stats.csv not found in $TUNA_WORK"
-    fi
-
-    # Cleanup.
-    rm -rf "$TUNA_WORK" "$TEMP_FOF"
-
-    echo "  n_parts=$N_PARTS  wall=${WALL}s  p1=${P1}s  p2=${P2}s  RSS=${RSS}MB"
-    echo "  load: mean=${DBG_LOAD_MEAN}  min=${DBG_LOAD_MIN}  max=${DBG_LOAD_MAX}"
-    echo "  oversize_mean=${DBG_OV_MEAN}  unique_mean=${DBG_UQ_MEAN}  resizes=${DBG_RESIZES}"
-
-    echo "${N},${N_PARTS},${WALL},${RSS},${P1},${P2},${UNIQUE},\
-${DBG_LOAD_MEAN},${DBG_LOAD_MIN},${DBG_LOAD_MAX},${DBG_OV_MEAN},${DBG_UQ_MEAN},\
-${DBG_RESIZES},${DBG_PARTS_R}" >> "$CSV"
-
+    rm -f "$TEMP_FOF"
     echo ""
 done
 
@@ -150,5 +210,4 @@ done
 echo "=== Done ==="
 echo "Results: $RESULTS"
 echo ""
-echo "bench_scale.csv:"
 column -t -s, "$CSV"
