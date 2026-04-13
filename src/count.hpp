@@ -324,11 +324,10 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
         typename table_t::Token token;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            const size_t n_files  = cfg.input_files.size();
-            const size_t per_part = (total_kmers > 0 && n_files <= 10)  // estimated unique k-mers per partition
+            const size_t per_part = (total_kmers > 0)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));  // initial table size (slots)
+            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
             table_t table(init_sz, 1);
 
             uint64_t ins;  // k-mers inserted into this partition
@@ -372,8 +371,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
-            const size_t n_files  = cfg.input_files.size();
-            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+            const size_t per_part = (total_kmers > 0)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
@@ -644,8 +642,9 @@ inline void emit_debug_stats(
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
 // Workers steal partitions round-robin (p = tid, tid+n_threads, …).
-// init_sz = clamp(2 × total_kmers/n_parts, 256K, 4M) for single-file runs;
-// falls back to 128M/n_parts for multi-file runs (where total counts duplicates).
+// init_sz = clamp(2 × total_kmers/n_parts, 4K, 4M).
+// total_kmers counts all occurrences (with multiplicity), so 2× gives headroom
+// for the unique fraction without oversizing beyond the 4M cap.
 
 template <uint16_t k, uint16_t m>
 std::pair<uint64_t, uint64_t> count_and_write(
@@ -677,11 +676,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
-            // Dynamic init_sz: 2× estimated unique k-mers per partition.
-            // Only use total_kmers when n_files ≤ 10: for multi-file runs total_kmers
-            // counts duplicates across files (total >> unique), over-sizing the table.
-            const size_t n_files = cfg.input_files.size();
-            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+            const size_t per_part = (total_kmers > 0)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
@@ -799,8 +794,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            const size_t n_files = cfg.input_files.size();
-            const size_t per_part = (total_kmers > 0 && n_files <= 10)
+            const size_t per_part = (total_kmers > 0)
                 ? static_cast<size_t>(total_kmers / n_parts) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(

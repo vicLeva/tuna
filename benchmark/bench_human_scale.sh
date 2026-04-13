@@ -5,8 +5,9 @@
 # of the human dataset, collecting timing, RSS, and (for tuna) per-partition
 # table diagnostics.
 #
-# Usage: bash bench_human_scale.sh [THREADS] [K] [M] [KMC_RAM_GB]
-# Example: bash bench_human_scale.sh 8 31 21 250
+# Usage: bash bench_human_scale.sh [THREADS] [K] [M]
+# Example: bash bench_human_scale.sh 8 31 21
+# KMC results are hardcoded (results_20260410_145334). Re-run KMC manually if needed.
 #
 # Output (all under $RESULTS/):
 #   bench_scale.csv              — one row per (tool, N)
@@ -20,11 +21,7 @@ set -uo pipefail
 THREADS=${1:-8}
 K=${2:-31}
 M=${3:-21}
-KMC_RAM=${4:-250}     # GB passed to KMC -m flag
-
 TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
-KMC=kmc
-KMC_DUMP=kmc_dump
 FOF=/WORKS/vlevallois/data/dataset_genome_human/fof.list
 WORK=/WORKS/vlevallois/test_tuna/human_scale
 RESULTS="$WORK/results_$(date +%Y%m%d_%H%M%S)"
@@ -37,11 +34,10 @@ N_FILES_LIST=(1 2 3 5 10 15 20)
 
 [ -f "$FOF" ]    || { echo "ERROR: fof not found: $FOF"; exit 1; }
 [ -x "$TUNA" ]   || { echo "ERROR: tuna binary not found: $TUNA"; exit 1; }
-command -v "$KMC" >/dev/null || { echo "ERROR: kmc not in PATH"; exit 1; }
 
 TOTAL_FILES=$(wc -l < "$FOF")
-echo "=== Human genome scale experiment: tuna vs KMC ==="
-echo "    k=$K  m=$M  threads=$THREADS  kmc_ram=${KMC_RAM}GB"
+echo "=== Human genome scale experiment: tuna vs KMC (KMC cached) ==="
+echo "    k=$K  m=$M  threads=$THREADS"
 echo "    fof: $FOF  ($TOTAL_FILES files total)"
 echo "    results: $RESULTS"
 echo ""
@@ -128,55 +124,24 @@ ${n_parts},${load_mean},${load_min},${load_max},\
 ${ov_mean},${uq_mean},${n_resizes},${parts_resized}" >> "$CSV"
 }
 
-# ── run_kmc <tag> <fof_path> <n> ─────────────────────────────────────────────
+# ── KMC cached results (results_20260410_145334, k=31 m=21 t=8) ──────────────
+# Hardcoded to avoid re-running KMC (each run costs ~10 min/file).
+# Re-run KMC and update these if k, m, threads, or dataset changes.
 
-run_kmc() {
-    local tag="$1" fof="$2" n="$3"
-    local kmc_db="$WORK/kmc_db_${tag}"
-    local kmc_tmp="$WORK/kmc_tmp_${tag}"
-    local kmc_log="$RESULTS/${tag}.kmc.log"
-    local kmc_time_f="$RESULTS/${tag}.kmc.timefile"
-    local dump_time_f="$RESULTS/${tag}.kmc_dump.timefile"
+declare -A KMC_WALL=( [1]=154.010 [2]=176.620 [3]=202.660 [5]=261.630 [10]=375.760 [15]=481.230 [20]=599.410 )
+declare -A KMC_RSS=(  [1]=46741   [2]=91888   [3]=138214  [5]=222290  [10]=238471  [15]=238493  [20]=238529  )
+declare -A KMC_P1=(   [1]=29.130  [2]=47.340  [3]=71.480  [5]=126.860 [10]=231.760 [15]=336.790 [20]=449.960 )
+declare -A KMC_P2=(   [1]=124.880 [2]=129.280 [3]=131.180 [5]=134.770 [10]=144.000 [15]=144.440 [20]=149.450 )
+declare -A KMC_UNQ=(  [1]=2496813618 [2]=2581788018 [3]=2625336481 [5]=2666269605 [10]=2724704476 [15]=2767924604 [20]=2796306069 )
 
-    mkdir -p "$kmc_tmp"
-
-    # Phase 1: count k-mers.
-    /usr/bin/time -v -o "$kmc_time_f" \
-        "$KMC" -k"$K" -m"$KMC_RAM" -ci1 -fm -t"$THREADS" \
-        "@${fof}" "$kmc_db" "$kmc_tmp" \
-        >"$kmc_log" 2>&1 || {
-            echo "  [kmc  FAIL] check $kmc_log"
-            rm -rf "$kmc_tmp" "${kmc_db}.kmc_pre" "${kmc_db}.kmc_suf"
-            return 1
-        }
-    rm -rf "$kmc_tmp"
-
-    # Parse unique k-mer count from KMC log.
-    local unique
-    unique=$(grep -i "unique k-mers" "$kmc_log" | grep -v "below\|above" \
-             | awk '{print $NF}' | head -1)
-    [ -z "$unique" ] && unique=$(grep -i "No\. of unique" "$kmc_log" \
-             | awk '{print $NF}' | head -1)
-    [ -z "$unique" ] && unique=0
-
-    # Phase 2: dump to /dev/null — measures time to scan and format all k-mers.
-    /usr/bin/time -v -o "$dump_time_f" \
-        "$KMC_DUMP" -ci1 "$kmc_db" /dev/null \
-        >>"$kmc_log" 2>&1 || {
-            echo "  [kmc_dump FAIL] check $kmc_log"
-        }
-
-    rm -f "${kmc_db}.kmc_pre" "${kmc_db}.kmc_suf"
-
-    local p1 p2 wall rss
-    p1=$(wall_from_file "$kmc_time_f")
-    p2=$(wall_from_file "$dump_time_f")
-    wall=$(awk "BEGIN{printf \"%.3f\", $p1 + $p2}")
-    rss=$(rss_mb "$kmc_time_f")
-
-    echo "  [kmc]   wall=${wall}s  count=${p1}s  dump=${p2}s  RSS=${rss}MB  unique=${unique}"
-
-    echo "kmc,${n},${wall},${rss},${p1},${p2},${unique},\
+emit_kmc_cached() {
+    local n="$1"
+    if [ -z "${KMC_WALL[$n]+x}" ]; then
+        echo "  [kmc]   no cached result for N=$n — skipping"
+        return
+    fi
+    echo "  [kmc]   wall=${KMC_WALL[$n]}s  count=${KMC_P1[$n]}s  dump=${KMC_P2[$n]}s  RSS=${KMC_RSS[$n]}MB  unique=${KMC_UNQ[$n]}  (cached)"
+    echo "kmc,${n},${KMC_WALL[$n]},${KMC_RSS[$n]},${KMC_P1[$n]},${KMC_P2[$n]},${KMC_UNQ[$n]},\
 na,na,na,na,na,na,na,na" >> "$CSV"
 }
 
@@ -195,8 +160,8 @@ for N in "${N_FILES_LIST[@]}"; do
 
     echo "── N=$N files ──────────────────────────────────────────────────────────────"
 
-    run_tuna "$TAG" "$TEMP_FOF" "$N" || true
-    run_kmc  "$TAG" "$TEMP_FOF" "$N" || true
+    run_tuna       "$TAG" "$TEMP_FOF" "$N" || true
+    emit_kmc_cached "$N"
 
     rm -f "$TEMP_FOF"
     echo ""
