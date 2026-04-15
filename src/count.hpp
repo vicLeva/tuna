@@ -26,6 +26,7 @@
 #include <vector>
 #include <exception>
 #include <stdexcept>
+#include <charconv>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -177,6 +178,7 @@ uint64_t write_counts(
     std::mutex&     out_mutex)
 {
     constexpr size_t WRITE_BATCH = 1u << 20; // 1 MB
+    if (chunk.capacity() < WRITE_BATCH + 64) chunk.reserve(WRITE_BATCH + 64);
 
     const auto flush_chunk = [&]() {
         std::lock_guard<std::mutex> g(out_mutex);
@@ -193,7 +195,10 @@ uint64_t write_counts(
         entry.first.get_label(label);
         chunk += label;
         chunk += '\t';
-        chunk += std::to_string(cnt);
+        char cnt_buf[32];
+        const auto [ptr, ec] = std::to_chars(std::begin(cnt_buf), std::end(cnt_buf), cnt);
+        if (ec == std::errc()) chunk.append(cnt_buf, ptr);
+        else chunk += std::to_string(cnt);
         chunk += '\n';
         ++written;
         if (chunk.size() >= WRITE_BATCH) flush_chunk();
@@ -217,15 +222,6 @@ uint64_t write_counts_kff(
     constexpr size_t KMER_BYTES  = (k + 3) / 4;                            // bytes per k-mer (2-bit packed)
     constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);  // k-mers per KFF write batch
 
-    // Lookup table: ASCII → 2-bit value (A=0, C=1, G=2, T=3).
-    static constexpr std::array<uint8_t, 256> B2B = []() constexpr {
-        std::array<uint8_t, 256> t{};
-        t['C'] = t['c'] = 1;
-        t['G'] = t['g'] = 2;
-        t['T'] = t['t'] = 3;
-        return t;
-    }();
-
     std::vector<uint8_t>  seq_buf;
     std::vector<uint32_t> cnt_buf;
     seq_buf.reserve(BATCH_KMERS * KMER_BYTES);
@@ -239,20 +235,16 @@ uint64_t write_counts_kff(
         }
     };
 
-    std::string label;
     uint64_t written = 0;
 
     table.for_each([&](const auto& entry) {
         const uint64_t cnt = entry.second;
         if (cnt < cfg.ci || cnt > cfg.cx) return;
 
-        entry.first.get_label(label);
-
         // Pack label into 2-bit bytes (MSB = first base).
         seq_buf.resize(seq_buf.size() + KMER_BYTES, 0);
         uint8_t* dst = seq_buf.data() + seq_buf.size() - KMER_BYTES;
-        for (size_t i = 0; i < k; ++i)
-            dst[i >> 2] |= B2B[(uint8_t)label[i]] << (6 - 2 * (i & 3));
+        entry.first.write_packed_2bit_msb(dst);
 
         cnt_buf.push_back(static_cast<uint32_t>(cnt));
         ++written;
@@ -319,31 +311,46 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    std::atomic<size_t> next_part{0};
 
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex worker_error_mutex;
 
-    auto worker = [&](size_t tid) {
-        typename table_t::Token token;
+    auto worker = [&](size_t /*tid*/) {
+        try {
+            typename table_t::Token token;
 
-        for (size_t p = tid; p < n_parts; p += n_threads) {
-            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                ? cfg.input_files.size() : 1;
-            const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
-            table_t table(init_sz, 1);
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
+                if (p >= n_parts) break;
+                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                    ? cfg.input_files.size() : 1;
+                const size_t per_part = (total_kmers > 0)
+                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                    : size_t(1u << 27) / n_parts;
+                const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
+                table_t table(init_sz, 1);
 
-            uint64_t ins;  // k-mers inserted into this partition
-            {
-                MemoryReader<k, m> reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
+                uint64_t ins;  // k-mers inserted into this partition
+                {
+                    MemoryReader<k, m> reader(part_bufs[p]);
+                    ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
+                }
+                { std::string tmp; part_bufs[p].swap(tmp); }
+                total_inserted.fetch_add(ins, std::memory_order_relaxed);
+
+                const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);  // k-mers written to output
+                total_written.fetch_add(wrt, std::memory_order_relaxed);
             }
-            { std::string tmp; part_bufs[p].swap(tmp); }
-            total_inserted.fetch_add(ins, std::memory_order_relaxed);
-
-            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);  // k-mers written to output
-            total_written.fetch_add(wrt, std::memory_order_relaxed);
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(worker_error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
         }
     };
 
@@ -352,6 +359,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
 
     return { total_inserted.load(), total_written.load() };
 }
@@ -367,18 +375,21 @@ std::pair<uint64_t, uint64_t> count_and_callback(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    std::atomic<size_t> next_part{0};
 
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
     std::atomic<bool> stop{false};
     std::exception_ptr worker_error = nullptr;
     std::mutex worker_error_mutex;
 
-    auto worker = [&](size_t tid) {
+    auto worker = [&](size_t /*tid*/) {
         try {
             typename table_t::Token token;
 
-            for (size_t p = tid; p < n_parts; p += n_threads) {
+            while (true) {
                 if (stop.load(std::memory_order_relaxed)) break;
+                const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
+                if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
                 SuperkmerReader<k, m> reader(path);
                 if (!reader.ok())
@@ -679,6 +690,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    std::atomic<size_t> next_part{0};
 
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
@@ -695,13 +707,15 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::vector<PartitionDebugInfo>                part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
 
-    auto worker = [&](size_t tid) {
+    auto worker = [&](size_t /*tid*/) {
         try {
             typename table_t::Token token;
             std::string chunk;
 
-            for (size_t p = tid; p < n_parts; p += n_threads) {
+            while (true) {
                 if (stop.load(std::memory_order_relaxed)) break;
+                const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
+                if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
                 SuperkmerReader<k, m> reader(path);
                 if (!reader.ok())
@@ -820,6 +834,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    std::atomic<size_t> next_part{0};
 
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
@@ -829,11 +844,13 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     std::vector<PartitionDebugInfo> part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
 
-    auto worker = [&](size_t tid) {
+    auto worker = [&](size_t /*tid*/) {
         typename table_t::Token token;
         std::string chunk;
 
-        for (size_t p = tid; p < n_parts; p += n_threads) {
+        while (true) {
+            const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
+            if (p >= n_parts) break;
             const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
                 ? cfg.input_files.size() : 1;
             const size_t per_part = (total_kmers > 0)
