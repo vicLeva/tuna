@@ -223,15 +223,6 @@ int run(const Config& cfg)
         std::cerr << "[2/2] counting  (" << p2_threads << " thread"
                   << (p2_threads > 1 ? "s" : "") << ") ...\n";
 
-    for (size_t p = 0; p < cfg.num_partitions; ++p) {
-        SuperkmerReader<k, m> check_reader(partition_path(cfg.work_dir, p));
-        if (!check_reader.ok()) {
-            std::cerr << "tuna: error: cannot open partition file for reading: "
-                      << partition_path(cfg.work_dir, p) << "\n";
-            return 1;
-        }
-    }
-
     const auto t2 = std::chrono::steady_clock::now();
 
     std::ofstream tsv_out;
@@ -331,14 +322,6 @@ void run_callback(const Config& cfg, Callback&& cb)
             if (!buckets[p]) {
                 throw std::runtime_error(
                     "tuna: failed while writing partition file: " + partition_path(cfg.work_dir, p));
-            }
-        }
-
-        for (size_t p = 0; p < cfg.num_partitions; ++p) {
-            SuperkmerReader<k, m> check_reader(partition_path(cfg.work_dir, p));
-            if (!check_reader.ok()) {
-                throw std::runtime_error(
-                    "tuna: cannot open partition file for reading: " + partition_path(cfg.work_dir, p));
             }
         }
 

@@ -24,6 +24,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#include <exception>
+#include <stdexcept>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -367,25 +369,40 @@ std::pair<uint64_t, uint64_t> count_and_callback(
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
 
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex worker_error_mutex;
 
     auto worker = [&](size_t tid) {
-        typename table_t::Token token;
+        try {
+            typename table_t::Token token;
 
-        for (size_t p = tid; p < n_parts; p += n_threads) {
-            SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
-            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                ? cfg.input_files.size() : 1;
-            const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
-            table_t table(init_sz, 1);
+            for (size_t p = tid; p < n_parts; p += n_threads) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                const std::string path = partition_path(cfg.work_dir, p);
+                SuperkmerReader<k, m> reader(path);
+                if (!reader.ok())
+                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                    ? cfg.input_files.size() : 1;
+                const size_t per_part = (total_kmers > 0)
+                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                    : size_t(1u << 27) / n_parts;
+                const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
+                table_t table(init_sz, 1);
 
-            const uint64_t ins = count_partition<k, m>(reader, table, token);
-            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+                const uint64_t ins = count_partition<k, m>(reader, table, token);
+                total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
-            const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
-            total_written.fetch_add(wrt, std::memory_order_relaxed);
+                const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
+                total_written.fetch_add(wrt, std::memory_order_relaxed);
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(worker_error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
         }
     };
 
@@ -394,6 +411,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
 
     return { total_inserted.load(), total_written.load() };
 }
@@ -664,6 +682,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex worker_error_mutex;
 
     // Overflow statistics accumulated across all partitions.
     std::mutex                                     ov_stats_mutex;
@@ -675,56 +696,68 @@ std::pair<uint64_t, uint64_t> count_and_write(
     if (cfg.debug_stats) part_infos.resize(n_parts);
 
     auto worker = [&](size_t tid) {
-        typename table_t::Token token;
-        std::string chunk;
+        try {
+            typename table_t::Token token;
+            std::string chunk;
 
-        for (size_t p = tid; p < n_parts; p += n_threads) {
-            SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
-            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                ? cfg.input_files.size() : 1;
-            const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(
-                per_part,
-                size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
-                size_t(1u << 22));  // max 4M
-            table_t table(init_sz, 1);
+            for (size_t p = tid; p < n_parts; p += n_threads) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                const std::string path = partition_path(cfg.work_dir, p);
+                SuperkmerReader<k, m> reader(path);
+                if (!reader.ok())
+                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                    ? cfg.input_files.size() : 1;
+                const size_t per_part = (total_kmers > 0)
+                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                    : size_t(1u << 27) / n_parts;
+                const size_t init_sz = std::clamp(
+                    per_part,
+                    size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
+                    size_t(1u << 22));  // max 4M
+                table_t table(init_sz, 1);
 
-            PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
-            const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
-            total_inserted.fetch_add(ins, std::memory_order_relaxed);
+                PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
+                const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
+                total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
-            if (dbg) {
-                dbg->init_sz     = init_sz;
-                dbg->n_inserted  = ins;
-                dbg->n_unique    = static_cast<uint64_t>(table.size());
-                dbg->n_overflow  = table.overflow_insert_count();
-                dbg->table_cap   = table.capacity();
-                dbg->n_buckets   = table.bucket_count();
-                dbg->resize_log  = table.resize_log();
-            }
+                if (dbg) {
+                    dbg->init_sz     = init_sz;
+                    dbg->n_inserted  = ins;
+                    dbg->n_unique    = static_cast<uint64_t>(table.size());
+                    dbg->n_overflow  = table.overflow_insert_count();
+                    dbg->table_cap   = table.capacity();
+                    dbg->n_buckets   = table.bucket_count();
+                    dbg->resize_log  = table.resize_log();
+                }
 
-            const uint64_t wrt = kff_out
-                ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
-            total_written.fetch_add(wrt, std::memory_order_relaxed);
+                const uint64_t wrt = kff_out
+                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+                total_written.fetch_add(wrt, std::memory_order_relaxed);
 
-            // Collect per-partition overflow stats.
-            const uint64_t ov_cnt = table.overflow_insert_count();
-            if(ov_cnt > 0)
-            {
-                ov_total.fetch_add(ov_cnt, std::memory_order_relaxed);
-                auto top = table.overflow_top_minimizers(20);
-                std::lock_guard<std::mutex> lg(ov_stats_mutex);
-                for(auto& [bin, cnt] : top)
+                // Collect per-partition overflow stats.
+                const uint64_t ov_cnt = table.overflow_insert_count();
+                if(ov_cnt > 0)
                 {
-                    auto it = std::find_if(ov_top_global.begin(), ov_top_global.end(),
-                                           [bin](const auto& e){ return e.first == bin; });
-                    if(it != ov_top_global.end()) it->second += cnt;
-                    else ov_top_global.emplace_back(bin, cnt);
+                    ov_total.fetch_add(ov_cnt, std::memory_order_relaxed);
+                    auto top = table.overflow_top_minimizers(20);
+                    std::lock_guard<std::mutex> lg(ov_stats_mutex);
+                    for(auto& [bin, cnt] : top)
+                    {
+                        auto it = std::find_if(ov_top_global.begin(), ov_top_global.end(),
+                                               [bin](const auto& e){ return e.first == bin; });
+                        if(it != ov_top_global.end()) it->second += cnt;
+                        else ov_top_global.emplace_back(bin, cnt);
+                    }
                 }
             }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(worker_error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
         }
     };
 
@@ -733,6 +766,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
 
     // Print overflow summary (always printed to stderr, regardless of -hp).
     if(ov_total.load() > 0)
