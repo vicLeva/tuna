@@ -324,8 +324,10 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
         typename table_t::Token token;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
+            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                ? cfg.input_files.size() : 1;
             const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
             table_t table(init_sz, 1);
@@ -371,8 +373,10 @@ std::pair<uint64_t, uint64_t> count_and_callback(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
+            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                ? cfg.input_files.size() : 1;
             const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
             table_t table(init_sz, 1);
@@ -676,8 +680,10 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
             SuperkmerReader<k, m> reader(partition_path(cfg.work_dir, p));
+            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                ? cfg.input_files.size() : 1;
             const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
@@ -794,8 +800,10 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
+            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                ? cfg.input_files.size() : 1;
             const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts) * 2
+                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
