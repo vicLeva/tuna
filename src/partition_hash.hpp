@@ -23,6 +23,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <exception>
 
 
 // Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
@@ -132,6 +133,7 @@ PartitionStats partition_kmers_gz_pc(
     std::mutex              q_mutex;
     std::condition_variable q_cv;
     bool                    producer_done = false;
+    std::exception_ptr      producer_error = nullptr;
 
     std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
@@ -169,8 +171,11 @@ PartitionStats partition_kmers_gz_pc(
                 feed(p);
             }
         } catch (...) {
-            std::lock_guard<std::mutex> lk(q_mutex);
-            producer_done = true;
+            {
+                std::lock_guard<std::mutex> lk(q_mutex);
+                producer_error = std::current_exception();
+                producer_done = true;
+            }
             q_cv.notify_all();
         }
     };
@@ -220,6 +225,7 @@ PartitionStats partition_kmers_gz_pc(
     for (size_t t = 0; t < n_consumers; ++t)
         threads.emplace_back(consumer_fn);
     for (auto& th : threads) th.join();
+    if (producer_error) std::rethrow_exception(producer_error);
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -337,6 +343,7 @@ PartitionStats partition_kmers_mem_impl(
             std::mutex              q_mutex;
             std::condition_variable q_cv;
             bool                    producer_done = false;
+            std::exception_ptr      producer_error = nullptr;
             std::vector<std::mutex> buf_mutexes(n_parts);
             std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
@@ -369,8 +376,11 @@ PartitionStats partition_kmers_mem_impl(
                         feed(p);
                     }
                 } catch (...) {
-                    std::lock_guard<std::mutex> lk(q_mutex);
-                    producer_done = true;
+                    {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        producer_error = std::current_exception();
+                        producer_done = true;
+                    }
                     q_cv.notify_all();
                 }
             };
@@ -412,6 +422,7 @@ PartitionStats partition_kmers_mem_impl(
             for (size_t t = 0; t < n_consumers; ++t)
                 threads.emplace_back(consumer_fn);
             for (auto& th : threads) th.join();
+            if (producer_error) std::rethrow_exception(producer_error);
             return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
         }
     }
