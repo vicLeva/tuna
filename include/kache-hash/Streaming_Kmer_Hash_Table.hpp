@@ -205,6 +205,35 @@ private:
     // Returns `true` iff `key` matches to the key of the element `e`.
     static constexpr bool key_equals(const flat_t& e, const Kmer<k>& key) { return Streaming_Kmer_Hash_Table::key(e) == key; }
 
+    // Computes canonical ntHash of the minimizer l-mer of `key` in O(k),
+    // using direct 2-bit arithmetic (no ASCII decode / MinimizerWindow reset).
+    static uint64_t minimizer_nt_hash_from_key(const Kmer<k>& key)
+    {
+        uint8_t nt[k];
+        for (uint16_t i = 0; i < k; ++i) {
+            const uint8_t b = static_cast<uint8_t>(key.base_at(k - 1 - i)); // kache: A=0,C=1,G=2,T=3
+            nt[i] = static_cast<uint8_t>(b ^ (b >> 1));                     // nt:    A=0,C=1,T=2,G=3
+        }
+
+        uint64_t fwd = 0, rev = 0;
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint8_t b = nt[i];
+            fwd ^= nt_hash::rol64(nt_hash::FWD[b], l - 1 - i);
+            rev ^= nt_hash::rol64(nt_hash::REV[b], i);
+        }
+        uint64_t best = fwd ^ rev;
+
+        for (uint16_t i = l; i < k; ++i) {
+            const uint8_t out_b = nt[i - l];
+            const uint8_t in_b  = nt[i];
+            fwd = nt_hash::rol64(fwd, 1) ^ nt_hash::rol64(nt_hash::FWD[out_b], l) ^ nt_hash::FWD[in_b];
+            rev = nt_hash::ror64(rev, 1) ^ nt_hash::ror64(nt_hash::REV[out_b], 1) ^ nt_hash::rol64(nt_hash::REV[in_b], l - 1);
+            const uint64_t h = fwd ^ rev;
+            best = std::min(best, h);
+        }
+        return best;
+    }
+
     // Returns the 32-bit equality mask of the vectors `x` and `y`.
     static uint32_t eq_mask(simd256_t x, simd256_t y);
 
@@ -1196,14 +1225,7 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
     const auto idx_mask = cap_ - 1;
 
     const auto key = this->key(x);
-    // Recompute minimizer hash via MinimizerWindow<k> (canonical ntHash).
-    static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
-    char buf[k];
-    for (uint16_t i = 0; i < k; ++i)
-        buf[i] = B2C[key.base_at(k - 1 - i)];
-    static thread_local MinimizerWindow<k, l> tmp_win;
-    tmp_win.reset(buf);
-    const auto nt_h = tmp_win.hash();
+    const auto nt_h = minimizer_nt_hash_from_key(key);
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
 
     const auto b = h & idx_mask;
