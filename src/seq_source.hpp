@@ -46,7 +46,7 @@ static constexpr helicase::Config HELICASE_ACTG =
 // any call to next().
 
 class GzInput {
-    static constexpr size_t BUF_SIZE = 1u << 16;   // 64 KB ring buffer
+    static constexpr size_t BUF_SIZE = 1u << 18;   // 256 KB buffer
 
     gzFile gz_   = nullptr;
     bool   eof_  = false;
@@ -61,7 +61,11 @@ class GzInput {
 
     void refill() {
         size_t consumed = pos_ - buf_start_;
-        if (consumed > 0 && consumed <= buf_fill_) {
+        if (consumed >= buf_fill_) {
+            // Fast path: all buffered data consumed.
+            buf_start_ = pos_;
+            buf_fill_ = 0;
+        } else if (consumed > 0) {
             buf_fill_ -= consumed;
             std::memmove(buf_.data(), buf_.data() + consumed, buf_fill_);
             buf_start_ = pos_;
@@ -110,8 +114,14 @@ public:
             cur_ptr_  = buf_.data() + (pos_ - buf_start_);
             cur_size_ = 64;
             pos_ += 64;
-            // Lookahead: prefill the buffer before the next next() call.
-            if (pos_ > buf_start_ + buf_fill_ && !eof_) refill();
+            // Lookahead refill at exact-buffer-boundary:
+            // copy out the current 64 B block first so refill() can safely
+            // compact/overwrite buf_ without invalidating cur_ptr_.
+            if (pos_ == buf_start_ + buf_fill_ && !eof_) {
+                std::memcpy(block_, cur_ptr_, 64);
+                cur_ptr_ = block_;
+                refill();
+            }
         } else {
             // Last (partial) block.  Advance pos_ to the exact end of data so
             // that the next next() call gets avail==0 and returns {} correctly,
