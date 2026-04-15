@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <stdexcept>
 #include <vector>
 
 #ifdef __linux__
@@ -160,6 +161,10 @@ int run(const Config& cfg)
                 return r;
               }()
             : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
+        if (!cfg.output_kff && !tsv_out) {
+            std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
+            return 1;
+        }
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
@@ -179,12 +184,24 @@ int run(const Config& cfg)
     // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
 
     std::vector<std::ofstream> buckets(cfg.num_partitions);
-    for (size_t p = 0; p < cfg.num_partitions; ++p)
-        buckets[p].open(partition_path(cfg.work_dir, p),
-                        std::ios::binary);
+    for (size_t p = 0; p < cfg.num_partitions; ++p) {
+        const std::string path = partition_path(cfg.work_dir, p);
+        buckets[p].open(path, std::ios::binary);
+        if (!buckets[p]) {
+            std::cerr << "tuna: error: cannot open partition file for writing: " << path << "\n";
+            return 1;
+        }
+    }
 
     stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
-    for (auto& f : buckets) f.close();
+    for (size_t p = 0; p < cfg.num_partitions; ++p) {
+        buckets[p].close();
+        if (!buckets[p]) {
+            std::cerr << "tuna: error: failed while writing partition file: "
+                      << partition_path(cfg.work_dir, p) << "\n";
+            return 1;
+        }
+    }
 
     const double t_phase1 = elapsed_s(t_part);
     if (!cfg.hide_progress)
@@ -206,6 +223,15 @@ int run(const Config& cfg)
         std::cerr << "[2/2] counting  (" << p2_threads << " thread"
                   << (p2_threads > 1 ? "s" : "") << ") ...\n";
 
+    for (size_t p = 0; p < cfg.num_partitions; ++p) {
+        SuperkmerReader<k, m> check_reader(partition_path(cfg.work_dir, p));
+        if (!check_reader.ok()) {
+            std::cerr << "tuna: error: cannot open partition file for reading: "
+                      << partition_path(cfg.work_dir, p) << "\n";
+            return 1;
+        }
+    }
+
     const auto t2 = std::chrono::steady_clock::now();
 
     std::ofstream tsv_out;
@@ -225,6 +251,10 @@ int run(const Config& cfg)
             return r;
           }()
         : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
+    if (!cfg.output_kff && !tsv_out) {
+        std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
+        return 1;
+    }
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)
@@ -289,10 +319,28 @@ void run_callback(const Config& cfg, Callback&& cb)
         }();
 
         std::vector<std::ofstream> buckets(cfg.num_partitions);
-        for (size_t p = 0; p < cfg.num_partitions; ++p)
-            buckets[p].open(partition_path(cfg.work_dir, p), std::ios::binary);
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            const std::string path = partition_path(cfg.work_dir, p);
+            buckets[p].open(path, std::ios::binary);
+            if (!buckets[p])
+                throw std::runtime_error("tuna: cannot open partition file for writing: " + path);
+        }
         stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
-        for (auto& f : buckets) f.close();
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            buckets[p].close();
+            if (!buckets[p]) {
+                throw std::runtime_error(
+                    "tuna: failed while writing partition file: " + partition_path(cfg.work_dir, p));
+            }
+        }
+
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            SuperkmerReader<k, m> check_reader(partition_path(cfg.work_dir, p));
+            if (!check_reader.ok()) {
+                throw std::runtime_error(
+                    "tuna: cannot open partition file for reading: " + partition_path(cfg.work_dir, p));
+            }
+        }
 
         count_and_callback<k, m>(cfg, stats.kmers, std::forward<Callback>(cb));
     }
