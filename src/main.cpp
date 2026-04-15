@@ -16,7 +16,9 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <fstream>
 #include <sys/resource.h>
+#include <exception>
 
 
 int main(int argc, char* argv[])
@@ -42,6 +44,15 @@ int main(int argc, char* argv[])
     // serialized bytes, not struct fields) — any instantiation gives the same sizeof.
     static_assert(sizeof(SuperkmerWriter<31, 21>) >= 8 && sizeof(SuperkmerWriter<31, 21>) <= 64,
                   "SuperkmerWriter size out of expected range");
+
+    for (const auto& input : cfg.input_files) {
+        std::ifstream f(input, std::ios::binary);
+        if (!f) {
+            std::cerr << "tuna: error: cannot open input file: " << input << "\n";
+            return 1;
+        }
+    }
+
     if (cfg.num_partitions == 0)
         cfg.num_partitions = auto_tune_partitions(
             cfg.input_files, sizeof(SuperkmerWriter<31, 21>), cfg.k, cfg.num_threads);
@@ -70,7 +81,16 @@ int main(int argc, char* argv[])
         std::cerr << "\n";
     }
 
-    const int rc = dispatch(cfg.k, cfg.l, cfg);
+    int rc = 1;
+    try {
+        rc = dispatch(cfg.k, cfg.l, cfg);
+    } catch (const std::exception& e) {
+        std::cerr << "tuna: error: " << e.what() << "\n";
+        rc = 1;
+    } catch (...) {
+        std::cerr << "tuna: error: unexpected failure\n";
+        rc = 1;
+    }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
     if (!cfg.keep_tmp) {
