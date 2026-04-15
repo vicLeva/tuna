@@ -37,7 +37,6 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
-#include <fstream>
 
 // Internal implementation headers (all template code, must be compiled inline).
 #include "pipeline.hpp"
@@ -97,11 +96,6 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
 
     if (files.empty())
         throw std::invalid_argument("tuna::count: no input files");
-    for (const auto& f : files) {
-        std::ifstream in(f, std::ios::binary);
-        if (!in)
-            throw std::runtime_error("tuna::count: cannot open input file: " + f);
-    }
 
     // ── Build internal config ──────────────────────────────────────────────
     Config cfg;

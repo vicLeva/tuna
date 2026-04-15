@@ -16,7 +16,6 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
-#include <fstream>
 #include <sys/resource.h>
 #include <exception>
 
@@ -44,14 +43,6 @@ int main(int argc, char* argv[])
     // serialized bytes, not struct fields) — any instantiation gives the same sizeof.
     static_assert(sizeof(SuperkmerWriter<31, 21>) >= 8 && sizeof(SuperkmerWriter<31, 21>) <= 64,
                   "SuperkmerWriter size out of expected range");
-
-    for (const auto& input : cfg.input_files) {
-        std::ifstream f(input, std::ios::binary);
-        if (!f) {
-            std::cerr << "tuna: error: cannot open input file: " << input << "\n";
-            return 1;
-        }
-    }
 
     if (cfg.num_partitions == 0)
         cfg.num_partitions = auto_tune_partitions(
