@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 
 namespace kache_hash
@@ -197,7 +198,7 @@ inline const T_val_* Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::insert(co
             return &T[i].val;
     }
 
-    return &T[0].val;   // Table full — silently treat as already present.
+    throw std::overflow_error("Concurrent_Hash_Table::insert: table is full");
 }
 
 
@@ -231,34 +232,27 @@ inline std::optional<T_val_> Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::u
         }
     }
 
-    return T[0].val;    // Table full — placeholder.
+    throw std::overflow_error("Concurrent_Hash_Table::upsert: table is full");
 }
 
 
 template <typename T_key_, typename T_val_, typename T_hasher_>
 inline const T_val_* Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::find(const T_key_ key) const
 {
-#ifndef NDEBUG
-    std::size_t tried_slots = 0;
-#endif
-
-    const T_val_* val_ptr = nullptr;
-    for(std::size_t i = hash_to_idx(hash(key)); ; i = next_index(i))
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
     {
         if(T[i].key == key)
         {
             lock[i].lock(); // To ensure that some other thread is not updating this val atm—a stable value is guaranteed.
-            val_ptr = &T[i].val;
+            const T_val_* val_ptr = &T[i].val;
             lock[i].unlock();
-            break;
+            return val_ptr;
         }
         else if(T[i].key == empty_key_)
-            break;
-        else
-            assert(++tried_slots <= capacity_);
+            return nullptr;
     }
 
-    return val_ptr;
+    return nullptr;
 }
 
 
