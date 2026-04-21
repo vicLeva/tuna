@@ -331,7 +331,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 const size_t per_part = (total_kmers > 0)
                     ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                     : size_t(1u << 27) / n_parts;
-                const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
+                const size_t init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 table_t table(init_sz, 1);
 
                 uint64_t ins;  // k-mers inserted into this partition
@@ -399,7 +399,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 const size_t per_part = (total_kmers > 0)
                     ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
                     : size_t(1u << 27) / n_parts;
-                const size_t init_sz = std::clamp(per_part, size_t(1u << 12), size_t(1u << 22));
+                const size_t init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 table_t table(init_sz, 1);
 
                 const uint64_t ins = count_partition<k, m>(reader, table, token);
@@ -727,7 +727,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     : size_t(1u << 27) / n_parts;
                 const size_t init_sz = std::clamp(
                     per_part,
-                    size_t(1u << 12),   // min 4K slots → 256 buckets minimum (below 256 buckets probe collisions cause k-mer loss)
+                    size_t(1u << 15),  // min 32K = 2× resize_checkpoint (16384): guarantees resize fires before overflow table is exhausted
                     size_t(1u << 22));  // max 4M
                 table_t table(init_sz, 1);
 
@@ -858,7 +858,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 : size_t(1u << 27) / n_parts;
             const size_t init_sz = std::clamp(
                 per_part,
-                size_t(1u << 12),   // min 4K slots → 256 buckets minimum
+                size_t(1u << 15),  // min 32K = 2× resize_checkpoint (16384): guarantees resize fires before overflow table is exhausted
                 size_t(1u << 22));  // max 4M
             table_t table(init_sz, 1);
 
