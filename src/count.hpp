@@ -341,10 +341,8 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                     init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
                                          size_t(1u << 15), size_t(1u << 22));
                 } else {
-                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                        ? cfg.input_files.size() : 1;
                     const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        ? static_cast<size_t>(total_kmers / n_parts) * 2
                         : size_t(1u << 27) / n_parts;
                     init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 }
@@ -426,10 +424,8 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                     init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
                                          size_t(1u << 15), size_t(1u << 22));
                 } else {
-                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                        ? cfg.input_files.size() : 1;
                     const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        ? static_cast<size_t>(total_kmers / n_parts) * 2
                         : size_t(1u << 27) / n_parts;
                     init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 }
@@ -769,10 +765,8 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
                                          size_t(1u << 15), size_t(1u << 22));
                 } else {
-                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                        ? cfg.input_files.size() : 1;
                     const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        ? static_cast<size_t>(total_kmers / n_parts) * 2
                         : size_t(1u << 27) / n_parts;
                     init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 }
@@ -914,10 +908,8 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
                                      size_t(1u << 15), size_t(1u << 22));
             } else {
-                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                    ? cfg.input_files.size() : 1;
                 const size_t per_part = (total_kmers > 0)
-                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                    ? static_cast<size_t>(total_kmers / n_parts) * 2
                     : size_t(1u << 27) / n_parts;
                 init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
             }

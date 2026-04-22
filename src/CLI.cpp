@@ -37,11 +37,6 @@ void print_usage(const char* prog)
         "  -w  <dir>   working directory for temp files\n"
         "              [default: tuna_tmp/ next to output file]\n"
         "\n"
-        "  -p          pangenome mode: input files are from the same species\n"
-        "              tuna assumes unique k-mers ≈ total_kmers / n_files and\n"
-        "              sizes hash tables accordingly (avoids 10-50× over-allocation\n"
-        "              that occurs with same-species multi-file inputs by default)\n"
-        "\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
@@ -144,8 +139,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.debug_stats = true;
         } else if (arg == "-kff") {
             cfg.output_kff = true;
-        } else if (arg == "-p") {
-            cfg.pangenome = true;
         } else if (arg == "-hp") {
             cfg.hide_progress = true;
         } else if (arg == "-kt") {

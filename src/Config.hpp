@@ -23,6 +23,4 @@ struct Config {
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
-    bool         pangenome       = false; // same-species input: coverage grows O(N files),
-                                          // so unique_kmers ≈ total_kmers / n_files
 };
