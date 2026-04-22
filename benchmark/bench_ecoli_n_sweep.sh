@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bench_ecoli_n_sweep.sh — tuna vs KMC, scaling with number of E. coli genomes
 #
-# Usage: bash bench_ecoli_n_sweep.sh [THREADS] [K] [M]
-# Example: bash bench_ecoli_n_sweep.sh 4 31 21
+# Usage: bash bench_ecoli_n_sweep.sh [THREADS] [K] [M] [KMC_MEM_GB]
+# Example: bash bench_ecoli_n_sweep.sh 4 31 21 12
 #
 # Path overrides via env vars:
 #   TUNA  KMC  FOF  WORK
@@ -15,6 +15,7 @@ set -uo pipefail
 THREADS=${1:-4}
 K=${2:-31}
 M=${3:-21}
+KMC_MEM_GB=${4:-12}
 
 REPS=3
 THREADS_LIST=(1 4)
@@ -115,7 +116,7 @@ for N in "${N_VALUES[@]}"; do
         time_f="$RESULTS/kmc_t${T}_n${N}_r${rep}.timefile"
 
         /usr/bin/time -v -o "$time_f" \
-            "$KMC" -k"$K" -t"$T" -fm -ci1 -hp \
+            "$KMC" -k"$K" -t"$T" -m"$KMC_MEM_GB" -fm -ci1 -hp \
             "@$SUBSET_FOF" "$KMC_WORK/out" "$KMC_WORK" \
             2>"$stderr_f" || {
                 echo "  [kmc FAIL t=$T N=$N rep=$rep]"
