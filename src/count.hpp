@@ -31,6 +31,14 @@
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
 
+// Returns the smallest power of two >= v (returns 1 for v == 0).
+inline size_t next_pow2(size_t v) noexcept {
+    size_t p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+
 // ─── Debug stats ──────────────────────────────────────────────────────────────
 // Populated by count_partition when dbg != nullptr (-dbg flag).
 // coverage_hist is aggregated globally and written to debug_min_coverage.csv.
@@ -317,6 +325,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
     std::atomic<bool> stop{false};
     std::exception_ptr worker_error = nullptr;
     std::mutex worker_error_mutex;
+    std::atomic<uint64_t> calibrated_unique{0};
 
     auto worker = [&](size_t /*tid*/) {
         try {
@@ -326,12 +335,19 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 if (stop.load(std::memory_order_relaxed)) break;
                 const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
                 if (p >= n_parts) break;
-                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                    ? cfg.input_files.size() : 1;
-                const size_t per_part = (total_kmers > 0)
-                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                    : size_t(1u << 27) / n_parts;
-                const size_t init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+                const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
+                size_t init_sz;
+                if (cal > 0) {
+                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
+                                         size_t(1u << 15), size_t(1u << 22));
+                } else {
+                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                        ? cfg.input_files.size() : 1;
+                    const size_t per_part = (total_kmers > 0)
+                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        : size_t(1u << 27) / n_parts;
+                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+                }
                 table_t table(init_sz, 1);
 
                 uint64_t ins;  // k-mers inserted into this partition
@@ -341,6 +357,15 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 }
                 { std::string tmp; part_bufs[p].swap(tmp); }
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
+                if (cal == 0) {
+                    const uint64_t unique = static_cast<uint64_t>(table.size());
+                    if (unique > 0) {
+                        uint64_t expected = 0;
+                        calibrated_unique.compare_exchange_strong(
+                            expected, unique,
+                            std::memory_order_relaxed, std::memory_order_relaxed);
+                    }
+                }
 
                 const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);  // k-mers written to output
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
@@ -381,6 +406,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
     std::atomic<bool> stop{false};
     std::exception_ptr worker_error = nullptr;
     std::mutex worker_error_mutex;
+    std::atomic<uint64_t> calibrated_unique{0};
 
     auto worker = [&](size_t /*tid*/) {
         try {
@@ -394,16 +420,32 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 SuperkmerReader<k, m> reader(path);
                 if (!reader.ok())
                     throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
-                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                    ? cfg.input_files.size() : 1;
-                const size_t per_part = (total_kmers > 0)
-                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                    : size_t(1u << 27) / n_parts;
-                const size_t init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+                const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
+                size_t init_sz;
+                if (cal > 0) {
+                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
+                                         size_t(1u << 15), size_t(1u << 22));
+                } else {
+                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                        ? cfg.input_files.size() : 1;
+                    const size_t per_part = (total_kmers > 0)
+                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        : size_t(1u << 27) / n_parts;
+                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+                }
                 table_t table(init_sz, 1);
 
                 const uint64_t ins = count_partition<k, m>(reader, table, token);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
+                if (cal == 0) {
+                    const uint64_t unique = static_cast<uint64_t>(table.size());
+                    if (unique > 0) {
+                        uint64_t expected = 0;
+                        calibrated_unique.compare_exchange_strong(
+                            expected, unique,
+                            std::memory_order_relaxed, std::memory_order_relaxed);
+                    }
+                }
 
                 const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
@@ -706,6 +748,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
     // Debug statistics (only used when cfg.debug_stats).
     std::vector<PartitionDebugInfo>                part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
+    std::atomic<uint64_t> calibrated_unique{0};
 
     auto worker = [&](size_t /*tid*/) {
         try {
@@ -720,20 +763,33 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 SuperkmerReader<k, m> reader(path);
                 if (!reader.ok())
                     throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
-                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                    ? cfg.input_files.size() : 1;
-                const size_t per_part = (total_kmers > 0)
-                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                    : size_t(1u << 27) / n_parts;
-                const size_t init_sz = std::clamp(
-                    per_part,
-                    size_t(1u << 15),  // min 32K = 2× resize_checkpoint (16384): guarantees resize fires before overflow table is exhausted
-                    size_t(1u << 22));  // max 4M
+                const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
+                size_t init_sz;
+                if (cal > 0) {
+                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
+                                         size_t(1u << 15), size_t(1u << 22));
+                } else {
+                    const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                        ? cfg.input_files.size() : 1;
+                    const size_t per_part = (total_kmers > 0)
+                        ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                        : size_t(1u << 27) / n_parts;
+                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+                }
                 table_t table(init_sz, 1);
 
                 PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
                 const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
+                if (cal == 0) {
+                    const uint64_t unique = static_cast<uint64_t>(table.size());
+                    if (unique > 0) {
+                        uint64_t expected = 0;
+                        calibrated_unique.compare_exchange_strong(
+                            expected, unique,
+                            std::memory_order_relaxed, std::memory_order_relaxed);
+                    }
+                }
 
                 if (dbg) {
                     dbg->init_sz     = init_sz;
@@ -843,6 +899,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     // Debug statistics (only used when cfg.debug_stats).
     std::vector<PartitionDebugInfo> part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
+    std::atomic<uint64_t> calibrated_unique{0};
 
     auto worker = [&](size_t /*tid*/) {
         typename table_t::Token token;
@@ -851,15 +908,19 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
         while (true) {
             const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
             if (p >= n_parts) break;
-            const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
-                ? cfg.input_files.size() : 1;
-            const size_t per_part = (total_kmers > 0)
-                ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
-                : size_t(1u << 27) / n_parts;
-            const size_t init_sz = std::clamp(
-                per_part,
-                size_t(1u << 15),  // min 32K = 2× resize_checkpoint (16384): guarantees resize fires before overflow table is exhausted
-                size_t(1u << 22));  // max 4M
+            const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
+            size_t init_sz;
+            if (cal > 0) {
+                init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
+                                     size_t(1u << 15), size_t(1u << 22));
+            } else {
+                const size_t coverage_est = (cfg.pangenome && cfg.input_files.size() > 1)
+                    ? cfg.input_files.size() : 1;
+                const size_t per_part = (total_kmers > 0)
+                    ? static_cast<size_t>(total_kmers / n_parts / coverage_est) * 2
+                    : size_t(1u << 27) / n_parts;
+                init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
+            }
             table_t table(init_sz, 1);
 
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
@@ -874,6 +935,15 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
             ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
+            if (cal == 0) {
+                const uint64_t unique = static_cast<uint64_t>(table.size());
+                if (unique > 0) {
+                    uint64_t expected = 0;
+                    calibrated_unique.compare_exchange_strong(
+                        expected, unique,
+                        std::memory_order_relaxed, std::memory_order_relaxed);
+                }
+            }
 
             if (dbg) {
                 dbg->init_sz     = init_sz;
