@@ -1,135 +1,146 @@
 #!/usr/bin/env bash
-# bench_ecoli_n_sweep.sh — tuna vs KMC across N E. coli genomes (log-scale N)
+# bench_ecoli_n_sweep.sh — tuna vs KMC, scaling with number of E. coli genomes
 #
-# Usage: bash bench_ecoli_n_sweep.sh [THREADS [MEM_GB]]
-# Example: bash bench_ecoli_n_sweep.sh 4 12
+# Usage: bash bench_ecoli_n_sweep.sh [THREADS] [K] [M]
+# Example: bash bench_ecoli_n_sweep.sh 4 31 21
 #
 # Path overrides via env vars:
-#   TUNA=/path/to/tuna  KMC=/path/to/kmc  KMCDUMP=/path/to/kmc_dump
-#   FOF=/path/to/ecoli_fof_3682.list  WORK=/path/to/workdir
+#   TUNA  KMC  FOF  WORK
 #
-# Output: $RESULTS/bench_n.csv
-# Columns: n_files, tuna_p1_s, tuna_p2_s, tuna_total_s,
-#          tuna_total_kmers, tuna_unique_kmers,
-#          kmc_count_s, kmc_dump_s, kmc_total_s, kmc_unique_kmers
+# Output: $RESULTS/bench_n_sweep.csv
+# Columns: tool, n_files, threads, rep, wall_s, rss_mb, phase1_s, phase2_s, unique_kmers
 
-set -euo pipefail
+set -uo pipefail
 
 THREADS=${1:-4}
-MEM_GB=${2:-12}
+K=${2:-31}
+M=${3:-21}
 
-# ── Paths ───────────────────────────────────────────────────────────────────
-TUNA=${TUNA:-~/documents/giulio_colab/softs/tuna/build/tuna}
-KMC=${KMC:-~/documents/giulio_colab/softs/kmc/bin/kmc}
-KMCDUMP=${KMCDUMP:-~/documents/giulio_colab/softs/kmc/bin/kmc_dump}
-FOF=${FOF:-~/tmp/data/ecoli_fof_3682.list}
-WORK=${WORK:-~/tuna_bench_tmp}
+REPS=3
+THREADS_LIST=(1 4)
 
-# Expand ~ in paths
-TUNA="${TUNA/#\~/$HOME}"
-KMC="${KMC/#\~/$HOME}"
-KMCDUMP="${KMCDUMP/#\~/$HOME}"
-FOF="${FOF/#\~/$HOME}"
-WORK="${WORK/#\~/$HOME}"
+# ── Paths ────────────────────────────────────────────────────────────────────
+TUNA=${TUNA:-/WORKS/vlevallois/softs/tuna/build/tuna}
+KMC=${KMC:-kmc}
+FOF=${FOF:-/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list}
+WORK=${WORK:-/WORKS/vlevallois/test_tuna/ecoli_nsweep}
 
-K=31
-M=17   # best m for E. coli (lowest overflow, least resizes)
+N_VALUES=(1 2 5 10 20 50 100 200 500 1000)
 
-# Log-scale N values: 8 points from 1 to 3682
-N_VALUES=(1 3 10 30 100 300 1000 3682)
-
-RESULTS="$WORK/bench_n_sweep_$(date +%Y%m%d_%H%M%S)"
+RESULTS="$WORK/results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS"
 
-CSV="$RESULTS/bench_n.csv"
-echo "n_files,tuna_p1_s,tuna_p2_s,tuna_total_s,tuna_total_kmers,tuna_unique_kmers,kmc_count_s,kmc_dump_s,kmc_total_s,kmc_unique_kmers" > "$CSV"
-
-echo "=== E. coli N-sweep: k=$K  m=$M  threads=$THREADS  mem=${MEM_GB}GB ==="
-echo "Results: $RESULTS"
+TOTAL_FILES=$(wc -l < "$FOF")
+echo "=== E. coli N-sweep: k=$K  m=$M  reps=$REPS  threads=${THREADS_LIST[*]} ==="
+echo "    fof: $FOF  ($TOTAL_FILES files)"
+echo "    results: $RESULTS"
 echo ""
-printf "%-6s  %-9s  %-9s  %-9s  %-9s  %-9s  %-9s  %-14s  %-14s\n" \
-    "N" "tuna_p1" "tuna_p2" "tuna_tot" "kmc_cnt" "kmc_dmp" "kmc_tot" "tuna_total_K" "tuna_unique_K"
-echo "──────  ─────────  ─────────  ─────────  ─────────  ─────────  ─────────  ──────────────  ──────────────"
 
+# ── CSV ───────────────────────────────────────────────────────────────────────
+CSV="$RESULTS/bench_n_sweep.csv"
+echo "tool,n_files,threads,rep,wall_s,rss_mb,phase1_s,phase2_s,unique_kmers" > "$CSV"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+wall_to_s() {
+    awk -F: '{if(NF==3) printf "%.3f",$1*3600+$2*60+$3;
+              else       printf "%.3f",$1*60+$2}' <<< "$1"
+}
+
+wall_from_file() {
+    local t
+    t=$(grep "Elapsed (wall clock)" "$1" | awk '{print $NF}')
+    wall_to_s "$t"
+}
+
+rss_mb() {
+    local kb
+    kb=$(grep "Maximum resident" "$1" | awk '{print $NF}')
+    awk "BEGIN{printf \"%.0f\", $kb/1024}"
+}
+
+parse_tuna() {
+    grep "^${2}:" "$1" | awk -F': ' '{gsub(/s$/,"",$2); print $2}' | head -1
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+for T in "${THREADS_LIST[@]}"; do
 for N in "${N_VALUES[@]}"; do
 
-    # ── Subset fof ─────────────────────────────────────────────────────────
-    SUBSET_FOF="$RESULTS/fof_${N}.list"
-    head -n "$N" "$FOF" > "$SUBSET_FOF"
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # tuna run
-    # ─────────────────────────────────────────────────────────────────────────
-    TUNA_WORK="$WORK/n_sweep_tuna_${N}"
-    TUNA_ERR="$RESULTS/tuna_stderr_${N}.txt"
-    mkdir -p "$TUNA_WORK"
-
-    # Run without -hp so the "X k-mers processed, Y unique written" line appears.
-    "$TUNA" -k "$K" -m "$M" -t "$THREADS" \
-        -w "$TUNA_WORK/" "@$SUBSET_FOF" /dev/null \
-        2>"$TUNA_ERR" || {
-        echo "  N=$N tuna FAILED — see $TUNA_ERR"
+    if [ "$N" -gt "$TOTAL_FILES" ]; then
+        echo "  [SKIP] N=$N > available ($TOTAL_FILES)"
         continue
-    }
-    rm -rf "$TUNA_WORK"
-
-    P1=$(grep  "^phase1:" "$TUNA_ERR" | awk -F: '{gsub(/s/,"",$2); printf "%.3f",$2}')
-    P2=$(grep  "^phase2:" "$TUNA_ERR" | awk -F: '{gsub(/s/,"",$2); printf "%.3f",$2}')
-    TUNA_TOTAL=$(awk "BEGIN{printf \"%.3f\", $P1+$P2}")
-
-    # Parse "N k-mers processed, M unique written"
-    STATS_LINE=$(grep "k-mers processed" "$TUNA_ERR" || echo "")
-    if [ -n "$STATS_LINE" ]; then
-        TUNA_TOT_K=$(echo "$STATS_LINE" | awk '{print $1}')
-        TUNA_UNI_K=$(echo "$STATS_LINE" | awk '{print $4}')
-    else
-        TUNA_TOT_K=0
-        TUNA_UNI_K=0
     fi
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # KMC run (count + dump)
-    # ─────────────────────────────────────────────────────────────────────────
-    KMC_WORK="$WORK/n_sweep_kmc_${N}"
-    KMC_DB="$WORK/n_sweep_kmc_db_${N}"
-    KMC_ERR="$RESULTS/kmc_stderr_${N}.txt"
+    SUBSET_FOF="$WORK/fof_n${N}.list"
+    head -n "$N" "$FOF" > "$SUBSET_FOF"
+
+    echo "── t=$T  N=$N ──────────────────────────────────────────────────────────────"
+
+    # ── tuna ──────────────────────────────────────────────────────────────────
+    TUNA_WORK="$WORK/tuna_work_t${T}_n${N}"
+    mkdir -p "$TUNA_WORK"
+
+    for rep in $(seq 1 $REPS); do
+        stderr_f="$RESULTS/tuna_t${T}_n${N}_r${rep}.stderr"
+        time_f="$RESULTS/tuna_t${T}_n${N}_r${rep}.timefile"
+
+        /usr/bin/time -v -o "$time_f" \
+            "$TUNA" -k "$K" -m "$M" -t "$T" -hp \
+            -w "$TUNA_WORK/" "@$SUBSET_FOF" /dev/null \
+            2>"$stderr_f" || {
+                echo "  [tuna FAIL t=$T N=$N rep=$rep]"
+                echo "tuna,$N,$T,$rep,,,,,," >> "$CSV"
+                continue
+            }
+
+        wall=$(wall_from_file "$time_f")
+        rss=$(rss_mb "$time_f")
+        p1=$(parse_tuna "$stderr_f" "phase1")
+        p2=$(parse_tuna "$stderr_f" "phase2")
+        unique=$(parse_tuna "$stderr_f" "unique_kmers")
+
+        echo "  [tuna] rep=$rep  wall=${wall}s  p1=${p1}s  p2=${p2}s  RSS=${rss}MB  unique=${unique}"
+        echo "tuna,$N,$T,$rep,$wall,$rss,$p1,$p2,$unique" >> "$CSV"
+    done
+    rm -rf "$TUNA_WORK"
+
+    # ── KMC ───────────────────────────────────────────────────────────────────
+    KMC_WORK="$WORK/kmc_work_t${T}_n${N}"
     mkdir -p "$KMC_WORK"
 
-    # Count
-    T_KMC_CNT_START=$(date +%s%3N)
-    "$KMC" -fm -k"$K" -t"$THREADS" -m"$MEM_GB" -ci1 \
-        "@$SUBSET_FOF" "$KMC_DB" "$KMC_WORK" \
-        >"$KMC_ERR" 2>&1 || {
-        echo "  N=$N kmc count FAILED — see $KMC_ERR"
-        rm -rf "$KMC_WORK" "${KMC_DB}.kmc_pre" "${KMC_DB}.kmc_suf" 2>/dev/null || true
-        continue
-    }
-    T_KMC_CNT_END=$(date +%s%3N)
-    KMC_CNT_S=$(awk "BEGIN{printf \"%.3f\", ($T_KMC_CNT_END - $T_KMC_CNT_START)/1000.0}")
+    for rep in $(seq 1 $REPS); do
+        stderr_f="$RESULTS/kmc_t${T}_n${N}_r${rep}.stderr"
+        time_f="$RESULTS/kmc_t${T}_n${N}_r${rep}.timefile"
 
-    # Dump (to stdout, count unique k-mers with wc -l; suppress text output)
-    T_KMC_DMP_START=$(date +%s%3N)
-    KMC_UNI_K=$("$KMCDUMP" "$KMC_DB" /dev/stdout 2>/dev/null | wc -l)
-    T_KMC_DMP_END=$(date +%s%3N)
-    KMC_DMP_S=$(awk "BEGIN{printf \"%.3f\", ($T_KMC_DMP_END - $T_KMC_DMP_START)/1000.0}")
-    KMC_TOTAL=$(awk "BEGIN{printf \"%.3f\", $KMC_CNT_S + $KMC_DMP_S}")
+        /usr/bin/time -v -o "$time_f" \
+            "$KMC" -k"$K" -t"$T" -fm -ci1 -hp \
+            "@$SUBSET_FOF" "$KMC_WORK/out" "$KMC_WORK" \
+            2>"$stderr_f" || {
+                echo "  [kmc FAIL t=$T N=$N rep=$rep]"
+                echo "kmc,$N,$T,$rep,,,,,," >> "$CSV"
+                continue
+            }
 
-    rm -rf "$KMC_WORK" "${KMC_DB}.kmc_pre" "${KMC_DB}.kmc_suf"
+        wall=$(wall_from_file "$time_f")
+        rss=$(rss_mb "$time_f")
+        s1=$(grep "^1st stage:" "$stderr_f" | awk '{print $3}' | tr -d 's')
+        s2=$(grep "^2nd stage:" "$stderr_f" | awk '{print $3}' | tr -d 's')
+        unique=$(grep "No. of unique counted k-mers" "$stderr_f" | awk '{print $NF}')
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Print + record
-    # ─────────────────────────────────────────────────────────────────────────
-    TUNA_TOT_KM=$(awk "BEGIN{printf \"%.1f\", $TUNA_TOT_K/1000000.0}")
-    TUNA_UNI_KM=$(awk "BEGIN{printf \"%.1f\", $TUNA_UNI_K/1000000.0}")
+        echo "  [kmc]  rep=$rep  wall=${wall}s  s1=${s1}s  s2=${s2}s  RSS=${rss}MB  unique=${unique}"
+        echo "kmc,$N,$T,$rep,$wall,$rss,$s1,$s2,$unique" >> "$CSV"
+    done
+    rm -rf "$KMC_WORK"
 
-    printf "%-6s  %-9s  %-9s  %-9s  %-9s  %-9s  %-9s  %-14s  %-14s\n" \
-        "$N" "$P1" "$P2" "$TUNA_TOTAL" \
-        "$KMC_CNT_S" "$KMC_DMP_S" "$KMC_TOTAL" \
-        "${TUNA_TOT_KM}M" "${TUNA_UNI_KM}M"
-
-    echo "$N,$P1,$P2,$TUNA_TOTAL,$TUNA_TOT_K,$TUNA_UNI_K,$KMC_CNT_S,$KMC_DMP_S,$KMC_TOTAL,$KMC_UNI_K" >> "$CSV"
+    rm -f "$SUBSET_FOF"
+    echo ""
 
 done
+done
 
+echo "=== Done ==="
+echo "Results: $RESULTS"
 echo ""
-echo "CSV: $CSV"
+column -t -s, "$CSV"
