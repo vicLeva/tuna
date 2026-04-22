@@ -25,7 +25,7 @@ KMC=${KMC:-kmc}
 FOF=${FOF:-/WORKS/vlevallois/data/dataset_genome_human/fof.list}
 WORK=${WORK:-/WORKS/vlevallois/test_tuna/human_nsweep}
 
-N_VALUES=(1 2 3 5 7 10 15)
+N_VALUES=(1 2 3 5 7 10 15 20 30)
 
 RESULTS="$WORK/results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS"
