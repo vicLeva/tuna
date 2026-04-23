@@ -17,11 +17,12 @@ K=${2:-31}
 M=${3:-21}
 KMC_MEM_GB=${4:-12}
 
-REPS=3
+REPS=1
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 TUNA=${TUNA:-/WORKS/vlevallois/softs/tuna/build/tuna}
 KMC=${KMC:-kmc}
+KMC_DUMP=${KMC_DUMP:-kmc_dump}
 FOF=${FOF:-/WORKS/vlevallois/data/dataset_genome_human/fof.list}
 WORK=${WORK:-/WORKS/vlevallois/test_tuna/human_nsweep}
 
@@ -113,10 +114,11 @@ for N in "${N_VALUES[@]}"; do
         stderr_f="$RESULTS/kmc_n${N}_r${rep}.stderr"
         time_f="$RESULTS/kmc_n${N}_r${rep}.timefile"
 
-        /usr/bin/time -v -o "$time_f" \
-            "$KMC" -k"$K" -t"$THREADS" -m"$KMC_MEM_GB" -fm -ci1 -hp \
-            "@$SUBSET_FOF" "$KMC_WORK/out" "$KMC_WORK" \
-            2>"$stderr_f" || {
+        /usr/bin/time -v -o "$time_f" bash -c "
+            '$KMC' -k'$K' -t'$THREADS' -m'$KMC_MEM_GB' -fm -ci1 -hp \
+                @'$SUBSET_FOF' '$KMC_WORK/out' '$KMC_WORK' &&
+            '$KMC_DUMP' '$KMC_WORK/out' /dev/null
+        " 2>"$stderr_f" || {
                 echo "  [kmc FAIL N=$N rep=$rep]"
                 echo "kmc,$N,$THREADS,$rep,,,,,," >> "$CSV"
                 continue
