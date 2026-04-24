@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.17)
-project(tuna VERSION 1.2.0 LANGUAGES CXX C)
+project(tuna VERSION 1.3.0 LANGUAGES CXX C)
 
 # Default to Release if no build type is specified.
 # Only set when tuna is the top-level project — do not override the parent's choice.
