@@ -159,4 +159,21 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(tuna ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/CLI.cpp)
     target_compile_options(tuna PRIVATE ${TUNA_PRIVATE_FLAGS})
     target_link_libraries(tuna PRIVATE tuna_lib)
+
+    # ── tuna-prot — protein k-mer counter ──────────────────────────────────────
+    add_executable(tuna_prot
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/prot/main_prot.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/prot/CLI_prot.cpp)
+    target_compile_features(tuna_prot PRIVATE cxx_std_20)
+    target_compile_options(tuna_prot PRIVATE ${TUNA_PRIVATE_FLAGS})
+    target_include_directories(tuna_prot PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/prot
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/helicase_cpp
+    )
+    target_compile_definitions(tuna_prot PRIVATE
+        TUNA_VERSION="${PROJECT_VERSION}"
+    )
+    target_link_libraries(tuna_prot PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads)
 endif()

@@ -1,5 +1,9 @@
 # tuna
 
+> **Branch `feat/prot-support` — work in progress.**
+> This branch adds `tuna-prot`, a protein k-mer counter built on the same minimizer-superkmer pipeline as tuna.
+> It is not yet merged or released. Expect API and CLI changes.
+
 **tuna** is a fast, streaming k-mer counter for FASTA/FASTQ input.
 It partitions k-mers by minimizer into superkmer files, then counts them using a streaming hash table — keeping memory usage low and throughput high.
 
@@ -250,3 +254,49 @@ tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)
+
+---
+
+## tuna-prot — protein k-mer counter (work in progress)
+
+`tuna-prot` is a companion binary for counting k-mers in **protein sequences** (FASTA, plain or gzipped).
+It shares the same minimizer-superkmer pipeline as tuna but uses a 5-bit amino acid encoding (k ≤ 12) and operates on the 20 standard amino acids.
+Sequences are split on ambiguous residues (B, J, O, U, X, Z, `*`, `-`); multi-line FASTA is fully supported.
+
+### Build
+
+```bash
+cd build && cmake --build . --target tuna_prot -j$(nproc)
+```
+
+The `tuna_prot` binary will be at `build/tuna_prot`.
+
+### Usage
+
+```
+tuna_prot [options] <file1.fa> [file2.fa ...]
+```
+
+Input files may be plain FASTA or gzip FASTA (`.gz`).
+Prefix a file with `@` to treat it as a file-of-filenames.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-k <int>` | `7` | k-mer length `[4, 12]` |
+| `-m <int>` | `5` | Minimizer length `[2, k-1]` |
+| `-t <int>` | `4` | Number of threads |
+| `-n <int>` | auto | Number of partitions (power of 2) |
+| `-o <file>` | stdout | Output file (`-` = stdout) |
+| `-w <dir>` | `.` | Work directory for temp files |
+| `-ram <GB>` | auto | RAM budget |
+| `-hp` | off | Hide progress |
+| `-kt` | off | Keep temp partition files |
+| `-tp` | off | Stop after phase 1 |
+
+Output is TSV: `<kmer>\t<count>`, one k-mer per line.
+
+### Example
+
+```bash
+tuna_prot -k 7 -m 4 -t 4 proteins.fasta > counts.tsv
+```
