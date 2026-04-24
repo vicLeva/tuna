@@ -134,7 +134,6 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-cx` | `<int>` | `max` | Maximum count to report |
 | `-ram` | `<int>` | auto | RAM budget in GB. Controls whether the in-memory or disk pipeline is used, and sizes write buffers accordingly. Set lower than physical RAM to leave headroom for other processes, or higher to force the in-memory pipeline |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files. |
-| `-p` | — | off | Pangenome mode. Use when all input files are from the **same species** (e.g. a human pan-genome or a collection of bacterial isolates from the same strain). tuna uses `total_kmers / n_files` as the unique k-mer estimate per partition, which avoids the 10–50× table over-allocation that otherwise occurs when coverage grows with the number of files. Has no effect with a single input file. |
 | `-kff` | — | off | Write output in [KFF binary format](https://github.com/Kmer-File-Format/kff-reference) instead of TSV. Auto-detected from a `.kff` output extension. |
 | `-h` / `--help` | — | — | Print usage |
 
@@ -249,6 +248,5 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 
 tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
-KMC tends to be faster on scaling set of datasets rather than counting k-mers inside individual files.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)
