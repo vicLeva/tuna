@@ -4,6 +4,7 @@
 #include <fstream>
 #include <limits>
 #include <cstdlib>
+#include <string_view>
 
 
 void print_usage(const char* prog)
@@ -74,27 +75,63 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             return argv[++i];
         };
 
+        auto parse_u64 = [&](const char* flag, const char* txt, uint64_t max, uint64_t& out) -> bool {
+            try {
+                const std::string_view s(txt);
+                size_t pos = 0;
+                const unsigned long long v = std::stoull(std::string(s), &pos, 10);
+                if (pos != s.size()) {
+                    std::cerr << "tuna: error: invalid integer for " << flag << ": " << s << "\n";
+                    return false;
+                }
+                if (v > max) {
+                    std::cerr << "tuna: error: value out of range for " << flag << ": " << s << "\n";
+                    return false;
+                }
+                out = static_cast<uint64_t>(v);
+                return true;
+            } catch (const std::exception&) {
+                std::cerr << "tuna: error: invalid integer for " << flag << ": " << txt << "\n";
+                return false;
+            }
+        };
+
         if (arg == "-k") {
             const char* v = next_val("-k"); if (!v) return false;
-            cfg.k = static_cast<uint16_t>(std::stoul(v));
+            uint64_t parsed = 0;
+            if (!parse_u64("-k", v, std::numeric_limits<uint16_t>::max(), parsed)) return false;
+            cfg.k = static_cast<uint16_t>(parsed);
         } else if (arg == "-m") {
             const char* v = next_val("-m"); if (!v) return false;
-            cfg.l = static_cast<uint16_t>(std::stoul(v));
+            uint64_t parsed = 0;
+            if (!parse_u64("-m", v, std::numeric_limits<uint16_t>::max(), parsed)) return false;
+            cfg.l = static_cast<uint16_t>(parsed);
         } else if (arg == "-n") {
             const char* v = next_val("-n"); if (!v) return false;
-            cfg.num_partitions = static_cast<uint32_t>(std::stoul(v));
+            uint64_t parsed = 0;
+            if (!parse_u64("-n", v, std::numeric_limits<uint32_t>::max(), parsed)) return false;
+            cfg.num_partitions = static_cast<uint32_t>(parsed);
         } else if (arg == "-ci") {
             const char* v = next_val("-ci"); if (!v) return false;
-            cfg.ci = static_cast<uint32_t>(std::stoul(v));
+            uint64_t parsed = 0;
+            if (!parse_u64("-ci", v, std::numeric_limits<uint32_t>::max(), parsed)) return false;
+            cfg.ci = static_cast<uint32_t>(parsed);
         } else if (arg == "-cx") {
             const char* v = next_val("-cx"); if (!v) return false;
-            cfg.cx = std::stoull(v);
+            uint64_t parsed = 0;
+            if (!parse_u64("-cx", v, std::numeric_limits<uint64_t>::max(), parsed)) return false;
+            cfg.cx = parsed;
         } else if (arg == "-t") {
             const char* v = next_val("-t"); if (!v) return false;
-            cfg.num_threads = static_cast<uint32_t>(std::stoul(v));
+            uint64_t parsed = 0;
+            if (!parse_u64("-t", v, std::numeric_limits<uint32_t>::max(), parsed)) return false;
+            cfg.num_threads = static_cast<uint32_t>(parsed);
         } else if (arg == "-ram") {
             const char* v = next_val("-ram"); if (!v) return false;
-            cfg.ram_budget_bytes = static_cast<uint64_t>(std::stoul(v)) << 30;
+            uint64_t parsed_gb = 0;
+            const uint64_t max_gb = std::numeric_limits<uint64_t>::max() >> 30;
+            if (!parse_u64("-ram", v, max_gb, parsed_gb)) return false;
+            cfg.ram_budget_bytes = parsed_gb << 30;
         } else if (arg == "-w") {
             const char* v = next_val("-w"); if (!v) return false;
             cfg.work_dir = v;

@@ -248,6 +248,5 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 
 tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
-KMC tends to be faster on scaling set of datasets rather than counting k-mers inside individual files.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)

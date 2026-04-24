@@ -23,6 +23,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <exception>
 
 
 // Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
@@ -132,6 +133,10 @@ PartitionStats partition_kmers_gz_pc(
     std::mutex              q_mutex;
     std::condition_variable q_cv;
     bool                    producer_done = false;
+    std::exception_ptr      producer_error = nullptr;
+    std::atomic<bool>       stop{false};
+    std::exception_ptr      consumer_error = nullptr;
+    std::mutex              consumer_error_mutex;
 
     std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
@@ -143,11 +148,14 @@ PartitionStats partition_kmers_gz_pc(
             while (true) {
                 Batch batch;
                 size_t chunk_count = 0;
-                while (chunk_count < BATCH_SEQS && parser.next()) {
+                while (!stop.load(std::memory_order_relaxed)
+                       && chunk_count < BATCH_SEQS
+                       && parser.next()) {
                     auto [ptr, len] = parser.get_dna_raw();
                     batch.emplace_back(ptr, len);
                     ++chunk_count;
                 }
+                if (stop.load(std::memory_order_relaxed)) break;
                 if (batch.empty()) break;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
@@ -169,49 +177,64 @@ PartitionStats partition_kmers_gz_pc(
                 feed(p);
             }
         } catch (...) {
-            std::lock_guard<std::mutex> lk(q_mutex);
-            producer_done = true;
+            {
+                std::lock_guard<std::mutex> lk(q_mutex);
+                producer_error = std::current_exception();
+                producer_done = true;
+            }
+            stop.store(true, std::memory_order_relaxed);
             q_cv.notify_all();
         }
     };
 
     // Consumer: pull batches from the queue and extract superkmers.
     auto consumer_fn = [&]() {
-        const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
-        MinimizerWindow<k, m>               min_it;
-        std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-        std::vector<uint8_t>         kache_buf;
-        uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            MinimizerWindow<k, m>               min_it;
+            std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t>         kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
-        auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-            if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
-        };
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
+            };
 
-        while (true) {
-            Batch batch;
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                Batch batch;
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
+                    if (queue.empty()) break;       // producer_done && queue empty → done
+                    batch = std::move(queue.front());
+                    queue.pop_front();
+                }
+                q_cv.notify_one();                  // wake producer if it was waiting for space
+
+                for (const auto& chunk : batch) {
+                    if (stop.load(std::memory_order_relaxed)) break;
+                    extract_superkmers_from_actg<k, m>(
+                        chunk.data(), chunk.size(), partition_fn,
+                        min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    ++local_seqs;
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to(buckets[p], bucket_mutexes[p]);
+
+            total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
+            total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
+            total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+        } catch (...) {
             {
-                std::unique_lock<std::mutex> lk(q_mutex);
-                q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
-                if (queue.empty()) break;       // producer_done && queue empty → done
-                batch = std::move(queue.front());
-                queue.pop_front();
+                std::lock_guard<std::mutex> lk(consumer_error_mutex);
+                if (!consumer_error) consumer_error = std::current_exception();
             }
-            q_cv.notify_one();                  // wake producer if it was waiting for space
-
-            for (const auto& chunk : batch) {
-                extract_superkmers_from_actg<k, m>(
-                    chunk.data(), chunk.size(), partition_fn,
-                    min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
-                ++local_seqs;
-            }
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
         }
-
-        for (size_t p = 0; p < n_parts; ++p)
-            writers[p].flush_to(buckets[p], bucket_mutexes[p]);
-
-        total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
-        total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
-        total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
     };
 
     std::vector<std::thread> threads;
@@ -220,6 +243,8 @@ PartitionStats partition_kmers_gz_pc(
     for (size_t t = 0; t < n_consumers; ++t)
         threads.emplace_back(consumer_fn);
     for (auto& th : threads) th.join();
+    if (producer_error) std::rethrow_exception(producer_error);
+    if (consumer_error) std::rethrow_exception(consumer_error);
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -257,36 +282,49 @@ PartitionStats partition_kmers_impl(
     std::atomic<size_t>   next_file{0};
     std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
+    std::atomic<bool>       stop{false};
+    std::exception_ptr      worker_error = nullptr;
+    std::mutex              worker_error_mutex;
 
     auto worker = [&]() {
-        const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
-        SeqSource            source;
-        MinimizerWindow<k, m>               min_it;
-        std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-        std::vector<uint8_t>         kache_buf;
-        uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            SeqSource            source;
+            MinimizerWindow<k, m>               min_it;
+            std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t>         kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
-        auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-            if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
-        };
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
+            };
 
-        while (true) {
-            const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
-            if (fi >= n_files) break;
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
+                if (fi >= n_files) break;
 
-            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                extract_superkmers_from_actg<k, m>(
-                    chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
-                ++local_seqs;
-            });
+                source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    extract_superkmers_from_actg<k, m>(
+                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    ++local_seqs;
+                });
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to(buckets[p], bucket_mutexes[p]);
+
+            total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
+            total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
+            total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(worker_error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
         }
-
-        for (size_t p = 0; p < n_parts; ++p)
-            writers[p].flush_to(buckets[p], bucket_mutexes[p]);
-
-        total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
-        total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
-        total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
     };
 
     std::vector<std::thread> threads;
@@ -294,6 +332,7 @@ PartitionStats partition_kmers_impl(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -337,6 +376,10 @@ PartitionStats partition_kmers_mem_impl(
             std::mutex              q_mutex;
             std::condition_variable q_cv;
             bool                    producer_done = false;
+            std::exception_ptr      producer_error = nullptr;
+            std::atomic<bool>       stop{false};
+            std::exception_ptr      consumer_error = nullptr;
+            std::mutex              consumer_error_mutex;
             std::vector<std::mutex> buf_mutexes(n_parts);
             std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
@@ -345,11 +388,14 @@ PartitionStats partition_kmers_mem_impl(
                     while (true) {
                         Batch batch;
                         size_t chunk_count = 0;
-                        while (chunk_count < BATCH_SEQS && parser.next()) {
+                        while (!stop.load(std::memory_order_relaxed)
+                               && chunk_count < BATCH_SEQS
+                               && parser.next()) {
                             auto [ptr, len] = parser.get_dna_raw();
                             batch.emplace_back(ptr, len);
                             ++chunk_count;
                         }
+                        if (stop.load(std::memory_order_relaxed)) break;
                         if (batch.empty()) break;
                         { std::unique_lock<std::mutex> lk(q_mutex);
                           q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
@@ -369,41 +415,56 @@ PartitionStats partition_kmers_mem_impl(
                         feed(p);
                     }
                 } catch (...) {
-                    std::lock_guard<std::mutex> lk(q_mutex);
-                    producer_done = true;
+                    {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        producer_error = std::current_exception();
+                        producer_done = true;
+                    }
+                    stop.store(true, std::memory_order_relaxed);
                     q_cv.notify_all();
                 }
             };
 
             auto consumer_fn = [&]() {
-                const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
-                MinimizerWindow<k, m>        min_it;
-                std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-                std::vector<uint8_t>         kache_buf;
-                uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
-                auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-                    if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
-                };
-                while (true) {
-                    Batch batch;
-                    { std::unique_lock<std::mutex> lk(q_mutex);
-                      q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
-                      if (queue.empty()) break;
-                      batch = std::move(queue.front());
-                      queue.pop_front(); }
-                    q_cv.notify_one();
-                    for (const auto& chunk : batch) {
-                        extract_superkmers_from_actg<k, m>(
-                            chunk.data(), chunk.size(), partition_fn,
-                            min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
-                        ++local_seqs;
+                try {
+                    const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+                    MinimizerWindow<k, m>        min_it;
+                    std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+                    std::vector<uint8_t>         kache_buf;
+                    uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+                    auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                        if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                    };
+                    while (true) {
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        Batch batch;
+                        { std::unique_lock<std::mutex> lk(q_mutex);
+                          q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
+                          if (queue.empty()) break;
+                          batch = std::move(queue.front());
+                          queue.pop_front(); }
+                        q_cv.notify_one();
+                        for (const auto& chunk : batch) {
+                            if (stop.load(std::memory_order_relaxed)) break;
+                            extract_superkmers_from_actg<k, m>(
+                                chunk.data(), chunk.size(), partition_fn,
+                                min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                            ++local_seqs;
+                        }
                     }
+                    for (size_t p = 0; p < n_parts; ++p)
+                        writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                    total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
+                    total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
+                    total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lk(consumer_error_mutex);
+                        if (!consumer_error) consumer_error = std::current_exception();
+                    }
+                    stop.store(true, std::memory_order_relaxed);
+                    q_cv.notify_all();
                 }
-                for (size_t p = 0; p < n_parts; ++p)
-                    writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
-                total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
-                total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
-                total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
             };
 
             std::vector<std::thread> threads;
@@ -412,6 +473,8 @@ PartitionStats partition_kmers_mem_impl(
             for (size_t t = 0; t < n_consumers; ++t)
                 threads.emplace_back(consumer_fn);
             for (auto& th : threads) th.join();
+            if (producer_error) std::rethrow_exception(producer_error);
+            if (consumer_error) std::rethrow_exception(consumer_error);
             return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
         }
     }
@@ -420,36 +483,49 @@ PartitionStats partition_kmers_mem_impl(
     std::atomic<size_t>     next_file{0};
     std::vector<std::mutex> buf_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
+    std::atomic<bool>       stop{false};
+    std::exception_ptr      worker_error = nullptr;
+    std::mutex              worker_error_mutex;
 
     auto worker = [&]() {
-        const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
-        SeqSource            source;
-        MinimizerWindow<k, m>               min_it;
-        std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-        std::vector<uint8_t>         kache_buf;
-        uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+            SeqSource            source;
+            MinimizerWindow<k, m>               min_it;
+            std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t>         kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
-        auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-            if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
-        };
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+            };
 
-        while (true) {
-            const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
-            if (fi >= n_files) break;
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
+                if (fi >= n_files) break;
 
-            source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
-                extract_superkmers_from_actg<k, m>(
-                    chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
-                ++local_seqs;
-            });
+                source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    extract_superkmers_from_actg<k, m>(
+                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    ++local_seqs;
+                });
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+
+            total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
+            total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
+            total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(worker_error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
         }
-
-        for (size_t p = 0; p < n_parts; ++p)
-            writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
-
-        total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
-        total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
-        total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
     };
 
     std::vector<std::thread> threads;
@@ -457,6 +533,7 @@ PartitionStats partition_kmers_mem_impl(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
 

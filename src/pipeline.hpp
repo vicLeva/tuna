@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+#include <stdexcept>
 #include <vector>
 
 #ifdef __linux__
@@ -160,15 +161,21 @@ int run(const Config& cfg)
                 return r;
               }()
             : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
+        if (!cfg.output_kff && !tsv_out) {
+            std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
+            return 1;
+        }
 
         const double t_phase2 = elapsed_s(t2);
         if (!cfg.hide_progress)
             std::cerr << "      " << total_inserted << " k-mers in  "
                       << total_written << " unique out  " << fmt_s(t_phase2) << "\n";
 
-        std::cerr << "phase1: "     << t_phase1        << "s\n"
-                  << "phase2: "     << t_phase2        << "s\n"
-                  << "superkmers: " << stats.superkmers << "\n";
+        std::cerr << "phase1: "        << t_phase1            << "s\n"
+                  << "phase2: "        << t_phase2            << "s\n"
+                  << "superkmers: "    << stats.superkmers     << "\n"
+                  << "n_parts: "       << cfg.num_partitions   << "\n"
+                  << "unique_kmers: "  << total_written        << "\n";
         if (!cfg.hide_progress)
             std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
         return 0;
@@ -177,12 +184,24 @@ int run(const Config& cfg)
     // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
 
     std::vector<std::ofstream> buckets(cfg.num_partitions);
-    for (size_t p = 0; p < cfg.num_partitions; ++p)
-        buckets[p].open(partition_path(cfg.work_dir, p),
-                        std::ios::binary);
+    for (size_t p = 0; p < cfg.num_partitions; ++p) {
+        const std::string path = partition_path(cfg.work_dir, p);
+        buckets[p].open(path, std::ios::binary);
+        if (!buckets[p]) {
+            std::cerr << "tuna: error: cannot open partition file for writing: " << path << "\n";
+            return 1;
+        }
+    }
 
     stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
-    for (auto& f : buckets) f.close();
+    for (size_t p = 0; p < cfg.num_partitions; ++p) {
+        buckets[p].close();
+        if (!buckets[p]) {
+            std::cerr << "tuna: error: failed while writing partition file: "
+                      << partition_path(cfg.work_dir, p) << "\n";
+            return 1;
+        }
+    }
 
     const double t_phase1 = elapsed_s(t_part);
     if (!cfg.hide_progress)
@@ -223,6 +242,10 @@ int run(const Config& cfg)
             return r;
           }()
         : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
+    if (!cfg.output_kff && !tsv_out) {
+        std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
+        return 1;
+    }
 
     const double t_phase2 = elapsed_s(t2);
     if (!cfg.hide_progress)
@@ -287,10 +310,20 @@ void run_callback(const Config& cfg, Callback&& cb)
         }();
 
         std::vector<std::ofstream> buckets(cfg.num_partitions);
-        for (size_t p = 0; p < cfg.num_partitions; ++p)
-            buckets[p].open(partition_path(cfg.work_dir, p), std::ios::binary);
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            const std::string path = partition_path(cfg.work_dir, p);
+            buckets[p].open(path, std::ios::binary);
+            if (!buckets[p])
+                throw std::runtime_error("tuna: cannot open partition file for writing: " + path);
+        }
         stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
-        for (auto& f : buckets) f.close();
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            buckets[p].close();
+            if (!buckets[p]) {
+                throw std::runtime_error(
+                    "tuna: failed while writing partition file: " + partition_path(cfg.work_dir, p));
+            }
+        }
 
         count_and_callback<k, m>(cfg, stats.kmers, std::forward<Callback>(cb));
     }

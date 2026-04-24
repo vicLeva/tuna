@@ -203,6 +203,10 @@ public:
     template <typename T_container_>
     void get_label(T_container_& label) const;
 
+    // Writes the k-mer as packed 2-bit bases into `dst` (MSB-first, 4 bases/byte).
+    // The output layout is suitable for KFF sequence payloads.
+    void write_packed_2bit_msb(uint8_t* dst) const;
+
     // Implicitly converts the k-mer to a `std::string`.
     operator std::string() const;
 
@@ -675,6 +679,17 @@ inline void Kmer<k>::get_label(T_container_& label) const
     for(uint16_t bit_pair_idx = 0; bit_pair_idx < (k & 31); ++bit_pair_idx)
         label[(k - 1) - (((NUM_INTS - 1) << 5) + bit_pair_idx)] =
             DNA_Utility::map_char(static_cast<DNA::Base>((kmer_data[NUM_INTS - 1] & (0b11ULL << (2 * bit_pair_idx))) >> (2 * bit_pair_idx)));
+}
+
+template <uint16_t k>
+inline void Kmer<k>::write_packed_2bit_msb(uint8_t* dst) const
+{
+    constexpr std::size_t packed_bytes = (k + 3) / 4;
+    std::memset(dst, 0, packed_bytes);
+    for (uint16_t i = 0; i < k; ++i) {
+        const uint8_t b = static_cast<uint8_t>(base_at(k - 1 - i));
+        dst[i >> 2] |= static_cast<uint8_t>(b << (6u - 2u * (i & 3u)));
+    }
 }
 
 

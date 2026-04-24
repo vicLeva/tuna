@@ -36,3 +36,4 @@ perf.data.*
 tools/*.png
 
 .claude/
+.codex
