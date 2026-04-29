@@ -43,6 +43,15 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
+# ── ankerl::unordered_dense — flat Robin Hood hash map ────────────────────────
+FetchContent_Declare(
+    unordered_dense
+    GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+    GIT_TAG        v4.4.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(unordered_dense)
+
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
 # no code changes required. Disable with -DTUNA_USE_ZLIB_NG=OFF to fall back
@@ -152,7 +161,7 @@ target_compile_definitions(tuna_lib INTERFACE
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
 )
-target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io unordered_dense::unordered_dense)
 
 # ── tuna — CLI executable (only when tuna is the top-level project) ────────────
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)

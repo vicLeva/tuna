@@ -41,7 +41,6 @@ inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
 // Walk one ACTG-only sequence, detect superkmer boundaries on minimizer hash
 // changes, and append each superkmer to the corresponding writer.
 // Splits on hash change (not partition change) so every superkmer has one minimizer.
-// min_pos comes from MinimizerWindow::min_lmer_pos() — no extra scan needed.
 //
 // FlushFn: void(std::vector<SuperkmerWriter<k,m>>&, size_t partition_id)
 // Called after each append; O(1) per superkmer.
@@ -70,31 +69,27 @@ void extract_superkmers_from_actg(
         kache_buf[i] = ((uint8_t(seq[i]) >> 2) ^ (uint8_t(seq[i]) >> 1)) & 3u;
 
     min_it.reset(seq);   // initialises from ASCII (called once per sequence — cheap)
-    uint64_t prev_hash    = min_it.hash();
-    uint64_t prev_min_pos = min_it.min_lmer_pos(); // absolute pos within seq
-    size_t   pid          = partition_fn(prev_hash);  // partition id
-    size_t   sk_start     = 0;                        // superkmer start position in current sequence
+    uint64_t prev_hash = min_it.hash();
+    size_t   pid       = partition_fn(prev_hash);  // partition id
+    size_t   sk_start  = 0;                        // superkmer start position in current sequence
 
     for (size_t pos = k; pos < seq_len; ++pos) {
         min_it.advance_kache(kache_buf[pos]);
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
-            const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
-            writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
+            const auto sk_len = static_cast<hdr_t>(pos - sk_start);
+            writers[pid].append_kache(kache_buf.data() + sk_start, sk_len);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
-            prev_hash    = new_hash;
-            prev_min_pos = min_it.min_lmer_pos();
-            pid          = partition_fn(new_hash);
-            sk_start     = pos - (k - 1);
+            prev_hash = new_hash;
+            pid       = partition_fn(new_hash);
+            sk_start  = pos - (k - 1);
         }
     }
 
-    const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
-    writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
+    const auto sk_len = static_cast<hdr_t>(seq_len - sk_start);
+    writers[pid].append_kache(kache_buf.data() + sk_start, sk_len);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
     ++sk_count;
