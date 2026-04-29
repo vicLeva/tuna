@@ -1,20 +1,16 @@
 #pragma once
 
 // On-disk / in-memory superkmer format:
-//   [hdr_t len_bases][hdr_t min_pos][ceil(len/4) packed bytes]
+//   [hdr_t len_bases][ceil(len/4) packed bytes]
 //
 // hdr_t is uint8_t when max superkmer length fits in 8 bits (2k-m ≤ 255),
 // uint16_t otherwise.  The type is a compile-time constant deduced from k and m,
 // so the header is as compact as possible without ever truncating a value.
 //
 //   Max superkmer length : 2k − m  (two k-mers sharing the boundary minimizer)
-//   Max min_pos          : 2(k−m)  < 2k−m, so same type covers both fields
 //
-// For k ≤ 138 with m ≥ 21 (the common genomics range), hdr_t = uint8_t → 2-byte
-// header per superkmer.  For larger k, hdr_t = uint16_t → 4-byte header.
-//
-// The sentinel value hdr_t::max() in min_pos means "no precomputed minimizer
-// hash stored" — Phase 2 falls back to a full MinimizerWindow::reset().
+// For k ≤ 138 with m ≥ 21 (the common genomics range), hdr_t = uint8_t → 1-byte
+// header per superkmer.  For larger k, hdr_t = uint16_t → 2-byte header.
 //
 // Packed encoding: base i is at bits 7-2*(i%4) of byte i/4, MSB-first.
 
@@ -47,10 +43,6 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 template <uint16_t k, uint16_t m>
 using sk_hdr_t = std::conditional_t<(2u * k - m <= 255u), uint8_t, uint16_t>;
 
-// Sentinel stored in min_pos when no precomputed minimizer hash is available.
-template <uint16_t k, uint16_t m>
-static constexpr sk_hdr_t<k, m> sk_no_min = std::numeric_limits<sk_hdr_t<k, m>>::max();
-
 
 // ─── Writer ───────────────────────────────────────────────────────────────────
 //
@@ -62,7 +54,7 @@ template <uint16_t k, uint16_t m>
 struct SuperkmerWriter
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);  // header bytes per record
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);  // header bytes per record
 
     char*  raw_  = nullptr;  // raw buffer pointer
     size_t sz_   = 0;        // used bytes
@@ -124,12 +116,11 @@ struct SuperkmerWriter
     }
 
     // Serialise one superkmer from ASCII DNA (ACGT, any case).
-    void append(const char* data, hdr_t len, hdr_t min_pos)
+    void append(const char* data, hdr_t len)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
         char* dst = reserve_inline(HDR_BYTES + packed_bytes);
-        std::memcpy(dst,                &len,     sizeof(hdr_t));
-        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        std::memcpy(dst, &len, sizeof(hdr_t));
         uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         size_t i = 0;
@@ -151,12 +142,11 @@ struct SuperkmerWriter
     }
 
     // Serialise one superkmer from pre-encoded kache bytes (A=0,C=1,G=2,T=3).
-    void append_kache(const uint8_t* kdata, hdr_t len, hdr_t min_pos)
+    void append_kache(const uint8_t* kdata, hdr_t len)
     {
         const size_t packed_bytes = (len + 3u) / 4u;
         char* dst = reserve_inline(HDR_BYTES + packed_bytes);
-        std::memcpy(dst,                 &len,     sizeof(hdr_t));
-        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        std::memcpy(dst, &len, sizeof(hdr_t));
         uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         size_t i = 0;
@@ -197,7 +187,7 @@ template <uint16_t k, uint16_t m>
 struct SuperkmerReader
 {
     using hdr_t = sk_hdr_t<k, m>;
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);
 
     explicit SuperkmerReader(const std::string& path)
     {
@@ -232,11 +222,9 @@ struct SuperkmerReader
     bool next()
     {
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
-        hdr_t len, mp;
-        std::memcpy(&len, cur_,                sizeof(hdr_t));
-        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        hdr_t len;
+        std::memcpy(&len, cur_, sizeof(hdr_t));
         if (len == 0) return false;
-        min_pos_ = mp;
         cur_ += HDR_BYTES;
 
         const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
@@ -250,7 +238,6 @@ struct SuperkmerReader
 
     const uint8_t* packed_data() const { return ptr_; }
     size_t         size()        const { return len_; }
-    hdr_t          min_pos()     const { return min_pos_; }
     size_t         file_size()   const { return size_; }
     bool           ok()          const { return map_ != nullptr; }
 
@@ -262,7 +249,6 @@ private:
     const char*    end_     = nullptr; // one past last byte
     const uint8_t* ptr_     = nullptr; // packed data of current superkmer
     size_t         len_     = 0;       // length of current superkmer (bases)
-    hdr_t          min_pos_ = 0;       // minimizer position in current superkmer
 };
 
 
@@ -272,7 +258,7 @@ template <uint16_t k, uint16_t m>
 struct MemoryReader
 {
     using hdr_t = sk_hdr_t<k, m>;
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);
 
     MemoryReader() = default;
     explicit MemoryReader(const std::string& data) noexcept
@@ -281,11 +267,9 @@ struct MemoryReader
     bool next() noexcept
     {
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
-        hdr_t len, mp;
-        std::memcpy(&len, cur_,                sizeof(hdr_t));
-        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        hdr_t len;
+        std::memcpy(&len, cur_, sizeof(hdr_t));
         if (len == 0) return false;
-        min_pos_ = mp;
         cur_ += HDR_BYTES;
         const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
         if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
@@ -297,7 +281,6 @@ struct MemoryReader
 
     const uint8_t* packed_data() const noexcept { return ptr_; }
     size_t         size()        const noexcept { return len_; }
-    hdr_t          min_pos()     const noexcept { return min_pos_; }
     bool           ok()          const noexcept { return cur_ != nullptr; }
 
 private:
@@ -305,5 +288,4 @@ private:
     const char*    end_     = nullptr;
     const uint8_t* ptr_     = nullptr;
     size_t         len_     = 0;
-    hdr_t          min_pos_ = 0;
 };

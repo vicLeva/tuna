@@ -43,6 +43,23 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
+# ── iceberg hash table — three-level concurrent hash table (static library) ───
+set(ICEBERG_DIR /home/vlevallo/documents/giulio_colab/softs/iceberghashtable)
+
+add_library(iceberg STATIC
+    ${ICEBERG_DIR}/src/iceberg_table.c
+    ${ICEBERG_DIR}/src/hashutil.c
+    ${ICEBERG_DIR}/src/lock.c
+    ${ICEBERG_DIR}/src/partitioned_counter.c
+)
+target_include_directories(iceberg PUBLIC
+    ${ICEBERG_DIR}/include
+    ${ICEBERG_DIR}/src
+)
+target_compile_options(iceberg PRIVATE -O3 -march=native -w)
+target_compile_definitions(iceberg PUBLIC USE_AVX)
+set_target_properties(iceberg PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
 # no code changes required. Disable with -DTUNA_USE_ZLIB_NG=OFF to fall back
@@ -152,7 +169,7 @@ target_compile_definitions(tuna_lib INTERFACE
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
 )
-target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io iceberg)
 
 # ── tuna — CLI executable (only when tuna is the top-level project) ────────────
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
