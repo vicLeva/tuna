@@ -332,19 +332,24 @@ void run_callback(const Config& cfg, Callback&& cb)
 
 // ─── Runtime dispatch (k × m) ────────────────────────────────────────────────
 //
-// Three dispatch modes, selected at compile time:
+// Four dispatch modes, selected at compile time:
 //
-//   FIXED_K + FIXED_M  (recommended for k > 31 or any non-standard k/m pair)
+//   FIXED_K + FIXED_M  (recommended for any non-standard k/m pair)
 //     Single template instantiation.  Any k ∈ [1,256], any m ∈ [1,k-1].
 //     cmake: -DFIXED_K=<k> -DFIXED_M=<m>
 //
 //   FIXED_K only
-//     Instantiates one k with m ∈ {9,11,...,min(k-2,29),odd-up-to-k-2} (see table).
+//     Instantiates one k with m ∈ {9,11,...,min(k-2,31)} (odd).
 //     cmake: -DFIXED_K=<k>
 //
-//   No flags (default build, backward-compatible)
-//     Supports k ∈ {11,13,...,31} (odd), m ∈ {9,...,k-2} (odd).
-//     For any other k, prints a message telling the user to recompile.
+//   TUNA_CONDA_PROFILE  (for conda binary packaging)
+//     Curated subset: k ∈ {21,31,51,63,127}, ~5 odd m values each (~27 total).
+//     Same zero-overhead dispatch as the default build, ~10× smaller binary.
+//     cmake: -DTUNA_CONDA_PROFILE=ON
+//
+//   No flags (default build)
+//     Supports k ∈ {11,13,...,127} (odd), m ∈ {9,...,min(k-2,31)} (odd).
+//     For any other k/m, prints a message telling the user to recompile.
 //
 // dispatch_generic is called by both the CLI and the library API.
 // It invokes f.template operator()<K, L>() for the matching (K, L) pair.
@@ -369,8 +374,29 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
     f.template operator()<FIXED_K, FIXED_M>();
     return 0;
 
+#elif defined(TUNA_CONDA_PROFILE)
+    // ── Conda profile: curated k × m subset ──────────────────────────────────
+    // k ∈ {21, 31, 51, 63, 127}; odd m values most used in practice.
+    // ~27 instantiations total — roughly 10× smaller binary than the full table.
+#define TDG(K, L)  if (k == (K) && m == (L)) { f.template operator()<K, L>(); return 0; }
+    TDG(21, 11); TDG(21, 13); TDG(21, 15); TDG(21, 17); TDG(21, 19);
+    TDG(31, 15); TDG(31, 17); TDG(31, 19); TDG(31, 21); TDG(31, 23);
+    TDG(51, 17); TDG(51, 19); TDG(51, 21); TDG(51, 23); TDG(51, 25);
+    TDG(63, 19); TDG(63, 21); TDG(63, 23); TDG(63, 25); TDG(63, 27);
+    TDG(127, 19); TDG(127, 21); TDG(127, 23); TDG(127, 25); TDG(127, 27); TDG(127, 29); TDG(127, 31);
+#undef TDG
+    std::cerr << "tuna: error: unsupported k=" << k << " m=" << m << " in conda build\n"
+              << "  Conda build supports k ∈ {21,31,51,63,127} with odd m:\n"
+              << "    k=21  m ∈ {11,13,15,17,19}\n"
+              << "    k=31  m ∈ {15,17,19,21,23}\n"
+              << "    k=51  m ∈ {17,19,21,23,25}\n"
+              << "    k=63  m ∈ {19,21,23,25,27}\n"
+              << "    k=127 m ∈ {19,21,23,25,27,29,31}\n"
+              << "  For other k/m recompile with -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
+    return 1;
+
 #else
-    // ── Mode 2 / 3: legacy dispatch table ────────────────────────────────────
+    // ── Mode 2 / 3: full dispatch table ──────────────────────────────────────
     // Each k block is guarded by #if so that only the selected k's templates
     // are instantiated — keeping compile time and binary size minimal with FIXED_K.
 #define TDG(K, L)  if (k == (K) && m == (L)) { f.template operator()<K, L>(); return 0; }
@@ -508,15 +534,22 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
     TDG(63, 17); TDG(63, 19); TDG(63, 21); TDG(63, 23);
     TDG(63, 25); TDG(63, 27); TDG(63, 29); TDG(63, 31);
 #endif
+// k=127: Kmer<127> uses 4 × uint64_t words; fully supported by the generic Kmer<k> template.
+// m is capped at 31 to avoid excessive instantiations; use -DFIXED_K=127 -DFIXED_M=<m> for larger m.
+#if !defined(FIXED_K) || FIXED_K == 127
+    TDG(127,  9); TDG(127, 11); TDG(127, 13); TDG(127, 15);
+    TDG(127, 17); TDG(127, 19); TDG(127, 21); TDG(127, 23);
+    TDG(127, 25); TDG(127, 27); TDG(127, 29); TDG(127, 31);
+#endif
 #undef TDG
 
     // k/m pair not in the built-in table.
     std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
-              << "  Default build supports odd k ∈ [11,31] with matching odd m.\n"
+              << "  Default build supports odd k ∈ [11,127] with odd m ∈ [9,min(k-2,31)].\n"
               << "  For any other k or m recompile with:\n"
               << "    -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
     return 1;
-#endif  // FIXED_K && FIXED_M
+#endif  // FIXED_K && FIXED_M / TUNA_CONDA_PROFILE / default
 }
 
 
