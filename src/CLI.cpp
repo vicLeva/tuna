@@ -18,12 +18,27 @@ void print_usage(const char* prog)
         "\n"
         "Options:\n"
         "  -k  <int>   k-mer length               [default: 31]\n"
-        "              this build accepts: odd values in [11,31]\n"
+#if defined(TUNA_CONDA_PROFILE)
+        "              conda build supports: k ∈ {21, 31, 51, 63, 127}\n"
+        "              for other k values: https://github.com/vicLeva/tuna\n"
+#else
+        "              this build accepts: odd values in [11,127]\n"
         "              for other values recompile with -DFIXED_K=<k> -DFIXED_M=<m>\n"
+#endif
         "  -m  <int>   minimizer length            [default: 21]\n"
+#if defined(TUNA_CONDA_PROFILE)
+        "              conda build supports odd m per k:\n"
+        "                k=21  m ∈ {11,13,15,17,19}\n"
+        "                k=31  m ∈ {15,17,19,21,23}\n"
+        "                k=51  m ∈ {17,19,21,23,25}\n"
+        "                k=63  m ∈ {19,21,23,25,27}\n"
+        "                k=127 m ∈ {19,21,23,25,27,29,31}\n"
+        "              for other m values: https://github.com/vicLeva/tuna\n"
+#else
         "              any odd value in [1, min(k-1, 32)]\n"
         "              m=21 is a good default; use m=23-25 for highly repetitive\n"
         "              or low-complexity data (e.g. individual human genomes)\n"
+#endif
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
         "  -t  <int>   worker threads              [default: 1]\n"
         "              phase 1: parallel over input files (capped at #files)\n"
