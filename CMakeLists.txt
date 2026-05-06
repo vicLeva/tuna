@@ -26,6 +26,7 @@ FetchContent_Declare(
 )
 FetchContent_GetProperties(kff_src)
 if(NOT kff_src_POPULATED)
+    cmake_policy(SET CMP0169 OLD)
     FetchContent_Populate(kff_src)
 endif()
 
