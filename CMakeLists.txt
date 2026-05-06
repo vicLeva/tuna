@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.17)
-project(tuna VERSION 1.3.0 LANGUAGES CXX C)
+project(tuna VERSION 1.4.0 LANGUAGES CXX C)
 
 # Default to Release if no build type is specified.
 # Only set when tuna is the top-level project — do not override the parent's choice.
@@ -146,11 +146,20 @@ target_include_directories(tuna_lib INTERFACE
 # not — those are tuna's internal concern.
 target_compile_features(tuna_lib INTERFACE cxx_std_20)
 target_compile_options(tuna_lib INTERFACE ${TUNA_SIMD_FLAGS})
+# ── Conda packaging profile ────────────────────────────────────────────────────
+# Compiles only the k/m pairs needed for a conda binary:
+#   k ∈ {21, 31, 51, 63, 127}, each with a curated set of odd m values.
+# Produces ~27 template instantiations instead of ~270 — much smaller binary,
+# same zero-overhead runtime dispatch.
+# Usage: cmake .. -DTUNA_CONDA_PROFILE=ON
+option(TUNA_CONDA_PROFILE "Build with curated k/m subset for conda packaging" OFF)
+
 target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
+    $<$<BOOL:${TUNA_CONDA_PROFILE}>:TUNA_CONDA_PROFILE>
 )
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
 
