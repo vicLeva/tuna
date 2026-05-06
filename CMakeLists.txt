@@ -16,22 +16,18 @@ find_package(Threads REQUIRED)
 include(FetchContent)
 
 # ── kff-cpp-api for KFF output format ─────────────────────────────────────────
-# We skip kff's own CMakeLists (which would pull in unneeded benchmarks/executables)
-# and build the library directly from the two source files we need.
+# We build our own kff_io target directly from kff's source files.
+# FetchContent_MakeAvailable also processes kff's CMakeLists (creating targets
+# named 'kff', 'kff_example', 'reader_bench') — none conflict with our 'kff_io'.
+set(KFF_VERSION_MAJOR 1)
+set(KFF_VERSION_MINOR 0)
 FetchContent_Declare(
     kff_src
     GIT_REPOSITORY https://github.com/Kmer-File-Format/kff-cpp-api.git
     GIT_TAG        main
     GIT_SHALLOW    TRUE
 )
-FetchContent_GetProperties(kff_src)
-if(NOT kff_src_POPULATED)
-    cmake_policy(SET CMP0169 OLD)
-    FetchContent_Populate(kff_src)
-endif()
-
-set(KFF_VERSION_MAJOR 1)
-set(KFF_VERSION_MINOR 0)
+FetchContent_MakeAvailable(kff_src)
 configure_file(
     ${kff_src_SOURCE_DIR}/kff_io.hpp.in
     ${CMAKE_BINARY_DIR}/kff_io.hpp
