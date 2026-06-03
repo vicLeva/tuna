@@ -61,7 +61,7 @@ struct ResizeEvent {
 };
 
 
-template <uint16_t k, bool mt_, typename T_ = void, uint16_t l = 19>
+template <uint16_t k, bool mt_, typename T_ = void, uint16_t l = 19, bool canonical_ = true>
 class Streaming_Kmer_Hash_Table
 {
 private:
@@ -496,9 +496,9 @@ public:
 
 
 // Token required to use the hash table.
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 class alignas(L1_CACHE_LINE_SIZE)
-    Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Token
+    Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::Token
 {
     friend class Streaming_Kmer_Hash_Table;
 
@@ -522,7 +522,7 @@ public:
 template <uint16_t k, uint16_t l>
 class Kmer_Window
 {
-    template <uint16_t k_, bool mt_, typename T_, uint16_t l_> friend class Streaming_Kmer_Hash_Table;
+    template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool c_> friend class Streaming_Kmer_Hash_Table;
 
     Directed_Vertex<k>    v;
     Rolling_Hash<k, true> rh;
@@ -748,11 +748,11 @@ public:
 };
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-class Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Iterator
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+class Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::Iterator
 {
-    friend class Streaming_Kmer_Hash_Table<k, mt_, T_, l>;
-    typedef Streaming_Kmer_Hash_Table<k, mt_, T_, l> ht_t;
+    friend class Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>;
+    typedef Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_> ht_t;
 
 private:
 
@@ -795,8 +795,8 @@ public:
 };
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Streaming_Kmer_Hash_Table(const std::size_t max_sz, const uint64_t resize_worker_c, const double lf):
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::Streaming_Kmer_Hash_Table(const std::size_t max_sz, const uint64_t resize_worker_c, const double lf):
       lf(lf)
     , cap_(ceil_pow_2((max_sz / lf) / B))
     , resize_th(capacity() * lf)
@@ -820,15 +820,15 @@ inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::Streaming_Kmer_Hash_Table(const
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline Streaming_Kmer_Hash_Table<k, mt_, T_, l>::~Streaming_Kmer_Hash_Table()
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::~Streaming_Kmer_Hash_Table()
 {
     kache_hash::deallocate(T), kache_hash::deallocate(M), delete(ov);
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::clear()
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::clear()
 {
     std::memset(M, 0, cap_ * sizeof(Metadata)); // Checksum `0` denotes absence of a key.
 
@@ -844,8 +844,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::clear()
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::eq_mask(const simd256_t x, const simd256_t y)
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::eq_mask(const simd256_t x, const simd256_t y)
 {
 #ifdef AVX_512
     return _mm256_cmpeq_epi8_mask(x, y);  // x86-only path, simd256_t == __m256i here
@@ -856,8 +856,8 @@ inline uint32_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::eq_mask(const simd256_
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::bucket_size(const std::size_t b) const
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::bucket_size(const std::size_t b) const
 {
     const auto zero  = simd256_zero();
     const auto c_vec = simd256_load(M[b].cs);
@@ -868,8 +868,8 @@ inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::bucket_size(const s
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::main_table_size() const
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::main_table_size() const
 {
     std::size_t sz = 0;
     for(std::size_t b = 0; b < cap_; ++b)
@@ -879,9 +879,9 @@ inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::main_table_size() c
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <bool resize_>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::lock(const std::size_t b)
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::lock(const std::size_t b)
 {
     if constexpr(mt_)
         while(true)
@@ -902,9 +902,9 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::lock(const std::size_t b)
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <bool resize_>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::lock_ordered(const std::size_t p, const std::size_t q)
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::lock_ordered(const std::size_t p, const std::size_t q)
 {
     if constexpr(mt_)
         KACHE_HASH_LIKELY(p != q) ?
@@ -913,9 +913,9 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::lock_ordered(const std::si
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <bool resize_>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::unlock(const std::size_t b)
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::unlock(const std::size_t b)
 {
     if constexpr(mt_)
     {
@@ -933,9 +933,9 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::unlock(const std::size_t b
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <bool resize_>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::unlock_ordered(const std::size_t p, const std::size_t q)
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::unlock_ordered(const std::size_t p, const std::size_t q)
 {
     if constexpr(mt_)
         KACHE_HASH_LIKELY(p != q) ?
@@ -944,8 +944,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::unlock_ordered(const std::
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::size() const
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::size() const
 {
     // return main_table_size() + overflow_size();
     std::size_t sz = approx_sz;
@@ -957,8 +957,8 @@ inline std::size_t Streaming_Kmer_Hash_Table<k, mt_, T_, l>::size() const
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer<k> key, const uint8_t c, const std::size_t i) const -> find_ret_t
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find(const Kmer<k> key, const uint8_t c, const std::size_t i) const -> find_ret_t
 {
     assert(i < cap_);
 
@@ -990,8 +990,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer<k> key, co
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find_in_overflow(const Kmer<k> key) const -> find_ret_t
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find_in_overflow(const Kmer<k> key) const -> find_ret_t
 {
     if constexpr(is_set_)
         return ov->find(key);
@@ -1003,9 +1003,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find_in_overflow(const Kme
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename F, typename V>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find_and_update(const Kmer<k> key, const uint8_t c, const std::size_t i, const F& f) -> val_t requires (is_map_)
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find_and_update(const Kmer<k> key, const uint8_t c, const std::size_t i, const F& f) -> val_t requires (is_map_)
 {
     assert(i < cap_);
 
@@ -1030,8 +1030,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find_and_update(const Kmer
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at(const flat_t& e, const uint8_t c, const uint8_t m, const std::size_t i, find_ret_t& val)
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::try_insert_at(const flat_t& e, const uint8_t c, const uint8_t m, const std::size_t i, find_ret_t& val)
 {
     lock(i);
 
@@ -1061,8 +1061,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at(const flat_t
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at_resize(const flat_t& e, const uint8_t c, const uint8_t m, const std::size_t i)
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::try_insert_at_resize(const flat_t& e, const uint8_t c, const uint8_t m, const std::size_t i)
 {
     lock<true>(i);
 
@@ -1083,9 +1083,9 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_insert_at_resize(const
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename F, typename V>
-inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_upsert_at(const Kmer<k> key, const uint8_t c, const uint8_t m, const std::size_t i, const F& f, const V& val, val_t& old_val) requires (is_map_)
+inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::try_upsert_at(const Kmer<k> key, const uint8_t c, const uint8_t m, const std::size_t i, const F& f, const V& val, val_t& old_val) requires (is_map_)
 {
     lock(i);
 
@@ -1115,8 +1115,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_upsert_at(const Kmer<k
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k, l>& w, const Token& token) requires (is_set_)
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const Kmer_Window<k, l>& w, const Token& token) requires (is_set_)
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
@@ -1125,7 +1125,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto h = w.minimizer_bucket_hash(nt_h);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
-    const auto r = insert(w.v.canonical(), c, h, m);
+    const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
+    const auto r = insert(key_, c, h, m);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
 
     if constexpr(mt_) {
@@ -1153,9 +1154,9 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename V>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k, l>& w, const V& val, const Token& token) -> val_t requires (is_map_)
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const Kmer_Window<k, l>& w, const V& val, const Token& token) -> val_t requires (is_map_)
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
@@ -1164,7 +1165,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto h = w.minimizer_bucket_hash(nt_h);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
-    const auto r = insert(std::make_pair(w.v.canonical(), val), c, h, m);
+    const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
+    const auto r = insert(std::make_pair(key_, val), c, h, m);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
 
     if constexpr(mt_) {
@@ -1192,9 +1194,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename F, typename V>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k, l>& w, const F& f, const V& val, const Token& token) -> val_t requires (is_map_)
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::upsert(const Kmer_Window<k, l>& w, const F& f, const V& val, const Token& token) -> val_t requires (is_map_)
 {
     (void)token;
     uint8_t m;
@@ -1205,7 +1207,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
 
     tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
-    const auto r = upsert(w.v.canonical(), c, h, m, f, val);
+    const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
+    const auto r = upsert(key_, c, h, m, f, val);
     if constexpr(mt_)   table_lock.unlock_shared(token.id);
 
     if(tl_ov_happened_)
@@ -1236,8 +1239,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, const uint8_t c, const uint64_t h, const uint8_t m) -> find_ret_t
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const flat_t& x, const uint8_t c, const uint64_t h, const uint8_t m) -> find_ret_t
 {
     const auto idx_mask = cap_ - 1;
 
@@ -1319,8 +1322,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, co
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const flat_t& x, const uint8_t c, const uint8_t m)
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert_at_resize(const flat_t& x, const uint8_t c, const uint8_t m)
 {
     const auto idx_mask = cap_ - 1;
 
@@ -1373,9 +1376,9 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename F, typename V>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, const uint8_t c, const uint64_t h, const uint8_t m, const F& f, const V& val) -> val_t requires (is_map_)
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::upsert(const Kmer<k> key, const uint8_t c, const uint64_t h, const uint8_t m, const F& f, const V& val) -> val_t requires (is_map_)
 {
     const auto idx_mask = cap_ - 1;
 
@@ -1459,8 +1462,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_resize()
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::try_resize()
 {
     if constexpr(mt_)   table_lock.lock();
 
@@ -1483,8 +1486,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::try_resize()
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::resize()
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::resize()
 {
     const auto old_cap = cap_;
     cap_ *= 2;
@@ -1529,10 +1532,10 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::resize()
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
 {
-    const auto key = w.v.canonical();
+    const Kmer<k>& key = canonical_ ? w.v.canonical() : w.v.kmer();
     const auto nt_h = w.minimizer_hash();
     const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
     const auto idx_mask = cap_ - 1;
@@ -1561,9 +1564,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, 
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 template <typename F>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::for_each(F&& f) const
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::for_each(F&& f) const
 {
     // Main flat table.
     for(auto it = cbegin(); it != cend(); ++it)
@@ -1582,8 +1585,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::for_each(F&& f) const
 }
 
 
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::report_stats() const
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::report_stats() const
 {
     std::cerr   << "Table height: " << cap_ << ".\n";
     std::cerr   << "Table width:  " << B << ".\n";
@@ -1611,8 +1614,8 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::report_stats() const
 
 
 // Thread-local flag: set by overflow insert path, consumed by public upsert.
-template <uint16_t k, bool mt_, typename T_, uint16_t l>
-thread_local bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::tl_ov_happened_ = false;
+template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
+thread_local bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::tl_ov_happened_ = false;
 
 
 }

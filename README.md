@@ -161,6 +161,7 @@ Instead of listing files directly, you can pass `@list.txt`, or a single `.fof`,
 | `-ram` | `<int>` | auto | RAM budget in GB. Controls whether the in-memory or disk pipeline is used, and sizes write buffers accordingly. Set lower than physical RAM to leave headroom for other processes, or higher to force the in-memory pipeline |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files. |
 | `-kff` | — | off | Write output in [KFF binary format](https://github.com/Kmer-File-Format/kff-reference) instead of TSV. Auto-detected from a `.kff` output extension. |
+| `-b` | — | off | Disable canonical k-mers: count forward and reverse-complement strands independently. By default, a k-mer and its reverse complement are merged into a single count (the canonical, lexicographically smaller form is reported). Use `-b` when strand orientation matters or to match tools that count each strand separately. |
 | `-h` / `--help` | — | — | Print usage |
 
 <details>
@@ -224,13 +225,13 @@ TGCATGCATGCATGCATGCATGCATGCATGC	7
 
 ### KFF binary (`-kff` or `.kff` extension)
 
-[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3, MSB-first) with a 4-byte big-endian count. The file is marked `canonical=true` and `unique=true`. Roughly 3–4× smaller than TSV for k=31.
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3, MSB-first) with a 4-byte big-endian count. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
 
 KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
 
 ---
 
-Only k-mers with counts in `[ci, cx]` are written. The canonical (lexicographically smaller of forward/reverse-complement) form of each k-mer is reported.
+Only k-mers with counts in `[ci, cx]` are written. By default, the canonical (lexicographically smaller of forward/reverse-complement) form of each k-mer is reported. With `-b`, the observed strand form is reported instead.
 
 ---
 

@@ -27,5 +27,6 @@ struct Config {
     bool         lz4_buckets   = false; // compress disk-mode phase-1 bucket files with LZ4
     bool         lz4_shards    = false; // compress recursive phase-2 dedup shard files with LZ4
     bool         phase1_adaptive = false; // use experimental adaptive phase-1 scheduler for gz FASTQ
+    bool         canonical     = true;  // count canonical k-mers (lex-min of k-mer and RC); set false with -b
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
 };

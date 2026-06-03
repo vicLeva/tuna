@@ -118,11 +118,11 @@ struct Phase2TimingStats {
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader<k, m>>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Reader = SuperkmerReader<k, m>>
 uint64_t count_partition(
-    Reader&                                                               reader,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
+    Reader&                                                                          reader,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
@@ -218,14 +218,14 @@ uint64_t count_partition(
 }
 
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 uint64_t count_superkmer_record(
-    const uint8_t*                                                        packed,
-    size_t                                                                len,
-    sk_hdr_t<k, m>                                                        min_pos,
-    uint32_t                                                              multiplicity,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+    const uint8_t*                                                                     packed,
+    size_t                                                                             len,
+    sk_hdr_t<k, m>                                                                     min_pos,
+    uint32_t                                                                           multiplicity,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
 {
     using hdr_t = sk_hdr_t<k, m>;
     static constexpr hdr_t NO_MIN = sk_no_min<k, m>;
@@ -305,12 +305,12 @@ struct PackedSuperkmerKeyHash {
 };
 
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 uint64_t count_packed_superkmer_key(
-    const PackedSuperkmerKey<k, m>&                                      key,
-    uint32_t                                                             multiplicity,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&        table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+    const PackedSuperkmerKey<k, m>&                                                   key,
+    uint32_t                                                                          multiplicity,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
 {
     using hdr_t = sk_hdr_t<k, m>;
     static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
@@ -319,7 +319,7 @@ uint64_t count_packed_superkmer_key(
     std::memcpy(&len, key.bytes(),                 sizeof(hdr_t));
     std::memcpy(&mp,  key.bytes() + sizeof(hdr_t), sizeof(hdr_t));
     const auto* packed = reinterpret_cast<const uint8_t*>(key.bytes() + HDR_BYTES);
-    return count_superkmer_record<k, m>(
+    return count_superkmer_record<k, m, canonical_>(
         packed, static_cast<size_t>(len), mp, multiplicity, table, token);
 }
 
@@ -359,14 +359,14 @@ inline size_t disk_dedup_worker_budget(const Config& cfg, size_t n_threads)
 }
 
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 bool try_count_disk_aggregated(
-    const std::string&                                                    path,
-    size_t                                                               memory_budget,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
-    uint64_t&                                                            inserted,
-    DiskDedupStats*                                                       stats = nullptr)
+    const std::string&                                                                path,
+    size_t                                                                           memory_budget,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
+    uint64_t&                                                                       inserted,
+    DiskDedupStats*                                                                   stats = nullptr)
 {
     using key_t = PackedSuperkmerKey<k, m>;
     using map_t = ankerl::unordered_dense::map<key_t, uint32_t, PackedSuperkmerKeyHash<k, m>>;
@@ -411,7 +411,7 @@ bool try_count_disk_aggregated(
 
     const auto replay_t0 = std::chrono::steady_clock::now();
     for (const auto& [key, multiplicity] : multiplicities)
-        inserted += count_packed_superkmer_key<k, m>(key, multiplicity, table, token);
+        inserted += count_packed_superkmer_key<k, m, canonical_>(key, multiplicity, table, token);
     const uint64_t replay_ns = elapsed_ns(replay_t0);
 
     if (stats) {
@@ -425,16 +425,16 @@ bool try_count_disk_aggregated(
 }
 
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 uint64_t count_disk_dedup_exact(
-    const std::string&                                                    path,
-    const Config&                                                         cfg,
-    size_t                                                               partition,
-    size_t                                                               level,
-    size_t                                                               memory_budget,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
-    DiskDedupStats*                                                       stats = nullptr)
+    const std::string&                                                                path,
+    const Config&                                                                     cfg,
+    size_t                                                                           partition,
+    size_t                                                                           level,
+    size_t                                                                           memory_budget,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
+    DiskDedupStats*                                                                   stats = nullptr)
 {
     static constexpr uint64_t MEMORY_FACTOR = 4;
     static constexpr size_t MAX_SHARDS = 64;
@@ -444,7 +444,7 @@ uint64_t count_disk_dedup_exact(
 
     uint64_t inserted = 0;
     if (stats) stats->aggregate_attempts.fetch_add(1, std::memory_order_relaxed);
-    if (try_count_disk_aggregated<k, m>(path, memory_budget, table, token, inserted, stats)) {
+    if (try_count_disk_aggregated<k, m, canonical_>(path, memory_budget, table, token, inserted, stats)) {
         if (stats) stats->aggregate_successes.fetch_add(1, std::memory_order_relaxed);
         return inserted;
     }
@@ -543,7 +543,7 @@ uint64_t count_disk_dedup_exact(
 
         uint64_t total_inserted = 0;
         for (size_t s = 0; s < n_shards; ++s) {
-            total_inserted += count_disk_dedup_exact<k, m>(
+            total_inserted += count_disk_dedup_exact<k, m, canonical_>(
                 shard_paths[s], cfg, partition, level + 1, memory_budget, table, token, stats);
             std::error_code ec;
             std::filesystem::remove(shard_paths[s], ec);
@@ -556,11 +556,11 @@ uint64_t count_disk_dedup_exact(
 }
 
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 uint64_t count_partition_mem_aggregated(
-    const std::string&                                                    data,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+    const std::string&                                                                data,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
 {
     using hdr_t = sk_hdr_t<k, m>;
     static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
@@ -596,7 +596,7 @@ uint64_t count_partition_mem_aggregated(
         std::memcpy(&len, record.data(),                 sizeof(hdr_t));
         std::memcpy(&mp,  record.data() + sizeof(hdr_t), sizeof(hdr_t));
         const auto* packed = reinterpret_cast<const uint8_t*>(record.data() + HDR_BYTES);
-        inserted += count_superkmer_record<k, m>(
+        inserted += count_superkmer_record<k, m, canonical_>(
             packed, static_cast<size_t>(len), mp, multiplicity, table, token);
     }
 
@@ -606,9 +606,9 @@ uint64_t count_partition_mem_aggregated(
 
 // ─── Output brick ─────────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t m, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config&   cfg,
     std::string&    chunk,
     std::ofstream&  out,
@@ -666,9 +666,9 @@ uint64_t count_output_kmers(
 // Encodes each k-mer from the table as 2-bit MSB-first bytes and flushes to
 // a KffOutput in batches of ~1 MB.  Thread-safe via KffOutput::write_batch.
 
-template <uint16_t k, uint16_t m, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts_kff(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg,
     KffOutput&    kff_out)
 {
@@ -718,9 +718,9 @@ uint64_t write_counts_kff(
 // concurrently, cb may be invoked from several threads simultaneously — the caller
 // is responsible for any needed synchronisation.
 
-template <uint16_t k, uint16_t m, bool mt_ = false, typename Callback>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true, typename Callback>
 uint64_t write_counts_callback(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg,
     Callback& cb)
 {
@@ -753,14 +753,14 @@ uint64_t write_counts_callback(
 // risk of duplicate calls for the same k-mer.  The caller must ensure cb is
 // safe to call from multiple threads if num_threads > 1.
 
-template <uint16_t k, uint16_t m, typename Callback>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
     Callback&&                cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;  // hash table type (local alias)
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;  // hash table type (local alias)
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -796,7 +796,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 uint64_t ins;  // k-mers inserted into this partition
                 {
                     MemoryReader<k, m> reader(part_bufs[p]);
-                    ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
+                    ins = count_partition<k, m, canonical_, MemoryReader<k, m>>(reader, table, token);
                 }
                 { std::string tmp; part_bufs[p].swap(tmp); }
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
@@ -833,13 +833,13 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
 }
 
 
-template <uint16_t k, uint16_t m, typename Callback>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback(
     const Config& cfg,
     uint64_t      total_kmers,
     Callback&&    cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -874,7 +874,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 }
                 table_t table(init_sz, 1);
 
-                const uint64_t ins = count_disk_dedup_exact<k, m>(
+                const uint64_t ins = count_disk_dedup_exact<k, m, canonical_>(
                     path, cfg, p, 0, dedup_budget, table, token);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
@@ -1161,14 +1161,14 @@ inline void emit_debug_stats(
 // total_kmers counts all occurrences (with multiplicity), so 2× gives headroom
 // for the unique fraction without oversizing beyond the 4M cap.
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
     std::ofstream* out,       // non-null for TSV output
     KffOutput*     kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -1231,14 +1231,14 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
                 if (!cfg.debug_stats) {
-                    ins = count_disk_dedup_exact<k, m>(
+                    ins = count_disk_dedup_exact<k, m, canonical_>(
                         path, cfg, p, 0, dedup_budget, table, token,
                         collect_phase2_stats ? &dedup_stats : nullptr);
                 } else {
                     SuperkmerReader<k, m> reader(path);
                     if (!reader.ok())
                         throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
-                    ins = count_partition<k, m>(reader, table, token, dbg);
+                    ins = count_partition<k, m, canonical_>(reader, table, token, dbg);
                 }
                 const uint64_t count_ns = collect_phase2_stats ? elapsed_ns(count_t0) : 0;
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
@@ -1398,7 +1398,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 // Each partition buffer is cleared after processing to release memory
 // incrementally — peak RSS ≈ largest-single-partition buffer, not all at once.
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
@@ -1406,7 +1406,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     std::ofstream*            out,       // non-null for TSV output
     KffOutput*                kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -1445,10 +1445,10 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             uint64_t ins;
             if (!cfg.debug_stats) {
-                ins = count_partition_mem_aggregated<k, m>(part_bufs[p], table, token);
+                ins = count_partition_mem_aggregated<k, m, canonical_>(part_bufs[p], table, token);
             } else {
                 MemoryReader<k, m> reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token, dbg);
+                ins = count_partition<k, m, canonical_, MemoryReader<k, m>>(reader, table, token, dbg);
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }

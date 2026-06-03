@@ -251,16 +251,21 @@ int run(const Config& cfg)
             }
         }
 
-        const auto [total_inserted, total_written] = cfg.count_only
-            ? count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, nullptr)
-            : (cfg.output_kff
-            ? [&]() {
+        auto do_count_mem = [&](auto canonical_tag) {
+            constexpr bool C = decltype(canonical_tag)::value;
+            if (cfg.count_only)
+                return count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, nullptr);
+            if (cfg.output_kff) {
                 KffOutput kff_out(cfg.output_file, cfg.k);
-                auto r = count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
+                auto r = count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
                 kff_out.close();
                 return r;
-              }()
-            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr));
+            }
+            return count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
+        };
+        const auto [total_inserted, total_written] = cfg.canonical
+            ? do_count_mem(std::true_type{})
+            : do_count_mem(std::false_type{});
         if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
             std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
             return 1;
@@ -335,16 +340,21 @@ int run(const Config& cfg)
         }
     }
 
-    const auto [total_inserted, total_written] = cfg.count_only
-        ? count_and_write<k, m>(cfg, stats.kmers, nullptr, nullptr)
-        : (cfg.output_kff
-        ? [&]() {
+    auto do_count = [&](auto canonical_tag) {
+        constexpr bool C = decltype(canonical_tag)::value;
+        if (cfg.count_only)
+            return count_and_write<k, m, C>(cfg, stats.kmers, nullptr, nullptr);
+        if (cfg.output_kff) {
             KffOutput kff_out(cfg.output_file, cfg.k);
-            auto r = count_and_write<k, m>(cfg, stats.kmers, nullptr, &kff_out);
+            auto r = count_and_write<k, m, C>(cfg, stats.kmers, nullptr, &kff_out);
             kff_out.close();
             return r;
-          }()
-        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr));
+        }
+        return count_and_write<k, m, C>(cfg, stats.kmers, &tsv_out, nullptr);
+    };
+    const auto [total_inserted, total_written] = cfg.canonical
+        ? do_count(std::true_type{})
+        : do_count(std::false_type{});
     if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
         std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
         return 1;
