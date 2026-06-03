@@ -68,11 +68,11 @@ struct PartitionDebugInfo {
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader<k, m>>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Reader = SuperkmerReader<k, m>>
 uint64_t count_partition(
-    Reader&                                                               reader,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
+    Reader&                                                                          reader,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
@@ -177,9 +177,9 @@ uint64_t count_partition(
 
 // ─── Output brick ─────────────────────────────────────────────────────────────
 
-template <uint16_t k, uint16_t m, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config&   cfg,
     std::string&    chunk,
     std::ofstream&  out,
@@ -221,9 +221,9 @@ uint64_t write_counts(
 // Encodes each k-mer from the table as 2-bit MSB-first bytes and flushes to
 // a KffOutput in batches of ~1 MB.  Thread-safe via KffOutput::write_batch.
 
-template <uint16_t k, uint16_t m, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts_kff(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg,
     KffOutput&    kff_out)
 {
@@ -273,9 +273,9 @@ uint64_t write_counts_kff(
 // concurrently, cb may be invoked from several threads simultaneously — the caller
 // is responsible for any needed synchronisation.
 
-template <uint16_t k, uint16_t m, bool mt_ = false, typename Callback>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true, typename Callback>
 uint64_t write_counts_callback(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg,
     Callback& cb)
 {
@@ -308,14 +308,14 @@ uint64_t write_counts_callback(
 // risk of duplicate calls for the same k-mer.  The caller must ensure cb is
 // safe to call from multiple threads if num_threads > 1.
 
-template <uint16_t k, uint16_t m, typename Callback>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
     Callback&&                cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;  // hash table type (local alias)
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;  // hash table type (local alias)
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -351,7 +351,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 uint64_t ins;  // k-mers inserted into this partition
                 {
                     MemoryReader<k, m> reader(part_bufs[p]);
-                    ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token);
+                    ins = count_partition<k, m, canonical_, MemoryReader<k, m>>(reader, table, token);
                 }
                 { std::string tmp; part_bufs[p].swap(tmp); }
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
@@ -388,13 +388,13 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
 }
 
 
-template <uint16_t k, uint16_t m, typename Callback>
+template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback(
     const Config& cfg,
     uint64_t      total_kmers,
     Callback&&    cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -431,7 +431,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 }
                 table_t table(init_sz, 1);
 
-                const uint64_t ins = count_partition<k, m>(reader, table, token);
+                const uint64_t ins = count_partition<k, m, canonical_>(reader, table, token);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
                     const uint64_t unique = static_cast<uint64_t>(table.size());
@@ -717,14 +717,14 @@ inline void emit_debug_stats(
 // total_kmers counts all occurrences (with multiplicity), so 2× gives headroom
 // for the unique fraction without oversizing beyond the 4M cap.
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
     std::ofstream* out,       // non-null for TSV output
     KffOutput*     kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -773,7 +773,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 table_t table(init_sz, 1);
 
                 PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
-                const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
+                const uint64_t ins = count_partition<k, m, canonical_>(reader, table, token, dbg);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
                     const uint64_t unique = static_cast<uint64_t>(table.size());
@@ -872,7 +872,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 // Each partition buffer is cleared after processing to release memory
 // incrementally — peak RSS ≈ largest-single-partition buffer, not all at once.
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
@@ -880,7 +880,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     std::ofstream*            out,       // non-null for TSV output
     KffOutput*                kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>;
+    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -920,7 +920,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             uint64_t ins;
             {
                 MemoryReader<k, m> reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token, dbg);
+                ins = count_partition<k, m, canonical_, MemoryReader<k, m>>(reader, table, token, dbg);
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }
