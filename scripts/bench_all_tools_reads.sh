@@ -74,8 +74,11 @@ TOOLS=(tuna kmc fastk kfc)
 # Sanity checks
 # =============================================================================
 err=0
-for bin in "$TUNA" "$KMC" "$KMC_DUMP" "$FASTK" "$TABEX" "$KFC"; do
-    [[ ! -x "$bin" ]] && { echo "[error] not executable: $bin"; err=1; }
+for var in TUNA KMC KMC_DUMP FASTK TABEX KFC; do
+    [[ -z "${!var}" ]] && { echo "[error] $var is not set"; err=1; }
+done
+for var in TUNA KMC KMC_DUMP FASTK TABEX KFC; do
+    [[ -n "${!var}" && ! -x "${!var}" ]] && { echo "[error] ${!var} is not executable"; err=1; }
 done
 for f in "$ECOLI_FILE" "$HUMAN_FILE"; do
     [[ ! -f "$f" ]] && { echo "[error] file not found: $f"; err=1; }
