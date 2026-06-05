@@ -45,12 +45,18 @@ if [[ "$MODE" == "local" ]]; then
     WORKDIR="$HOME/tuna_bench_tmp/bench_reads_$(date +%Y%m%d_%H%M%S)"
     RAM_GB=16
 else
-    TUNA="/WORKS/vlevallois/softs/tuna/build/tuna"
-    KMC="kmc"
-    KMC_DUMP="kmc_dump"
-    FASTK="FastK"
-    TABEX="Tabex"
-    KFC="kfc"
+    # On the cluster, tool paths are injected via environment variables.
+    # Set them before calling this script, e.g.:
+    #   export TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
+    #   export KMC=/path/to/kmc  KMC_DUMP=/path/to/kmc_dump
+    #   export FASTK=/path/to/FastK  TABEX=/path/to/Tabex
+    #   export KFC=/path/to/kfc
+    : "${TUNA:=""}"
+    : "${KMC:=""}"
+    : "${KMC_DUMP:=""}"
+    : "${FASTK:=""}"
+    : "${TABEX:=""}"
+    : "${KFC:=""}"
     DATA_DIR="/WORKS/vlevallois/data/data_sequencing"
     WORKDIR="/WORKS/vlevallois/expes_tuna/bench_reads_$(date +%Y%m%d_%H%M%S)"
     RAM_GB=256
