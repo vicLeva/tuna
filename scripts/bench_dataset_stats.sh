@@ -16,6 +16,7 @@
 #   dup_rate, singleton_pct          <- total_k/distinct_k, fraction with count=1
 
 set -euo pipefail
+export LC_ALL=C LANG=C
 
 THREADS=${1:-8}
 K=${2:-31}
