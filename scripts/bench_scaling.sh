@@ -156,7 +156,7 @@ run_tuna() {
     mkdir -p "$work"
 
     /usr/bin/time -v -o "$tf" \
-        "$TUNA" -k "$K" -m "$M" -t "$THREADS" -hp -p \
+        "$TUNA" -k "$K" -m "$M" -t "$THREADS" -hp \
         -ram "$RAM_GB" \
         -w "$work/" "@$subfof" /dev/null \
         > /dev/null 2>"$se" \
