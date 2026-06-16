@@ -14,10 +14,11 @@
 #   dataset,n_files,tool,wall_s,rss_mb,phase1_s,phase2_s
 #
 # Notes:
-#   tuna  : -p flag always on (same-species multi-file); output → /dev/null
-#   KMC   : phase1=kmc count, phase2=kmc_dump; dump → /dev/null
-#   FastK : phase1=FastK, phase2=Tabex -A; .fna files need .fa symlinks
-#           (created once at setup, in $WORKDIR/fastk_links/)
+#   tuna  : output written to a temp TSV in $WORKDIR, deleted after timing
+#   KMC   : phase1=kmc count (binary db), phase2=kmc_dump (TSV); both deleted
+#   FastK : phase1=FastK (ktab), phase2=Tabex -A (TSV); both deleted
+#           .fna files need .fa symlinks (created once at setup in $WORKDIR/fastk_links/)
+#           FastK does not support @fof — files are passed as individual arguments
 
 set -uo pipefail
 export LC_ALL=C LANG=C
@@ -155,13 +156,14 @@ run_tuna() {
     local se="$RESULTS/${ds}_n${n}_tuna.stderr"
     mkdir -p "$work"
 
+    local out="$WORKDIR/tuna_scaling_out_${ds}_n${n}.tsv"
     /usr/bin/time -v -o "$tf" \
         "$TUNA" -k "$K" -m "$M" -t "$THREADS" -hp \
         -ram "$RAM_GB" \
-        -w "$work/" "@$subfof" /dev/null \
+        -w "$work/" "@$subfof" "$out" \
         > /dev/null 2>"$se" \
-    || { echo "  [FAIL] tuna $ds n=$n"; rm -rf "$work" "$subfof"; return; }
-    rm -rf "$work" "$subfof"
+    || { echo "  [FAIL] tuna $ds n=$n"; rm -rf "$work" "$subfof" "$out"; return; }
+    rm -rf "$work" "$subfof" "$out"
 
     local wall rss p1 p2
     wall=$(wall_from_file "$tf")
@@ -188,17 +190,19 @@ run_kmc() {
     local tf_dump="$RESULTS/${ds}_n${n}_kmc_dump.timefile"
     mkdir -p "$tmp"
 
+    local se_count="$RESULTS/${ds}_n${n}_kmc_count.stderr"
     /usr/bin/time -v -o "$tf_count" \
         "$KMC" -k"$K" -m"$RAM_GB" -ci1 -cs4294967295 -fm -hp -t"$THREADS" \
         "@$subfof" "$db" "$tmp" \
-        > /dev/null 2>&1 \
+        > /dev/null 2>"$se_count" \
     || { echo "  [FAIL] kmc count $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
     rm -rf "$tmp"
 
-    local dump_out; dump_out=$(mktemp "$WORKDIR/kmc_dump_XXXXXX.tsv")
+    local dump_out="$WORKDIR/kmc_scaling_dump_${ds}_n${n}.tsv"
+    local se_dump="$RESULTS/${ds}_n${n}_kmc_dump.stderr"
     /usr/bin/time -v -o "$tf_dump" \
         "$KMC_DUMP" -ci1 "$db" "$dump_out" \
-        > /dev/null 2>&1 \
+        > /dev/null 2>"$se_dump" \
     || echo "  [WARN] kmc_dump $ds n=$n"
     rm -f "${db}.kmc_pre" "${db}.kmc_suf" "$dump_out" "$subfof"
 
@@ -227,18 +231,22 @@ run_fastk() {
     local tf_dump="$RESULTS/${ds}_n${n}_fastk_dump.timefile"
     mkdir -p "$tmp"
 
+    mapfile -t fastk_files < "$subfof"
+    local se_count="$RESULTS/${ds}_n${n}_fastk_count.stderr"
     /usr/bin/time -v -o "$tf_count" \
         "$FASTK" -k"$K" -t1 -T"$THREADS" -M"$RAM_GB" \
-        -N"$db" -P"$tmp" "@$subfof" \
-        > /dev/null 2>&1 \
+        -N"$db" -P"$tmp" "${fastk_files[@]}" \
+        > /dev/null 2>"$se_count" \
     || { echo "  [FAIL] FastK $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
     rm -rf "$tmp"
 
+    local tabex_out="$WORKDIR/fastk_scaling_dump_${ds}_n${n}.tsv"
+    local se_dump="$RESULTS/${ds}_n${n}_fastk_dump.stderr"
     /usr/bin/time -v -o "$tf_dump" \
         "$TABEX" -A "$db" \
-        > /dev/null 2>&1 \
+        > "$tabex_out" 2>"$se_dump" \
     || echo "  [WARN] Tabex $ds n=$n"
-    rm -f "${db}.hist" "${db}.ktab" "${db}"* 2>/dev/null || true
+    rm -f "${db}.hist" "${db}.ktab" "${db}"* "$tabex_out" 2>/dev/null || true
     rm -f "$subfof"
 
     local w1 w2 wall rss
