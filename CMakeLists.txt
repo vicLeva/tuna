@@ -40,12 +40,26 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
+# ── ankerl::unordered_dense for fast phase-2 superkmer aggregation ────────────
+FetchContent_Declare(
+    unordered_dense
+    GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+    GIT_TAG        v4.4.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(unordered_dense)
+
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
 # no code changes required. Disable with -DTUNA_USE_ZLIB_NG=OFF to fall back
 # to the system zlib (e.g. if building in an environment where fetching is not
 # possible or a system zlib-ng is already installed).
 option(TUNA_USE_ZLIB_NG "Build against zlib-ng (faster gz) instead of system zlib" ON)
+option(TUNA_LZ4_BUCKETS "Build optional runtime LZ4 compression support for disk-mode temporary files" ON)
+option(TUNA_LZ4_SHARDS "Deprecated; LZ4 shard compression is controlled by the runtime -lz4-shards flag" OFF)
+set(TUNA_LZ4_ACCELERATION "" CACHE STRING "Optional LZ4 fast-compression acceleration; higher is faster/larger")
+set(TUNA_FASTQ_CHUNK_MB "" CACHE STRING "Optional raw gzip FASTQ chunk size in MiB; defaults to 4")
+option(TUNA_PACKED_NT_PHASE1 "Consume packed parser bases directly in phase 1 instead of decoding to kache bytes" OFF)
 
 if(TUNA_USE_ZLIB_NG)
     include(FetchContent)
@@ -70,6 +84,24 @@ else()
         find_package(ZLIB REQUIRED)
     endif()
     set(TUNA_ZLIB_TARGET ZLIB::ZLIB)
+endif()
+
+if(TUNA_LZ4_BUCKETS)
+    find_library(LZ4_LIBRARY NAMES lz4 liblz4.so.1 PATHS /lib64 /usr/lib64 /lib /usr/lib)
+    if(NOT LZ4_LIBRARY)
+        find_file(LZ4_LIBRARY NAMES liblz4.so.1 PATHS /lib64 /usr/lib64 /lib /usr/lib)
+    endif()
+    if(NOT LZ4_LIBRARY)
+        message(STATUS "Tuna LZ4 support: liblz4 not found; disabling runtime -lz4 support")
+        set(TUNA_LZ4_BUCKETS OFF)
+    else()
+        find_path(LZ4_INCLUDE_DIR lz4.h)
+        if(LZ4_INCLUDE_DIR)
+            message(STATUS "Tuna LZ4 support: using ${LZ4_LIBRARY} with headers in ${LZ4_INCLUDE_DIR}")
+        else()
+            message(STATUS "Tuna LZ4 support: using ${LZ4_LIBRARY} with local ABI declarations")
+        endif()
+    endif()
 endif()
 
 # L1 cache line size required by kache-hash internals.
@@ -138,6 +170,9 @@ target_include_directories(tuna_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include/helicase_cpp
 )
+target_include_directories(tuna_lib SYSTEM INTERFACE
+    ${unordered_dense_SOURCE_DIR}/include
+)
 # C++ standard and definitions are propagated so users get the right dialect
 # and tuna's required macros, but compile flags (warnings, optimisations) are
 # not — those are tuna's internal concern.
@@ -150,15 +185,31 @@ target_compile_options(tuna_lib INTERFACE ${TUNA_SIMD_FLAGS})
 # same zero-overhead runtime dispatch.
 # Usage: cmake .. -DTUNA_CONDA_PROFILE=ON
 option(TUNA_CONDA_PROFILE "Build with curated k/m subset for conda packaging" OFF)
+set(TUNA_PHASE1_SIG_LEN "" CACHE STRING "Optional phase-1 signature minimizer length; defaults to FIXED_M/runtime m")
+set(TUNA_AUTO_PARTITION_MB "" CACHE STRING "Optional auto partition throughput target in MiB; defaults to 2")
 
 target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
+    $<$<BOOL:${TUNA_PHASE1_SIG_LEN}>:TUNA_PHASE1_SIG_LEN=${TUNA_PHASE1_SIG_LEN}>
+    $<$<BOOL:${TUNA_AUTO_PARTITION_MB}>:TUNA_AUTO_PARTITION_MB=${TUNA_AUTO_PARTITION_MB}>
     $<$<BOOL:${TUNA_CONDA_PROFILE}>:TUNA_CONDA_PROFILE>
+    $<$<BOOL:${TUNA_LZ4_BUCKETS}>:TUNA_LZ4_BUCKETS>
+    $<$<BOOL:${TUNA_LZ4_SHARDS}>:TUNA_LZ4_SHARDS>
+    $<$<BOOL:${TUNA_LZ4_ACCELERATION}>:TUNA_LZ4_ACCELERATION=${TUNA_LZ4_ACCELERATION}>
+    $<$<BOOL:${TUNA_FASTQ_CHUNK_MB}>:TUNA_FASTQ_CHUNK_MB=${TUNA_FASTQ_CHUNK_MB}>
+    $<$<BOOL:${TUNA_PACKED_NT_PHASE1}>:TUNA_PACKED_NT_PHASE1>
+    $<$<BOOL:${LZ4_INCLUDE_DIR}>:TUNA_HAVE_LZ4_H>
 )
+if(TUNA_LZ4_BUCKETS AND LZ4_INCLUDE_DIR)
+    target_include_directories(tuna_lib SYSTEM INTERFACE ${LZ4_INCLUDE_DIR})
+endif()
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+if(TUNA_LZ4_BUCKETS)
+    target_link_libraries(tuna_lib INTERFACE ${LZ4_LIBRARY})
+endif()
 
 # ── tuna — CLI executable (only when tuna is the top-level project) ────────────
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)

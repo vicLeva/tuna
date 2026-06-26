@@ -44,13 +44,6 @@ int main(int argc, char* argv[])
     static_assert(sizeof(SuperkmerWriter<31, 21>) >= 8 && sizeof(SuperkmerWriter<31, 21>) <= 64,
                   "SuperkmerWriter size out of expected range");
 
-    if (cfg.num_partitions == 0)
-        cfg.num_partitions = auto_tune_partitions(
-            cfg.input_files, sizeof(SuperkmerWriter<31, 21>), cfg.k, cfg.num_threads);
-
-    // Round up to next power of 2 so partition_fn can use bitmask instead of division.
-    cfg.num_partitions = round_pow2(cfg.num_partitions);
-
     // ── Working directory ──────────────────────────────────────────────────
     bool own_work_dir = false;
     if (cfg.work_dir.empty()) {
@@ -61,6 +54,20 @@ int main(int argc, char* argv[])
     }
     if (cfg.work_dir.back() != '/') cfg.work_dir += '/';
     fs::create_directories(cfg.work_dir);
+
+    if (cfg.phase2_only && cfg.num_partitions == 0) {
+        const Phase1Meta meta = read_phase1_meta(cfg.work_dir);
+        cfg.k = meta.k;
+        cfg.l = meta.m;
+        cfg.num_partitions = meta.n_parts;
+    }
+
+    if (cfg.num_partitions == 0)
+        cfg.num_partitions = auto_tune_partitions(
+            cfg.input_files, sizeof(SuperkmerWriter<31, 21>), cfg.k, cfg.num_threads);
+
+    // Round up to next power of 2 so partition_fn can use bitmask instead of division.
+    cfg.num_partitions = round_pow2(cfg.num_partitions);
 
     if (!cfg.hide_progress) {
         std::cerr << "tuna  k=" << cfg.k
@@ -84,13 +91,14 @@ int main(int argc, char* argv[])
     }
 
     // ── Cleanup ────────────────────────────────────────────────────────────
-    if (!cfg.keep_tmp) {
+    if (!cfg.keep_tmp && !cfg.phase2_only) {
         if (own_work_dir)
             fs::remove_all(cfg.work_dir);
         else {
             // Only remove the partition files we created, not the whole directory.
             for (size_t p = 0; p < cfg.num_partitions; ++p)
                 fs::remove(partition_path(cfg.work_dir, p));
+            fs::remove(phase1_meta_path(cfg.work_dir));
         }
     }
 

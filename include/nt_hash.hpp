@@ -110,6 +110,15 @@ public:
         }
     }
 
+    void init_nt(const uint8_t* bases) noexcept {
+        fwd_ = 0; rev_ = 0;
+        for (uint16_t i = 0; i < m; ++i) {
+            const uint8_t b = bases[i] & 3u;
+            fwd_ ^= rol64(FWD[b], m - 1 - i);
+            rev_ ^= rol64(REV[b], i);
+        }
+    }
+
     // Slide the window: `out_2bit` leaves from the left, `in_2bit` enters on the right.
     void roll(uint8_t out_2bit, uint8_t in_2bit) noexcept {
         const uint8_t idx = static_cast<uint8_t>((out_2bit << 2) | in_2bit);

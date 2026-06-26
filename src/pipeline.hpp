@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #include <stdexcept>
 #include <vector>
@@ -58,6 +59,53 @@ inline std::string fmt_s(double s)
     return buf;
 }
 
+struct Phase1Meta {
+    uint16_t k = 0;
+    uint16_t m = 0;
+    uint32_t n_parts = 0;
+    PartitionStats stats;
+};
+
+inline std::string phase1_meta_path(const std::string& work_dir)
+{
+    return work_dir + "phase1.meta";
+}
+
+inline void write_phase1_meta(const Config& cfg, const PartitionStats& stats)
+{
+    std::ofstream out(phase1_meta_path(cfg.work_dir), std::ios::trunc);
+    if (!out)
+        throw std::runtime_error("tuna: cannot write phase1 metadata");
+    out << "k " << cfg.k << "\n"
+        << "m " << cfg.l << "\n"
+        << "n_parts " << cfg.num_partitions << "\n"
+        << "seqs " << stats.seqs << "\n"
+        << "kmers " << stats.kmers << "\n"
+        << "superkmers " << stats.superkmers << "\n";
+}
+
+inline Phase1Meta read_phase1_meta(const std::string& work_dir)
+{
+    std::ifstream in(phase1_meta_path(work_dir));
+    if (!in)
+        throw std::runtime_error("tuna: cannot read phase1 metadata in work directory");
+
+    Phase1Meta meta;
+    std::string key;
+    uint64_t value = 0;
+    while (in >> key >> value) {
+        if (key == "k") meta.k = static_cast<uint16_t>(value);
+        else if (key == "m") meta.m = static_cast<uint16_t>(value);
+        else if (key == "n_parts") meta.n_parts = static_cast<uint32_t>(value);
+        else if (key == "seqs") meta.stats.seqs = value;
+        else if (key == "kmers") meta.stats.kmers = value;
+        else if (key == "superkmers") meta.stats.superkmers = value;
+    }
+    if (meta.k == 0 || meta.m == 0 || meta.n_parts == 0 || meta.stats.kmers == 0)
+        throw std::runtime_error("tuna: incomplete phase1 metadata in work directory");
+    return meta;
+}
+
 
 // ─── Core run function ────────────────────────────────────────────────────────
 
@@ -65,6 +113,56 @@ template <uint16_t k, uint16_t m>
 int run(const Config& cfg)
 {
     const auto t_start = std::chrono::steady_clock::now();
+
+    if (cfg.phase2_only) {
+        const Phase1Meta meta = read_phase1_meta(cfg.work_dir);
+        if (meta.k != cfg.k || meta.m != cfg.l || meta.n_parts != cfg.num_partitions)
+            throw std::runtime_error("tuna: phase1 metadata does not match requested k/m/n");
+
+        const size_t p2_threads = std::min(static_cast<size_t>(cfg.num_threads),
+                                           static_cast<size_t>(cfg.num_partitions));
+        if (!cfg.hide_progress)
+            std::cerr << "[2/2] counting  (" << p2_threads << " thread"
+                      << (p2_threads > 1 ? "s" : "") << ", phase2-only) ...\n";
+
+        const auto t2 = std::chrono::steady_clock::now();
+        std::ofstream tsv_out;
+        if (!cfg.output_kff && !cfg.count_only) {
+            tsv_out.open(cfg.output_file);
+            if (!tsv_out) {
+                std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
+                return 1;
+            }
+        }
+
+        const auto [total_inserted, total_written] = cfg.count_only
+            ? count_and_write<k, m>(cfg, meta.stats.kmers, nullptr, nullptr)
+            : (cfg.output_kff
+            ? [&]() {
+                KffOutput kff_out(cfg.output_file, cfg.k);
+                auto r = count_and_write<k, m>(cfg, meta.stats.kmers, nullptr, &kff_out);
+                kff_out.close();
+                return r;
+              }()
+            : count_and_write<k, m>(cfg, meta.stats.kmers, &tsv_out, nullptr));
+        if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
+            std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
+            return 1;
+        }
+
+        const double t_phase2 = elapsed_s(t2);
+        if (!cfg.hide_progress)
+            std::cerr << "      " << total_inserted << " k-mers in  "
+                      << total_written << " unique out  " << fmt_s(t_phase2) << "\n";
+
+        std::cerr << "phase1: skipped\n"
+                  << "phase2: "     << t_phase2             << "s\n"
+                  << "superkmers: " << meta.stats.superkmers << "\n";
+
+        if (!cfg.hide_progress)
+            std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
+        return 0;
+    }
 
     // ── Decide pipeline mode: in-memory vs disk ───────────────────────────
     //
@@ -145,7 +243,7 @@ int run(const Config& cfg)
         const auto t2 = std::chrono::steady_clock::now();
 
         std::ofstream tsv_out;
-        if (!cfg.output_kff) {
+        if (!cfg.output_kff && !cfg.count_only) {
             tsv_out.open(cfg.output_file);
             if (!tsv_out) {
                 std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -153,15 +251,17 @@ int run(const Config& cfg)
             }
         }
 
-        const auto [total_inserted, total_written] = cfg.output_kff
+        const auto [total_inserted, total_written] = cfg.count_only
+            ? count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, nullptr)
+            : (cfg.output_kff
             ? [&]() {
                 KffOutput kff_out(cfg.output_file, cfg.k);
                 auto r = count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
                 kff_out.close();
                 return r;
               }()
-            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
-        if (!cfg.output_kff && !tsv_out) {
+            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr));
+        if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
             std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
             return 1;
         }
@@ -183,7 +283,7 @@ int run(const Config& cfg)
 
     // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
 
-    std::vector<std::ofstream> buckets(cfg.num_partitions);
+    std::vector<SuperkmerBucketFile> buckets(cfg.num_partitions);
     for (size_t p = 0; p < cfg.num_partitions; ++p) {
         const std::string path = partition_path(cfg.work_dir, p);
         buckets[p].open(path, std::ios::binary);
@@ -204,6 +304,7 @@ int run(const Config& cfg)
     }
 
     const double t_phase1 = elapsed_s(t_part);
+    write_phase1_meta(cfg, stats);
     if (!cfg.hide_progress)
         std::cerr << "      " << stats.seqs << " seqs  "
                   << stats.kmers << " k-mers  " << fmt_s(t_phase1) << "\n";
@@ -226,7 +327,7 @@ int run(const Config& cfg)
     const auto t2 = std::chrono::steady_clock::now();
 
     std::ofstream tsv_out;
-    if (!cfg.output_kff) {
+    if (!cfg.output_kff && !cfg.count_only) {
         tsv_out.open(cfg.output_file);
         if (!tsv_out) {
             std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -234,15 +335,17 @@ int run(const Config& cfg)
         }
     }
 
-    const auto [total_inserted, total_written] = cfg.output_kff
+    const auto [total_inserted, total_written] = cfg.count_only
+        ? count_and_write<k, m>(cfg, stats.kmers, nullptr, nullptr)
+        : (cfg.output_kff
         ? [&]() {
             KffOutput kff_out(cfg.output_file, cfg.k);
             auto r = count_and_write<k, m>(cfg, stats.kmers, nullptr, &kff_out);
             kff_out.close();
             return r;
           }()
-        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
-    if (!cfg.output_kff && !tsv_out) {
+        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr));
+    if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
         std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
         return 1;
     }
@@ -309,7 +412,7 @@ void run_callback(const Config& cfg, Callback&& cb)
             return static_cast<size_t>(std::min(budget, uint64_t(512) << 20));
         }();
 
-        std::vector<std::ofstream> buckets(cfg.num_partitions);
+        std::vector<SuperkmerBucketFile> buckets(cfg.num_partitions);
         for (size_t p = 0; p < cfg.num_partitions; ++p) {
             const std::string path = partition_path(cfg.work_dir, p);
             buckets[p].open(path, std::ios::binary);

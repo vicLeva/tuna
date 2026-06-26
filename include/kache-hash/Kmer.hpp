@@ -93,6 +93,10 @@ public:
     // be MSB-aligned.
     void from_super_kmer(const uint64_t* super_kmer, std::size_t word_count);
 
+    // Gets the first k-mer from a byte-packed sequence in kache encoding
+    // (A=0,C=1,G=2,T=3), 4 bases per byte, MSB-first.
+    void from_packed_msb(const uint8_t* packed);
+
     // Gets the k-mer that is a prefix of the provided
     // (k + 1)-mer `k_plus_1_mer`.
     void from_prefix(const Kmer<k + 1>& k_plus_1_mer);
@@ -361,6 +365,40 @@ inline void Kmer<k>::from_super_kmer(const uint64_t* const super_kmer, const std
         kmer_data[i] = (super_kmer[word_off + i] >> (2 * t)) | (super_kmer[word_off + (i + 1)] << (2 * (32 - t)));
 
     kmer_data[NUM_INTS - 1] = super_kmer[word_off + NUM_INTS - 1] >> (2 * t);
+}
+
+
+template <uint16_t k>
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("unroll-loops")))
+#endif
+inline void Kmer<k>::from_packed_msb(const uint8_t* const packed)
+{
+    if constexpr(k <= 32) {
+        constexpr uint16_t byte_count = (k + 3) / 4;
+        constexpr uint16_t excess_bases = byte_count * 4 - k;
+        uint64_t x = 0;
+        if constexpr(byte_count == 8) {
+            std::memcpy(&x, packed, sizeof(x));
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            x = __builtin_bswap64(x);
+#endif
+        } else {
+            for(uint16_t i = 0; i < byte_count; ++i)
+                x = (x << 8) | packed[i];
+        }
+        kmer_data[0] = x >> (2u * excess_bases);
+    } else {
+        for(uint16_t idx = 0; idx < NUM_INTS; ++idx)
+            kmer_data[idx] = 0;
+
+        for(uint16_t i = 0; i < k; ++i)
+        {
+            const uint64_t b = (packed[i >> 2] >> (6u - 2u * (i & 3u))) & 0b11u;
+            const uint16_t rev_i = k - 1 - i;
+            kmer_data[rev_i >> 5] |= b << (2u * (rev_i & 31u));
+        }
+    }
 }
 
 

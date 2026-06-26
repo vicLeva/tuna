@@ -117,6 +117,64 @@ public:
 
 
 // =============================================================================
+// A single-threaded table with the same surface used by Concurrent_Hash_Table.
+// Streaming_Kmer_Hash_Table<..., false, ...> owns one overflow table per worker,
+// so the per-slot spin locks in Concurrent_Hash_Table are pure overhead there.
+template <typename T_key_, typename T_val_, typename T_hasher_>
+class Serial_Hash_Table
+{
+    class Iterator;
+    friend class Iterator;
+
+private:
+
+    struct Key_Val_Pair
+    {
+        T_key_ key;
+        T_val_ val;
+    };
+
+    static constexpr double lf_default = 0.8;
+
+    T_key_ empty_key_;
+
+    const T_hasher_ hash;
+    const std::size_t capacity_;
+    const std::size_t idx_wrapper_mask;
+
+    Key_Val_Pair* const T;
+
+    std::size_t hash_to_idx(std::size_t h) const { return h & idx_wrapper_mask; }
+    std::size_t next_index(std::size_t i) const { return hash_to_idx(i + 1); }
+
+public:
+
+    Serial_Hash_Table(std::size_t max_n, double load_factor = lf_default, T_hasher_ hasher = T_hasher_());
+
+    ~Serial_Hash_Table() { deallocate(T); }
+
+    std::size_t capacity() const { return capacity_; }
+
+    void clear();
+
+    std::size_t size() const;
+
+    const T_val_* insert(T_key_ key, T_val_ val);
+
+    std::optional<T_val_> upsert(T_key_ key, T_val_ val);
+
+    const T_val_* find(T_key_ key) const;
+
+    template <typename F>
+    std::optional<T_val_> find_and_update(T_key_ key, const F& f);
+
+    Iterator iterator() { return Iterator(*this, 1, 0); }
+
+    Iterator iterator(const std::size_t it_count, const std::size_t it_id) { return Iterator(*this, it_count, it_id); }
+};
+
+
+// =============================================================================
 template <typename T_key_, typename T_val_, typename T_hasher_>
 class Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator
 {
@@ -289,6 +347,161 @@ inline Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator::Iterator(Conc
 
 template <typename T_key_, typename T_val_, typename T_hasher_>
 inline bool Concurrent_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator::next(T_key_& key, T_val_& val)
+{
+    for(; idx < end; idx++)
+        if(M.T[idx].key != M.empty_key_)
+        {
+            key = M.T[idx].key, val = M.T[idx].val;
+            idx++;
+            return true;
+        }
+
+    return false;
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+class Serial_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator
+{
+    friend class Serial_Hash_Table;
+
+private:
+
+    Serial_Hash_Table& M;
+    std::size_t idx;
+    std::size_t end;
+
+    Iterator(Serial_Hash_Table& M, std::size_t it_count, std::size_t it_id);
+
+public:
+
+    bool next(T_key_& key, T_val_& val);
+};
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline Serial_Hash_Table<T_key_, T_val_, T_hasher_>::Serial_Hash_Table(const std::size_t max_n, const double load_factor, const T_hasher_ hasher):
+      empty_key_()
+    , hash(hasher)
+    , capacity_(ceil_pow_2(static_cast<std::size_t>(std::ceil(max_n / load_factor))))
+    , idx_wrapper_mask(capacity_ - 1)
+    , T(allocate<Key_Val_Pair>(capacity_))
+{
+    std::memset(reinterpret_cast<char*>(&empty_key_), -1, sizeof(empty_key_));
+
+    clear();
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline void Serial_Hash_Table<T_key_, T_val_, T_hasher_>::clear()
+{
+    std::memset(static_cast<void*>(T), -1, capacity_ * sizeof(Key_Val_Pair));
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline std::size_t Serial_Hash_Table<T_key_, T_val_, T_hasher_>::size() const
+{
+    std::size_t sz = 0;
+    for(std::size_t i = 0; i < capacity_; ++i)
+        sz += (T[i].key != empty_key_);
+
+    return sz;
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline const T_val_* Serial_Hash_Table<T_key_, T_val_, T_hasher_>::insert(const T_key_ key, const T_val_ val)
+{
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
+    {
+        if(T[i].key == empty_key_)
+        {
+            T[i].key = key;
+            T[i].val = val;
+            return nullptr;
+        }
+
+        if(T[i].key == key)
+            return &T[i].val;
+    }
+
+    throw std::overflow_error("Serial_Hash_Table::insert: table is full");
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline std::optional<T_val_> Serial_Hash_Table<T_key_, T_val_, T_hasher_>::upsert(const T_key_ key, const T_val_ val)
+{
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
+    {
+        if(T[i].key == empty_key_)
+        {
+            T[i].key = key;
+            T[i].val = val;
+            return std::nullopt;
+        }
+
+        if(T[i].key == key)
+        {
+            const auto old_val = T[i].val;
+            T[i].val = val;
+            return old_val;
+        }
+    }
+
+    throw std::overflow_error("Serial_Hash_Table::upsert: table is full");
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline const T_val_* Serial_Hash_Table<T_key_, T_val_, T_hasher_>::find(const T_key_ key) const
+{
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
+    {
+        if(T[i].key == key)
+            return &T[i].val;
+        else if(T[i].key == empty_key_)
+            return nullptr;
+    }
+
+    return nullptr;
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+template <typename F>
+inline std::optional<T_val_> Serial_Hash_Table<T_key_, T_val_, T_hasher_>::find_and_update(const T_key_ key, const F& f)
+{
+    for(std::size_t tried = 0, i = hash_to_idx(hash(key)); tried < capacity_; ++tried, i = next_index(i))
+    {
+        if(T[i].key == key)
+        {
+            const auto old_val = T[i].val;
+            T[i].val = f(old_val);
+            return old_val;
+        }
+        else if(T[i].key == empty_key_)
+            return std::nullopt;
+    }
+
+    return std::nullopt;
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline Serial_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator::Iterator(Serial_Hash_Table& M, std::size_t it_count, std::size_t it_id):
+      M(M)
+{
+    const auto range_sz = (M.capacity_ + it_count - 1) / it_count;
+    idx = it_id * range_sz;
+    end = std::min((it_id + 1) * range_sz, M.capacity_);
+}
+
+
+template <typename T_key_, typename T_val_, typename T_hasher_>
+inline bool Serial_Hash_Table<T_key_, T_val_, T_hasher_>::Iterator::next(T_key_& key, T_val_& val)
 {
     for(; idx < end; idx++)
         if(M.T[idx].key != M.empty_key_)

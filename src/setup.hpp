@@ -178,10 +178,16 @@ inline uint32_t auto_tune_partitions(
     // ── Throughput floor ───────────────────────────────────────────────────
     // Even when tables fit in L3 at low n, more partitions = smaller work
     // units per round = better thread utilisation and fewer resizes.
-    // Use total_effective / 2 MB as a throughput-oriented lower bound
-    // (the original heuristic), uncapped by the multi-file correction above.
+    // Use total_effective / target MB as a throughput-oriented lower bound,
+    // uncapped by the multi-file correction above.
+#ifdef TUNA_AUTO_PARTITION_MB
+    constexpr uint64_t PARTITION_TARGET_MB = TUNA_AUTO_PARTITION_MB;
+#else
+    constexpr uint64_t PARTITION_TARGET_MB = 2;
+#endif
+    static_assert(PARTITION_TARGET_MB > 0, "auto partition target must be positive");
     const size_t n_tp_raw = static_cast<size_t>(
-        std::max(uint64_t(1), total_effective >> 21));   // / 2 MB
+        std::max(uint64_t(1), total_effective / (PARTITION_TARGET_MB << 20)));
     size_t n_throughput = 16;
     while (n_throughput < n_tp_raw) n_throughput <<= 1;
 

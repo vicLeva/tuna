@@ -38,6 +38,13 @@ static constexpr helicase::Config HELICASE_ACTG =
         .config()
     & ~helicase::advanced::RETURN_RECORD;
 
+static constexpr helicase::Config HELICASE_ACTG_PACKED =
+    helicase::ParserOptions()
+        .ignore_headers()
+        .dna_packed()
+        .config()
+    & ~helicase::advanced::RETURN_RECORD;
+
 
 // ── GzInput ───────────────────────────────────────────────────────────────────
 // helicase-compatible Block-producer backed by zlib gz decompression.
@@ -46,7 +53,7 @@ static constexpr helicase::Config HELICASE_ACTG =
 // any call to next().
 
 class GzInput {
-    static constexpr size_t BUF_SIZE = 1u << 18;   // 256 KB buffer
+    static constexpr size_t BUF_SIZE = 1u << 20;   // 1 MB buffer
 
     gzFile gz_   = nullptr;
     bool   eof_  = false;
@@ -84,7 +91,7 @@ public:
     explicit GzInput(const std::string& path) : buf_(BUF_SIZE) {
         gz_ = gzopen(path.c_str(), "rb");
         if (!gz_) throw std::runtime_error("Cannot open: " + path);
-        gzbuffer(gz_, 256u << 10);
+        gzbuffer(gz_, 1u << 20);
         int n = gzread(gz_, buf_.data(), static_cast<unsigned>(buf_.size()));
         if (n <= 0) { gzclose(gz_); gz_ = nullptr; throw std::runtime_error("Cannot read: " + path); }
         buf_fill_   = static_cast<size_t>(n);

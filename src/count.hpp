@@ -27,7 +27,11 @@
 #include <exception>
 #include <stdexcept>
 #include <charconv>
+#include <string_view>
+#include <filesystem>
+#include <chrono>
 
+#include <ankerl/unordered_dense.h>
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
 
@@ -36,6 +40,26 @@ inline size_t next_pow2(size_t v) noexcept {
     size_t p = 1;
     while (p < v) p <<= 1;
     return p;
+}
+
+inline uint64_t elapsed_ns(std::chrono::steady_clock::time_point t0) noexcept
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+}
+
+inline void atomic_fetch_max_relaxed(std::atomic<uint64_t>& dst, uint64_t value) noexcept
+{
+    uint64_t cur = dst.load(std::memory_order_relaxed);
+    while (cur < value &&
+           !dst.compare_exchange_weak(
+               cur, value, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
+inline double ns_to_s(uint64_t ns) noexcept
+{
+    return static_cast<double>(ns) / 1'000'000'000.0;
 }
 
 
@@ -59,12 +83,38 @@ struct PartitionDebugInfo {
     std::unordered_map<uint32_t, uint64_t> coverage_hist;
 };
 
+struct DiskDedupStats {
+    std::atomic<uint64_t> aggregate_attempts{0};
+    std::atomic<uint64_t> aggregate_successes{0};
+    std::atomic<uint64_t> aggregate_fallbacks{0};
+    std::atomic<uint64_t> aggregate_records{0};
+    std::atomic<uint64_t> aggregate_unique_records{0};
+    std::atomic<uint64_t> aggregate_read_ns{0};
+    std::atomic<uint64_t> aggregate_replay_ns{0};
+    std::atomic<uint64_t> shard_rounds{0};
+    std::atomic<uint64_t> shard_files{0};
+    std::atomic<uint64_t> shard_input_bytes{0};
+    std::atomic<uint64_t> shard_output_bytes{0};
+};
+
+struct Phase2TimingStats {
+    std::atomic<uint64_t> partitions{0};
+    std::atomic<uint64_t> partition_bytes{0};
+    std::atomic<uint64_t> table_init_ns{0};
+    std::atomic<uint64_t> count_ns{0};
+    std::atomic<uint64_t> output_ns{0};
+    std::atomic<uint64_t> max_part_ns{0};
+    std::atomic<uint64_t> max_count_ns{0};
+    std::atomic<uint64_t> max_output_ns{0};
+};
+
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
 //
 // Drains a superkmer reader into the caller-provided hash table (mt_=false).
 // The stored min_pos byte lets Phase 2 init the bucket hash in O(m) rather than
-// O(k), and a 1-ahead prefetch_packed hides the ~40 ns LLC miss per superkmer.
+// O(k).  After each superkmer window is initialized, we prefetch the destination
+// bucket from the already-computed minimizer hash.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
@@ -83,10 +133,6 @@ uint64_t count_partition(
 
     // Per-minimizer k-mer count (only allocated when debug is requested).
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
-
-    // 1-ahead prefetch: issue prefetch_packed for superkmer N+1 before processing N
-    // to hide the ~40 ns LLC miss behind N's processing time.
-    // min_pos == NO_MIN (sentinel): falls back to prefetch-after-init.
 
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
@@ -111,10 +157,6 @@ uint64_t count_partition(
         const uint8_t* nxt_packed  = reader.packed_data();  // packed bases of next superkmer (prefetch target)
         const size_t   nxt_len     = reader.size();
         const hdr_t    nxt_min_pos = reader.min_pos();
-
-        // Issue prefetch for NEXT bucket BEFORE processing CURRENT superkmer.
-        if (nxt_len >= k && nxt_min_pos != NO_MIN)
-            table.prefetch_packed(nxt_packed, nxt_min_pos);
 
         // Process CURRENT superkmer.
         if (cur_len >= k) {
@@ -142,6 +184,7 @@ uint64_t count_partition(
             if (cur_min_pos != NO_MIN) {
                 const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
                 if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
+                table.prefetch(win);
             } else {
                 win.init_packed(cur_packed);
                 table.prefetch(win);  // NO_MIN fallback: prefetch after init
@@ -169,6 +212,392 @@ uint64_t count_partition(
         // Convert per-minimizer k-mer counts to a coverage histogram.
         for (auto& [mh, cnt] : min_kmer_count)
             dbg->coverage_hist[cnt]++;
+    }
+
+    return inserted;
+}
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_superkmer_record(
+    const uint8_t*                                                        packed,
+    size_t                                                                len,
+    sk_hdr_t<k, m>                                                        min_pos,
+    uint32_t                                                              multiplicity,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+{
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr hdr_t NO_MIN = sk_no_min<k, m>;
+
+    if (len < k || multiplicity == 0) return 0;
+
+    auto inc = [multiplicity](uint32_t v) { return v + multiplicity; };
+    uint64_t inserted = 0;
+
+    kache_hash::Kmer_Window<k, m> win;
+    if (min_pos != NO_MIN) {
+        win.init_packed_with_min(packed, min_pos);
+        table.prefetch(win);
+    } else {
+        win.init_packed(packed);
+        table.prefetch(win);
+    }
+
+    table.upsert(win, inc, multiplicity, token);
+    inserted += multiplicity;
+
+    const uint8_t* byte_ptr = packed + (k >> 2);
+    int shift = static_cast<int>(6u - 2u * (k & 3u));
+    for (size_t i = k; i < len; ++i) {
+        const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
+        shift -= 2;
+        if (shift < 0) { shift = 6; ++byte_ptr; }
+        win.advance(b);
+        table.upsert(win, inc, multiplicity, token);
+        inserted += multiplicity;
+    }
+
+    return inserted;
+}
+
+
+template <uint16_t k, uint16_t m>
+struct PackedSuperkmerKey {
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t MAX_LEN = static_cast<size_t>(std::numeric_limits<hdr_t>::max());
+    static constexpr size_t MAX_RECORD_BYTES = HDR_BYTES + (MAX_LEN + 3u) / 4u;
+    static constexpr size_t WORDS = (MAX_RECORD_BYTES + sizeof(uint64_t) - 1u) / sizeof(uint64_t);
+    static constexpr size_t STORAGE_BYTES = WORDS * sizeof(uint64_t);
+
+    std::array<uint64_t, WORDS> words{};
+
+    static PackedSuperkmerKey from_record(const char* record, size_t record_size)
+    {
+        PackedSuperkmerKey key;
+        if (record_size > MAX_RECORD_BYTES)
+            throw std::runtime_error("tuna: corrupt superkmer record exceeds maximum encoded length");
+        std::memcpy(key.words.data(), record, record_size);
+        return key;
+    }
+
+    const char* bytes() const noexcept
+    {
+        return reinterpret_cast<const char*>(words.data());
+    }
+
+    friend bool operator==(const PackedSuperkmerKey& a,
+                           const PackedSuperkmerKey& b) noexcept
+    {
+        return a.words == b.words;
+    }
+};
+
+
+template <uint16_t k, uint16_t m>
+struct PackedSuperkmerKeyHash {
+    size_t operator()(const PackedSuperkmerKey<k, m>& key) const noexcept
+    {
+        return static_cast<size_t>(
+            XXH3_64bits(key.words.data(), PackedSuperkmerKey<k, m>::STORAGE_BYTES));
+    }
+};
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_packed_superkmer_key(
+    const PackedSuperkmerKey<k, m>&                                      key,
+    uint32_t                                                             multiplicity,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&        table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+{
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+
+    hdr_t len, mp;
+    std::memcpy(&len, key.bytes(),                 sizeof(hdr_t));
+    std::memcpy(&mp,  key.bytes() + sizeof(hdr_t), sizeof(hdr_t));
+    const auto* packed = reinterpret_cast<const uint8_t*>(key.bytes() + HDR_BYTES);
+    return count_superkmer_record<k, m>(
+        packed, static_cast<size_t>(len), mp, multiplicity, table, token);
+}
+
+
+inline uint64_t superkmer_file_size(const std::string& path)
+{
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    return ec ? 0 : static_cast<uint64_t>(sz);
+}
+
+
+inline std::string dedup_shard_path(
+    const std::string& work_dir,
+    size_t             partition,
+    size_t             level,
+    size_t             shard)
+{
+    return work_dir + "dedup_p" + std::to_string(partition)
+        + "_l" + std::to_string(level)
+        + "_s" + std::to_string(shard) + ".superkmers";
+}
+
+
+inline size_t disk_dedup_worker_budget(const Config& cfg, size_t n_threads)
+{
+    static constexpr uint64_t MiB = uint64_t(1) << 20;
+    if (cfg.ram_budget_bytes == 0)
+        return static_cast<size_t>(256 * MiB);
+
+    const uint64_t threads = std::max<uint64_t>(1, n_threads);
+    // This budget is only for the exact superkmer dedup map.  The phase-2
+    // k-mer table and other working memory are separate, so keep substantial
+    // headroom while still using enough of -ram to avoid excess sharding.
+    const uint64_t share = (cfg.ram_budget_bytes * 3u / 8u) / threads;
+    return static_cast<size_t>(std::min(std::max<uint64_t>(share, 16 * MiB), 512 * MiB));
+}
+
+
+template <uint16_t k, uint16_t m>
+bool try_count_disk_aggregated(
+    const std::string&                                                    path,
+    size_t                                                               memory_budget,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
+    uint64_t&                                                            inserted,
+    DiskDedupStats*                                                       stats = nullptr)
+{
+    using key_t = PackedSuperkmerKey<k, m>;
+    using map_t = ankerl::unordered_dense::map<key_t, uint32_t, PackedSuperkmerKeyHash<k, m>>;
+    static constexpr size_t ENTRY_OVERHEAD = 32;
+    static constexpr size_t ENTRY_ESTIMATE = sizeof(key_t) + sizeof(uint32_t) + ENTRY_OVERHEAD;
+
+    inserted = 0;
+    if (superkmer_file_size(path) == 0) return true;
+
+    SuperkmerReader<k, m> reader(path);
+    if (!reader.ok())
+        throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+
+    map_t multiplicities;
+    if (memory_budget > ENTRY_ESTIMATE) {
+        const size_t reserve_by_budget = memory_budget / ENTRY_ESTIMATE;
+        const size_t reserve_by_file = static_cast<size_t>(
+            std::max<uint64_t>(1024, superkmer_file_size(path) / key_t::MAX_RECORD_BYTES));
+        multiplicities.reserve(std::min(reserve_by_budget, reserve_by_file));
+    }
+
+    size_t total_key_bytes = 0;
+    size_t records_seen = 0;
+    const auto read_t0 = std::chrono::steady_clock::now();
+    while (reader.next()) {
+        const auto key = key_t::from_record(reader.record_data(), reader.record_size());
+        auto [it, is_new] = multiplicities.try_emplace(key, uint32_t(1));
+        if (is_new) {
+            total_key_bytes += key_t::STORAGE_BYTES;
+        } else {
+            ++it->second;
+        }
+
+        if ((++records_seen & 4095u) == 0) {
+            const size_t estimated = multiplicities.size() * ENTRY_OVERHEAD
+                                   + total_key_bytes
+                                   + multiplicities.size() * sizeof(uint32_t);
+            if (estimated > memory_budget) return false;
+        }
+    }
+    const uint64_t read_ns = elapsed_ns(read_t0);
+
+    const auto replay_t0 = std::chrono::steady_clock::now();
+    for (const auto& [key, multiplicity] : multiplicities)
+        inserted += count_packed_superkmer_key<k, m>(key, multiplicity, table, token);
+    const uint64_t replay_ns = elapsed_ns(replay_t0);
+
+    if (stats) {
+        stats->aggregate_records.fetch_add(records_seen, std::memory_order_relaxed);
+        stats->aggregate_unique_records.fetch_add(multiplicities.size(), std::memory_order_relaxed);
+        stats->aggregate_read_ns.fetch_add(read_ns, std::memory_order_relaxed);
+        stats->aggregate_replay_ns.fetch_add(replay_ns, std::memory_order_relaxed);
+    }
+
+    return true;
+}
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_disk_dedup_exact(
+    const std::string&                                                    path,
+    const Config&                                                         cfg,
+    size_t                                                               partition,
+    size_t                                                               level,
+    size_t                                                               memory_budget,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token,
+    DiskDedupStats*                                                       stats = nullptr)
+{
+    static constexpr uint64_t MEMORY_FACTOR = 4;
+    static constexpr size_t MAX_SHARDS = 64;
+
+    const uint64_t file_bytes = superkmer_file_size(path);
+    if (file_bytes == 0) return 0;
+
+    uint64_t inserted = 0;
+    if (stats) stats->aggregate_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (try_count_disk_aggregated<k, m>(path, memory_budget, table, token, inserted, stats)) {
+        if (stats) stats->aggregate_successes.fetch_add(1, std::memory_order_relaxed);
+        return inserted;
+    }
+    if (stats) stats->aggregate_fallbacks.fetch_add(1, std::memory_order_relaxed);
+
+    if (level >= 12)
+        throw std::runtime_error("tuna: disk dedup shard exceeded memory budget after recursive sharding");
+
+    const uint64_t target = std::max<uint64_t>(1, memory_budget);
+    const uint64_t needed = std::max<uint64_t>(2, (file_bytes * MEMORY_FACTOR + target - 1) / target);
+    const size_t n_shards = std::min(MAX_SHARDS, next_pow2(static_cast<size_t>(needed)));
+    if (stats) {
+        stats->shard_rounds.fetch_add(1, std::memory_order_relaxed);
+        stats->shard_files.fetch_add(n_shards, std::memory_order_relaxed);
+        stats->shard_input_bytes.fetch_add(file_bytes, std::memory_order_relaxed);
+    }
+
+    std::vector<std::string> shard_paths;
+    shard_paths.reserve(n_shards);
+    for (size_t s = 0; s < n_shards; ++s)
+        shard_paths.push_back(dedup_shard_path(cfg.work_dir, partition, level, s));
+
+    auto cleanup = [&]() {
+        for (const auto& shard : shard_paths) {
+            std::error_code ec;
+            std::filesystem::remove(shard, ec);
+        }
+    };
+
+    try {
+        std::vector<std::ofstream> outs;
+        outs.reserve(n_shards);
+        for (const auto& shard : shard_paths) {
+            outs.emplace_back(shard, std::ios::binary | std::ios::trunc);
+            if (!outs.back())
+                throw std::runtime_error("tuna: cannot open dedup shard for writing: " + shard);
+        }
+
+        SuperkmerReader<k, m> reader(path);
+        if (!reader.ok())
+            throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+
+#ifdef TUNA_LZ4_BUCKETS
+        static constexpr size_t SHARD_BUFFER_BYTES = 1u << 20;
+        std::vector<std::vector<char>> shard_buffers(n_shards);
+        std::vector<uint8_t> shard_initialized(n_shards, 0);
+        auto flush_shard = [&](size_t shard) {
+            auto& buf = shard_buffers[shard];
+            if (buf.empty()) return;
+            if (!shard_initialized[shard]) {
+                tuna_superkmer_detail::write_lz4_bucket_magic(outs[shard]);
+                shard_initialized[shard] = 1;
+            }
+            tuna_superkmer_detail::write_superkmer_bucket_block(
+                outs[shard], buf.data(), buf.size(), true);
+            buf.clear();
+        };
+#endif
+
+        const uint64_t seed = 0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(level);
+        while (reader.next()) {
+            const uint64_t h = XXH3_64bits_withSeed(
+                reader.record_data(), reader.record_size(), seed);
+            const size_t shard = static_cast<size_t>(h) & (n_shards - 1u);
+#ifdef TUNA_LZ4_BUCKETS
+            if (cfg.lz4_shards) {
+                auto& buf = shard_buffers[shard];
+                buf.insert(buf.end(), reader.record_data(), reader.record_data() + reader.record_size());
+                if (buf.size() >= SHARD_BUFFER_BYTES)
+                    flush_shard(shard);
+            } else
+#endif
+            outs[shard].write(reader.record_data(),
+                              static_cast<std::streamsize>(reader.record_size()));
+        }
+#ifdef TUNA_LZ4_BUCKETS
+        if (cfg.lz4_shards) {
+            for (size_t s = 0; s < n_shards; ++s)
+                flush_shard(s);
+        }
+#endif
+        for (auto& out : outs) {
+            out.close();
+            if (!out)
+                throw std::runtime_error("tuna: failed while writing dedup shard");
+        }
+        if (stats) {
+            uint64_t written = 0;
+            for (const auto& shard : shard_paths) {
+                std::error_code ec;
+                const auto sz = std::filesystem::file_size(shard, ec);
+                if (!ec) written += static_cast<uint64_t>(sz);
+            }
+            stats->shard_output_bytes.fetch_add(written, std::memory_order_relaxed);
+        }
+
+        uint64_t total_inserted = 0;
+        for (size_t s = 0; s < n_shards; ++s) {
+            total_inserted += count_disk_dedup_exact<k, m>(
+                shard_paths[s], cfg, partition, level + 1, memory_budget, table, token, stats);
+            std::error_code ec;
+            std::filesystem::remove(shard_paths[s], ec);
+        }
+        return total_inserted;
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+}
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_partition_mem_aggregated(
+    const std::string&                                                    data,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+{
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+
+    struct RecordHash {
+        size_t operator()(std::string_view s) const noexcept {
+            return static_cast<size_t>(XXH3_64bits(s.data(), s.size()));
+        }
+    };
+
+    ankerl::unordered_dense::map<std::string_view, uint32_t, RecordHash> multiplicities;
+    multiplicities.reserve(std::max<size_t>(1024, data.size() / 8));
+
+    const char* cur = data.data();
+    const char* end = data.data() + data.size();
+    while (cur + static_cast<ptrdiff_t>(HDR_BYTES) <= end) {
+        const char* rec = cur;
+        hdr_t len, mp;
+        std::memcpy(&len, cur,                 sizeof(hdr_t));
+        std::memcpy(&mp,  cur + sizeof(hdr_t), sizeof(hdr_t));
+        (void)mp;
+        if (len == 0) break;
+        cur += HDR_BYTES;
+        const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
+        if (cur + static_cast<ptrdiff_t>(packed_bytes) > end) break;
+        cur += packed_bytes;
+        ++multiplicities[std::string_view(rec, static_cast<size_t>(cur - rec))];
+    }
+
+    uint64_t inserted = 0;
+    for (const auto& [record, multiplicity] : multiplicities) {
+        hdr_t len, mp;
+        std::memcpy(&len, record.data(),                 sizeof(hdr_t));
+        std::memcpy(&mp,  record.data() + sizeof(hdr_t), sizeof(hdr_t));
+        const auto* packed = reinterpret_cast<const uint8_t*>(record.data() + HDR_BYTES);
+        inserted += count_superkmer_record<k, m>(
+            packed, static_cast<size_t>(len), mp, multiplicity, table, token);
     }
 
     return inserted;
@@ -212,6 +641,22 @@ uint64_t write_counts(
         if (chunk.size() >= WRITE_BATCH) flush_chunk();
     });
     if (!chunk.empty()) flush_chunk();
+    return written;
+}
+
+template <uint16_t k, uint16_t m, bool mt_ = false>
+uint64_t count_output_kmers(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg)
+{
+    if (cfg.ci <= 1 && cfg.cx == std::numeric_limits<uint64_t>::max())
+        return static_cast<uint64_t>(table.size());
+
+    uint64_t written = 0;
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt >= cfg.ci && cnt <= cfg.cx) ++written;
+    });
     return written;
 }
 
@@ -398,6 +843,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    const size_t dedup_budget = disk_dedup_worker_budget(cfg, n_threads);
     std::atomic<size_t> next_part{0};
 
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
@@ -415,9 +861,6 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
                 if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
-                SuperkmerReader<k, m> reader(path);
-                if (!reader.ok())
-                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
                 size_t init_sz;
                 if (cal > 0) {
@@ -431,7 +874,8 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 }
                 table_t table(init_sz, 1);
 
-                const uint64_t ins = count_partition<k, m>(reader, table, token);
+                const uint64_t ins = count_disk_dedup_exact<k, m>(
+                    path, cfg, p, 0, dedup_budget, table, token);
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
                     const uint64_t unique = static_cast<uint64_t>(table.size());
@@ -728,6 +1172,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
+    const size_t dedup_budget = disk_dedup_worker_budget(cfg, n_threads);
     std::atomic<size_t> next_part{0};
 
     std::mutex            out_mutex;
@@ -745,6 +1190,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::vector<PartitionDebugInfo>                part_infos;
     if (cfg.debug_stats) part_infos.resize(n_parts);
     std::atomic<uint64_t> calibrated_unique{0};
+    const bool collect_phase2_stats = cfg.debug_stats;
+    Phase2TimingStats phase2_stats;
+    DiskDedupStats dedup_stats;
 
     auto worker = [&](size_t /*tid*/) {
         try {
@@ -756,9 +1204,10 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
                 if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
-                SuperkmerReader<k, m> reader(path);
-                if (!reader.ok())
-                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+                const uint64_t part_bytes = collect_phase2_stats ? superkmer_file_size(path) : 0;
+                const auto part_t0 = collect_phase2_stats
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
                 size_t init_sz;
                 if (cal > 0) {
@@ -770,10 +1219,28 @@ std::pair<uint64_t, uint64_t> count_and_write(
                         : size_t(1u << 27) / n_parts;
                     init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
                 }
+                const auto table_t0 = collect_phase2_stats
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 table_t table(init_sz, 1);
+                const uint64_t table_ns = collect_phase2_stats ? elapsed_ns(table_t0) : 0;
 
                 PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
-                const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
+                uint64_t ins;
+                const auto count_t0 = collect_phase2_stats
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                if (!cfg.debug_stats) {
+                    ins = count_disk_dedup_exact<k, m>(
+                        path, cfg, p, 0, dedup_budget, table, token,
+                        collect_phase2_stats ? &dedup_stats : nullptr);
+                } else {
+                    SuperkmerReader<k, m> reader(path);
+                    if (!reader.ok())
+                        throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+                    ins = count_partition<k, m>(reader, table, token, dbg);
+                }
+                const uint64_t count_ns = collect_phase2_stats ? elapsed_ns(count_t0) : 0;
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
                     const uint64_t unique = static_cast<uint64_t>(table.size());
@@ -795,10 +1262,27 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     dbg->resize_log  = table.resize_log();
                 }
 
-                const uint64_t wrt = kff_out
-                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+                const auto output_t0 = collect_phase2_stats
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                const uint64_t wrt = cfg.count_only
+                    ? count_output_kmers<k, m>(table, cfg)
+                    : (kff_out
+                        ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                        : write_counts<k, m>(table, cfg, chunk, *out, out_mutex));
+                const uint64_t output_ns = collect_phase2_stats ? elapsed_ns(output_t0) : 0;
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
+                if (collect_phase2_stats) {
+                    const uint64_t part_ns = elapsed_ns(part_t0);
+                    phase2_stats.partitions.fetch_add(1, std::memory_order_relaxed);
+                    phase2_stats.partition_bytes.fetch_add(part_bytes, std::memory_order_relaxed);
+                    phase2_stats.table_init_ns.fetch_add(table_ns, std::memory_order_relaxed);
+                    phase2_stats.count_ns.fetch_add(count_ns, std::memory_order_relaxed);
+                    phase2_stats.output_ns.fetch_add(output_ns, std::memory_order_relaxed);
+                    atomic_fetch_max_relaxed(phase2_stats.max_part_ns, part_ns);
+                    atomic_fetch_max_relaxed(phase2_stats.max_count_ns, count_ns);
+                    atomic_fetch_max_relaxed(phase2_stats.max_output_ns, output_ns);
+                }
 
                 // Collect per-partition overflow stats.
                 const uint64_t ov_cnt = table.overflow_insert_count();
@@ -831,6 +1315,48 @@ std::pair<uint64_t, uint64_t> count_and_write(
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
     if (worker_error) std::rethrow_exception(worker_error);
+
+    if (collect_phase2_stats) {
+        const uint64_t p_done = phase2_stats.partitions.load(std::memory_order_relaxed);
+        const double mb = static_cast<double>(
+            phase2_stats.partition_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
+        std::cerr << "[phase2] partitions=" << p_done
+                  << " input_mib=" << std::fixed << std::setprecision(1) << mb
+                  << " table_init=" << std::setprecision(3)
+                  << ns_to_s(phase2_stats.table_init_ns.load(std::memory_order_relaxed)) << "s"
+                  << " count=" << ns_to_s(phase2_stats.count_ns.load(std::memory_order_relaxed)) << "s"
+                  << " output_scan=" << ns_to_s(phase2_stats.output_ns.load(std::memory_order_relaxed)) << "s"
+                  << " max_part=" << ns_to_s(phase2_stats.max_part_ns.load(std::memory_order_relaxed)) << "s"
+                  << " max_count=" << ns_to_s(phase2_stats.max_count_ns.load(std::memory_order_relaxed)) << "s"
+                  << " max_output=" << ns_to_s(phase2_stats.max_output_ns.load(std::memory_order_relaxed)) << "s"
+                  << "\n";
+
+        std::cerr << "[phase2-dedup] budget_mib="
+                  << (static_cast<double>(dedup_budget) / (1024.0 * 1024.0))
+                  << " attempts=" << dedup_stats.aggregate_attempts.load(std::memory_order_relaxed)
+                  << " direct=" << dedup_stats.aggregate_successes.load(std::memory_order_relaxed)
+                  << " sharded=" << dedup_stats.aggregate_fallbacks.load(std::memory_order_relaxed)
+                  << " shard_rounds=" << dedup_stats.shard_rounds.load(std::memory_order_relaxed)
+                  << " shard_files=" << dedup_stats.shard_files.load(std::memory_order_relaxed)
+                  << " shard_input_mib=" << std::setprecision(1)
+                  << (static_cast<double>(dedup_stats.shard_input_bytes.load(std::memory_order_relaxed)) /
+                      (1024.0 * 1024.0))
+                  << " shard_output_mib="
+                  << (static_cast<double>(dedup_stats.shard_output_bytes.load(std::memory_order_relaxed)) /
+                      (1024.0 * 1024.0))
+                  << "\n";
+        const uint64_t records = dedup_stats.aggregate_records.load(std::memory_order_relaxed);
+        if (records > 0) {
+            const uint64_t unique_records = dedup_stats.aggregate_unique_records.load(std::memory_order_relaxed);
+            std::cerr << "[phase2-dedup-detail] records=" << records
+                      << " unique_records=" << unique_records
+                      << " multiplicity=" << std::setprecision(3)
+                      << (static_cast<double>(records) / static_cast<double>(std::max<uint64_t>(1, unique_records)))
+                      << " aggregate_read=" << ns_to_s(dedup_stats.aggregate_read_ns.load(std::memory_order_relaxed)) << "s"
+                      << " aggregate_replay=" << ns_to_s(dedup_stats.aggregate_replay_ns.load(std::memory_order_relaxed)) << "s"
+                      << "\n";
+        }
+    }
 
     // Print overflow summary (always printed to stderr, regardless of -hp).
     if(ov_total.load() > 0)
@@ -918,7 +1444,9 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
 
             uint64_t ins;
-            {
+            if (!cfg.debug_stats) {
+                ins = count_partition_mem_aggregated<k, m>(part_bufs[p], table, token);
+            } else {
                 MemoryReader<k, m> reader(part_bufs[p]);
                 ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token, dbg);
             }
@@ -947,9 +1475,11 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = kff_out
-                ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+            const uint64_t wrt = cfg.count_only
+                ? count_output_kmers<k, m>(table, cfg)
+                : (kff_out
+                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex));
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };

@@ -26,11 +26,13 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 
 tuna runs a two-phase pipeline:
 
-1. **Partition (Phase 1)** — streams each input file through a minimizer iterator. Whenever the minimizer changes, the current superkmer is flushed to a per-partition binary file (on disk if unsufficient RAM budget). This groups k-mers that share a minimizer into the same bucket. The number of partitions is auto-tuned from input size (targeting ~2 MB input per partition) or set explicitly with `-n`.
+1. **Partition (Phase 1)** — streams each input file through a minimizer iterator. Whenever the minimizer changes, the current superkmer is flushed to a per-partition binary file (on disk if insufficient RAM budget). This groups k-mers that share a Phase 1 signature into the same bucket. The number of partitions is auto-tuned from input size (targeting ~2 MB input per partition) or set explicitly with `-n`.
 
-2. **Count (Phase 2)** — replays each partition, upserting every k-mer into a Kache-hash table with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time.
+2. **Count (Phase 2)** — replays each partition, upserting every k-mer into a Kache-hash table with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time. Disk-mode partitions are exact-superkmer deduplicated within the configured RAM budget before replay, reducing repeated work on read-shaped input.
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
+
+For gzipped input, Phase 1 uses producer/consumer parsing with packed read batches in both disk and in-memory bucket modes. One or a few large plain inputs are also split into mmap-backed batches so multiple workers can partition a single file. In disk mode, all partitioning paths hand full buffers to sharded writer threads, so parser/partition workers can overlap computation with bucket file writes.
 
 Partitions are processed in parallel across threads (up to `-n` partitions at a time), keeping peak memory proportional to a single partition's k-mer set.
 
@@ -91,6 +93,29 @@ This produces a single-instantiation binary locked to that (k, m) pair. Those va
 cmake .. -DFIXED_K=31 -DFIXED_M=21
 ```
 
+### Advanced build-time tuning
+
+Most benchmark builds should set `FIXED_K` and `FIXED_M` for the workload being measured. Two additional CMake cache variables expose large-read pipeline tuning:
+
+```bash
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_PHASE1_SIG_LEN=17
+```
+
+`TUNA_PHASE1_SIG_LEN` decouples the Phase 1 partitioning signature from the Phase 2 counting minimizer. For example, `-DFIXED_K=31 -DFIXED_M=21 -DTUNA_PHASE1_SIG_LEN=17` partitions on 17-mers but still counts with the 21-mer minimizer used by the hash table. Records produced with a shorter Phase 1 signature are marked so Phase 2 recomputes the true counting minimizer while replaying each k-mer. This preserves counts while reducing superkmer record count on read-shaped data.
+
+```bash
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_AUTO_PARTITION_MB=4
+```
+
+`TUNA_AUTO_PARTITION_MB` changes only the throughput floor in the automatic partition-count heuristic. The cache-residency constraint can still choose a larger `-n`. Explicit `-n` on the command line always takes precedence.
+
+```bash
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_LZ4_BUCKETS=ON
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_LZ4_BUCKETS=ON -DTUNA_LZ4_ACCELERATION=16
+```
+
+`TUNA_LZ4_BUCKETS` builds optional support for runtime `-lz4` and `-lz4-shards` flags. `-lz4` stores Phase 1 bucket blocks in an LZ4-framed superkmer format, and `-lz4-shards` applies the same default-LZ4 block format to recursive Phase 2 dedup shard files. `TUNA_LZ4_ACCELERATION` switches those modes from default LZ4 compression to `LZ4_compress_fast`; higher values favor faster compression and larger buckets. LZ4 buckets and shards can substantially reduce temporary file size on large inputs, but are disabled at runtime by default because benchmark results on current hardware show little or no runtime gain.
+
 If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
 
 ```bash
@@ -118,10 +143,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 ```
 tuna [options] <input1.fa [input2.fa ...]> <output_file>
 tuna [options] @<input_list_file>          <output_file>
+tuna [options] <input_list_file>.fof       <output_file>
 ```
 
 Input files can be FASTA or FASTQ, plain or gzipped.
-Instead of listing files directly, you can pass `@list.txt` where `list.txt` is a newline-separated file of paths.
+Instead of listing files directly, you can pass `@list.txt`, or a single `.fof`, `.fofn`, or `.list` input, where the list file contains one input path per line.
 
 ### Options
 
@@ -146,6 +172,10 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
 | `-kt` | — | off | Keep temporary partition files after the run |
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
+| `-p2` | — | off | Run Phase 2 only from kept partition files in `-w` |
+| `-co` | — | off | Count only; skip output writing after k-mer counting |
+| `-lz4` | — | off | Compress disk-mode Phase 1 bucket files with default LZ4 when LZ4 support is available |
+| `-lz4-shards` | — | off | Compress recursive Phase 2 dedup shard files with default LZ4 when LZ4 support is available |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
 
 </details>
@@ -250,3 +280,15 @@ tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)
+
+### Large human-read benchmark
+
+On a paired human FASTQ.gz read dataset with 793M reads and 95.1B counted 31-mers, using 8 threads, an 8 GB memory target, and count-only/output-suppressed runs:
+
+| tool / configuration | wall time | notes |
+|----------------------|----------:|-------|
+| tuna, `-DFIXED_K=31 -DFIXED_M=21 -DTUNA_PHASE1_SIG_LEN=17` | 4:19.20 | Phase 1 149.19s, Phase 2 109.95s, 12.56B superkmers |
+| KMC 3.2.4 | 6:55.89 | `kmc -k31 -t8 -m8 -w`; KMC stages sum to 415.79s |
+| upstream `vicLeva/tuna` commit `338e9d9` | 17:31.46 | measured through the unmodified library API with a no-op binary callback because that CLI has no count-only flag |
+
+All runs reported 7,589,178,026 unique 31-mers.

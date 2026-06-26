@@ -354,6 +354,12 @@ public:
         PackedDNA res; std::swap(res, cur_dna_packed_); return res;
     }
 
+    const PackedDNA& get_dna_packed() const {
+        if constexpr (advanced::flag_is_not_set(CONFIG, advanced::COMPUTE_DNA_PACKED))
+            throw std::logic_error("dna_packed not enabled");
+        return cur_dna_packed_;
+    }
+
     size_t get_dna_len() const {
         if constexpr (advanced::flag_is_set(CONFIG, advanced::COMPUTE_DNA_LEN)) return dna_len_;
         if constexpr (advanced::flag_is_set(CONFIG, advanced::COMPUTE_DNA_STRING)) {

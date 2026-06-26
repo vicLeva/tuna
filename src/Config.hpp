@@ -20,7 +20,12 @@ struct Config {
     bool         hide_progress  = false;
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
+    bool         phase2_only   = false; // skip phase 1 and count existing partition files in work_dir
+    bool         count_only    = false; // count k-mers but skip output writing
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
+    bool         lz4_buckets   = false; // compress disk-mode phase-1 bucket files with LZ4
+    bool         lz4_shards    = false; // compress recursive phase-2 dedup shard files with LZ4
+    bool         phase1_adaptive = false; // use experimental adaptive phase-1 scheduler for gz FASTQ
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
 };
