@@ -1,198 +1,254 @@
 #!/usr/bin/env python3
 """Plot n-files scaling sweep from bench_scaling.sh output.
 
-Usage:
-    python scripts/plot_scaling.py [bench_scaling.csv] [outprefix]
+Produces figures matching the style of plot_all_tools.py:
+  <prefix>_ecoli.png   — wall time + RSS for E. coli
+  <prefix>_human.png   — wall time + RSS for Human
+  <prefix>_combined.png — 2×2 combined figure
 
-Defaults:
-    csv     — most recent benchmark/results/bench_scaling_*/bench_scaling.csv
-    outprefix — same directory as csv, stem = "scaling"
+Usage:
+    python scripts/plot_scaling.py [bench_scaling.csv] [--out PREFIX]
 """
 
 import sys
 import csv
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+import argparse
+import math
 from pathlib import Path
 from collections import defaultdict
 
-# ── Input paths ───────────────────────────────────────────────────────────────
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
-if len(sys.argv) > 1:
-    csv_path = Path(sys.argv[1])
-else:
-    candidates = sorted(
-        Path(__file__).parent.parent.glob(
-            "benchmark/results/bench_scaling_*/bench_scaling.csv"
-        )
-    )
-    if not candidates:
-        raise FileNotFoundError("No bench_scaling.csv found under benchmark/results/")
-    csv_path = candidates[-1]
-
-outprefix = Path(sys.argv[2]) if len(sys.argv) > 2 else csv_path.parent / "scaling"
-
-print(f"CSV:    {csv_path}")
-print(f"Output: {outprefix}_*.png")
-
-# ── Style (matches plot_all_tools.py) ─────────────────────────────────────────
+# ── per-tool visual identity (matches plot_all_tools.py exactly) ──────────────
 
 STYLE = {
     "tuna":  dict(color="#2166ac", marker="o",  label="tuna"),
     "kmc":   dict(color="#d6604d", marker="s",  label="KMC3"),
     "fastk": dict(color="#4dac26", marker="^",  label="FastK"),
 }
+TOOLS = ["tuna", "kmc", "fastk"]
 
-# ── Load CSV ──────────────────────────────────────────────────────────────────
-# data[dataset][tool][n_files] = {wall_s, rss_mb, phase1_s, phase2_s}
+DATASET_META = {
+    "ecoli": dict(title="E. coli  (k=31, assemblies)"),
+    "human": dict(title="Human    (k=31, assemblies)"),
+}
 
-data = defaultdict(lambda: defaultdict(dict))
+# ── tick formatters (matches plot_all_tools.py) ───────────────────────────────
 
-with open(csv_path) as f:
-    for row in csv.DictReader(f):
-        ds   = row["dataset"]
-        tool = row["tool"]
-        n    = int(row["n_files"])
-        def _f(k):
-            v = row.get(k, "")
-            return float(v) if v not in ("", "na") else None
-        data[ds][tool][n] = dict(
-            wall=_f("wall_s"),
-            rss =_f("rss_mb"),
-            p1  =_f("phase1_s"),
-            p2  =_f("phase2_s"),
-        )
+def _fmt_time(v, _):
+    if v <= 0:  return "0 s"
+    if v < 10:  return f"{v:.1f} s"
+    return f"{v:.0f} s"
 
-DATASETS = [ds for ds in ["ecoli", "human"] if ds in data]
-TOOLS    = [t  for t  in ["tuna", "kmc", "fastk"] if any(t in data[ds] for ds in DATASETS)]
+def _fmt_n(v, _):
+    """Compact label for n_files log axis."""
+    v = int(v)
+    if v >= 1000: return f"{v//1000}k"
+    return str(v)
 
-DS_LABELS = {"ecoli": "E. coli (assemblies)", "human": "Human (assemblies)"}
+# ── data loading ──────────────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def load(csv_path):
+    """data[dataset][tool] = sorted list of (n_files, wall_s, rss_mb)."""
+    data = defaultdict(lambda: defaultdict(list))
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            ds, tool, n = row["dataset"], row["tool"], int(row["n_files"])
+            def _f(k):
+                v = row.get(k, "")
+                return float(v) if v not in ("", "na") else None
+            wall = _f("wall_s")
+            rss  = _f("rss_mb")
+            if wall is not None:
+                data[ds][tool].append((n, wall, rss))
+    for ds in data:
+        for tool in data[ds]:
+            data[ds][tool].sort()
+    return data
 
-def xs_ys(ds, tool, metric="wall"):
-    pts = data[ds].get(tool, {})
-    pairs = sorted((n, v[metric]) for n, v in pts.items() if v.get(metric) is not None)
-    if not pairs:
-        return [], []
-    xs, ys = zip(*pairs)
-    return list(xs), list(ys)
+def xs_ys(data, ds, tool, field):
+    """field: 'wall' or 'rss'. Returns (xs, ys) with None values dropped."""
+    fi = 0 if field == "wall" else 1
+    pts = [(n, wall, rss) for n, wall, rss in data[ds].get(tool, [])
+           if (wall if field == "wall" else rss) is not None]
+    if not pts: return [], []
+    xs = [p[0] for p in pts]
+    ys = [p[fi + 1] for p in pts]
+    return xs, ys
 
-# ── Figure: wall time ─────────────────────────────────────────────────────────
+# ── axis drawing ──────────────────────────────────────────────────────────────
 
-fig, axes = plt.subplots(1, len(DATASETS), figsize=(6 * len(DATASETS), 4.5), sharey=False)
-if len(DATASETS) == 1:
-    axes = [axes]
-
-for ax, ds in zip(axes, DATASETS):
-    for tool in TOOLS:
-        st = STYLE[tool]
-        xs, ys = xs_ys(ds, tool, "wall")
-        if not xs:
-            continue
-        ax.plot(xs, ys, color=st["color"], marker=st["marker"],
-                label=st["label"], linewidth=1.8, markersize=5, zorder=3)
-
+def _style_xaxis(ax, xs_all):
+    """Log x-axis with clean integer tick labels."""
     ax.set_xscale("log")
-    ax.set_xlabel("Number of input files", fontsize=10)
-    ax.set_ylabel("Wall-clock time (s)", fontsize=10)
-    ax.set_title(DS_LABELS.get(ds, ds), fontsize=11, fontweight="bold")
-    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
-    ax.grid(axis="both", linestyle=":", alpha=0.4)
-    ax.spines[["top", "right"]].set_visible(False)
+    # pick explicit ticks from the data itself
+    ticks = sorted(set(xs_all))
+    ax.set_xticks(ticks)
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_n))
+    ax.xaxis.set_minor_locator(mticker.NullLocator())
+    ax.tick_params(axis="x", labelsize=7, rotation=45)
 
-# shared legend
-handles, labels = axes[0].get_legend_handles_labels()
-seen = set()
-h2, l2 = [], []
-for h, l in zip(handles, labels):
-    if l not in seen:
-        h2.append(h); l2.append(l); seen.add(l)
-
-fig.legend(h2, l2, loc="upper left", bbox_to_anchor=(0.01, 0.99),
-           fontsize=9, framealpha=0.85)
-fig.suptitle("Scaling vs number of input files  (k=31, m=21, 8 threads)",
-             fontsize=11, y=1.01)
-fig.tight_layout()
-fig.savefig(f"{outprefix}_wall.png", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {outprefix}_wall.png")
-
-# ── Figure: phase breakdown (tuna only) ───────────────────────────────────────
-
-if "tuna" in TOOLS:
-    fig, axes = plt.subplots(1, len(DATASETS), figsize=(6 * len(DATASETS), 4.5), sharey=False)
-    if len(DATASETS) == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, DATASETS):
-        xs, p1s = xs_ys(ds, "tuna", "p1")
-        _,  p2s = xs_ys(ds, "tuna", "p2")
-        if xs:
-            ax.plot(xs, p1s, color="#4393c3", marker="o", linewidth=1.6,
-                    markersize=5, label="phase 1 (partition)")
-            ax.plot(xs, p2s, color="#d6604d", marker="s", linewidth=1.6,
-                    markersize=5, label="phase 2 (count+write)")
-            ax.plot(xs, [a + b for a, b in zip(p1s, p2s)],
-                    color="#2166ac", marker="o", linewidth=1.6, markersize=5,
-                    linestyle="--", label="total", zorder=2)
-
-        ax.set_xscale("log")
-        ax.set_xlabel("Number of input files", fontsize=10)
-        ax.set_ylabel("Time (s)", fontsize=10)
-        ax.set_title(f"tuna — {DS_LABELS.get(ds, ds)}", fontsize=11, fontweight="bold")
-        ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-        ax.xaxis.set_minor_formatter(mticker.NullFormatter())
-        ax.grid(axis="both", linestyle=":", alpha=0.4)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(fontsize=8.5)
-
-    fig.suptitle("tuna phase breakdown vs number of input files  (k=31, m=21, 8 threads)",
-                 fontsize=11, y=1.01)
-    fig.tight_layout()
-    fig.savefig(f"{outprefix}_phases.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {outprefix}_phases.png")
-
-# ── Figure: peak RSS ──────────────────────────────────────────────────────────
-
-fig, axes = plt.subplots(1, len(DATASETS), figsize=(6 * len(DATASETS), 4.5), sharey=False)
-if len(DATASETS) == 1:
-    axes = [axes]
-
-for ax, ds in zip(axes, DATASETS):
+def draw_time_ax(ax, data, dataset, add_legend=False):
+    all_xs = []
     for tool in TOOLS:
         st = STYLE[tool]
-        xs, ys = xs_ys(ds, tool, "rss")
-        if not xs:
-            continue
+        xs, ys = xs_ys(data, dataset, tool, "wall")
+        if not xs: continue
+        all_xs.extend(xs)
+        ax.plot(xs, ys, color=st["color"], marker=st["marker"],
+                label=st["label"], linewidth=1.8, markersize=6, zorder=3)
+    if all_xs:
+        _style_xaxis(ax, all_xs)
+    ax.set_xlabel("Number of input files", fontsize=9)
+    ax.set_ylabel("Wall-clock time", fontsize=9)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_time))
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
+    ax.spines[["top", "right"]].set_visible(False)
+    if add_legend:
+        ax.legend(fontsize=8, framealpha=0.85, loc="upper left")
+
+def add_ecoli_zoom(ax, data):
+    """Inset zooming into n=1..50 on the E. coli wall-time panel."""
+    from matplotlib.patches import ConnectionPatch
+
+    axins = ax.inset_axes([0.08, 0.45, 0.45, 0.52])
+    for tool in TOOLS:
+        st = STYLE[tool]
+        xs, ys = xs_ys(data, "ecoli", tool, "wall")
+        pairs = [(x, y) for x, y in zip(xs, ys) if x <= 50]
+        if not pairs: continue
+        xi, yi = zip(*pairs)
+        axins.plot(xi, yi, color=st["color"], marker=st["marker"],
+                   linewidth=1.4, markersize=4, zorder=3)
+    axins.set_xscale("log")
+    axins.set_xticks([1, 2, 5, 10, 20, 50])
+    axins.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_n))
+    axins.xaxis.set_minor_locator(mticker.NullLocator())
+    axins.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_time))
+    axins.tick_params(labelsize=6)
+    axins.grid(axis="y", linestyle=":", alpha=0.35)
+    axins.spines[["top", "right"]].set_visible(False)
+
+    # draw the indicator rectangle but hide the default connectors
+    indicator = ax.indicate_inset_zoom(axins, edgecolor="grey", alpha=0.55)
+    for c in indicator.connectors:
+        c.set_visible(False)
+
+    # custom connectors: top-left and top-right of indicator → bottom corners of inset
+    x0, x1 = axins.get_xlim()
+    y_top   = axins.get_ylim()[1]   # top of the zoomed data range = top of indicator box
+    for xdata, xfrac in [(x0, 0.0), (x1, 1.0)]:
+        conn = ConnectionPatch(
+            xyA=(xdata, y_top), coordsA="data", axesA=ax,
+            xyB=(xfrac, 0.0),   coordsB="axes fraction", axesB=axins,
+            color="grey", alpha=0.55, linewidth=0.8, zorder=5,
+        )
+        ax.get_figure().add_artist(conn)
+
+def draw_rss_ax(ax, data, dataset, add_legend=False):
+    all_xs = []
+    for tool in TOOLS:
+        st = STYLE[tool]
+        xs, ys = xs_ys(data, dataset, tool, "rss")
+        if not xs: continue
+        all_xs.extend(xs)
         ys_gb = [v / 1024 for v in ys]
         ax.plot(xs, ys_gb, color=st["color"], marker=st["marker"],
-                label=st["label"], linewidth=1.8, markersize=5, zorder=3)
-
-    ax.set_xscale("log")
-    ax.set_xlabel("Number of input files", fontsize=10)
-    ax.set_ylabel("Peak RSS (GB)", fontsize=10)
-    ax.set_title(DS_LABELS.get(ds, ds), fontsize=11, fontweight="bold")
-    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
-    ax.grid(axis="both", linestyle=":", alpha=0.4)
+                label=st["label"], linewidth=1.8, markersize=6, zorder=3)
+    if all_xs:
+        _style_xaxis(ax, all_xs)
+    ax.set_xlabel("Number of input files", fontsize=9)
+    ax.set_ylabel("Peak RSS (GB)", fontsize=9)
+    ax.grid(axis="y", linestyle=":", alpha=0.45)
     ax.spines[["top", "right"]].set_visible(False)
+    if add_legend:
+        ax.legend(fontsize=8, framealpha=0.85, loc="upper left")
 
-handles, labels = axes[0].get_legend_handles_labels()
-seen = set()
-h2, l2 = [], []
-for h, l in zip(handles, labels):
-    if l not in seen:
-        h2.append(h); l2.append(l); seen.add(l)
+# ── per-dataset figure ────────────────────────────────────────────────────────
 
-fig.legend(h2, l2, loc="upper left", bbox_to_anchor=(0.01, 0.99),
-           fontsize=9, framealpha=0.85)
-fig.suptitle("Peak RSS vs number of input files  (k=31, m=21, 8 threads)",
-             fontsize=11, y=1.01)
-fig.tight_layout()
-fig.savefig(f"{outprefix}_rss.png", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"Saved: {outprefix}_rss.png")
+def plot_dataset(data, dataset, outprefix):
+    meta = DATASET_META[dataset]
+    fig, (ax_t, ax_r) = plt.subplots(1, 2, figsize=(9, 3.8),
+                                      constrained_layout=True)
+    fig.suptitle(meta["title"], fontsize=11, fontweight="bold")
+    draw_time_ax(ax_t, data, dataset, add_legend=True)
+    if dataset == "ecoli":
+        add_ecoli_zoom(ax_t, data)
+    draw_rss_ax(ax_r, data, dataset, add_legend=False)
+    out = f"{outprefix}_{dataset}.png"
+    fig.savefig(out, dpi=500)
+    plt.close(fig)
+    print(f"  saved  {out}")
+
+# ── combined 2×2 figure ───────────────────────────────────────────────────────
+
+def plot_combined(data, outprefix):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 6))
+    fig.suptitle("k-mer counting — scaling with number of input files  (k=31, count + text dump)",
+                 fontsize=11, fontweight="bold")
+
+    row_labels = {"ecoli": "E. coli", "human": "Human"}
+
+    for row, ds in enumerate(["ecoli", "human"]):
+        draw_time_ax(axes[row, 0], data, ds, add_legend=False)
+        if ds == "ecoli":
+            add_ecoli_zoom(axes[row, 0], data)
+        draw_rss_ax(axes[row, 1], data, ds, add_legend=False)
+        axes[row, 0].set_ylabel(f"{row_labels[ds]}\nWall-clock time", fontsize=9)
+        axes[row, 1].set_ylabel("Peak RSS (GB)", fontsize=9)
+
+    # shared legend below
+    seen, handles, labels = set(), [], []
+    for ax in axes.flat:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in seen:
+                handles.append(h); labels.append(l); seen.add(l)
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.13, top=0.92)
+    fig.legend(handles, labels,
+               loc="lower center", bbox_to_anchor=(0.5, 0.01),
+               ncol=len(handles), fontsize=8.5, framealpha=0.85)
+
+    out = f"{outprefix}_combined.png"
+    fig.savefig(out, dpi=500, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved  {out}")
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("csv", nargs="?", type=Path,
+                    help="bench_scaling.csv (default: most recent in benchmark/results/)")
+    ap.add_argument("--out", default=None,
+                    help="output prefix (default: same dir as csv, stem=scaling)")
+    args = ap.parse_args()
+
+    csv_path = args.csv
+    if csv_path is None:
+        candidates = sorted(
+            Path(__file__).parent.parent.glob(
+                "benchmark/results/bench_scaling_*/bench_scaling.csv"))
+        if not candidates:
+            sys.exit("error: no bench_scaling.csv found under benchmark/results/")
+        csv_path = candidates[-1]
+
+    outprefix = args.out or str(csv_path.parent / "scaling")
+
+    print(f"CSV:    {csv_path}")
+    print(f"Output: {outprefix}_*.png")
+
+    data = load(csv_path)
+
+    for ds in ["ecoli", "human"]:
+        if ds in data:
+            plot_dataset(data, ds, outprefix)
+
+    plot_combined(data, outprefix)
+
+if __name__ == "__main__":
+    main()
