@@ -797,7 +797,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
 
                 const uint64_t wrt = kff_out
                     ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+                    : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex) : 0;
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
 
                 // Collect per-partition overflow stats.

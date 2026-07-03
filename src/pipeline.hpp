@@ -145,7 +145,7 @@ int run(const Config& cfg)
         const auto t2 = std::chrono::steady_clock::now();
 
         std::ofstream tsv_out;
-        if (!cfg.output_kff) {
+        if (!cfg.count_only && !cfg.output_kff) {
             tsv_out.open(cfg.output_file);
             if (!tsv_out) {
                 std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -155,19 +155,19 @@ int run(const Config& cfg)
 
         auto do_count_mem = [&](auto canonical_tag) {
             constexpr bool C = decltype(canonical_tag)::value;
-            return cfg.output_kff
-                ? [&]() {
-                    KffOutput kff_out(cfg.output_file, cfg.k);
-                    auto r = count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
-                    kff_out.close();
-                    return r;
-                  }()
-                : count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
+            if (cfg.output_kff) {
+                KffOutput kff_out(cfg.output_file, cfg.k);
+                auto r = count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
+                kff_out.close();
+                return r;
+            }
+            return count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs,
+                                                cfg.count_only ? nullptr : &tsv_out, nullptr);
         };
         const auto [total_inserted, total_written] = cfg.canonical
             ? do_count_mem(std::true_type{})
             : do_count_mem(std::false_type{});
-        if (!cfg.output_kff && !tsv_out) {
+        if (!cfg.count_only && !cfg.output_kff && !tsv_out) {
             std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
             return 1;
         }
@@ -232,7 +232,7 @@ int run(const Config& cfg)
     const auto t2 = std::chrono::steady_clock::now();
 
     std::ofstream tsv_out;
-    if (!cfg.output_kff) {
+    if (!cfg.count_only && !cfg.output_kff) {
         tsv_out.open(cfg.output_file);
         if (!tsv_out) {
             std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -242,19 +242,19 @@ int run(const Config& cfg)
 
     auto do_count = [&](auto canonical_tag) {
         constexpr bool C = decltype(canonical_tag)::value;
-        return cfg.output_kff
-            ? [&]() {
-                KffOutput kff_out(cfg.output_file, cfg.k);
-                auto r = count_and_write<k, m, C>(cfg, stats.kmers, nullptr, &kff_out);
-                kff_out.close();
-                return r;
-              }()
-            : count_and_write<k, m, C>(cfg, stats.kmers, &tsv_out, nullptr);
+        if (cfg.output_kff) {
+            KffOutput kff_out(cfg.output_file, cfg.k);
+            auto r = count_and_write<k, m, C>(cfg, stats.kmers, nullptr, &kff_out);
+            kff_out.close();
+            return r;
+        }
+        return count_and_write<k, m, C>(cfg, stats.kmers,
+                                        cfg.count_only ? nullptr : &tsv_out, nullptr);
     };
     const auto [total_inserted, total_written] = cfg.canonical
         ? do_count(std::true_type{})
         : do_count(std::false_type{});
-    if (!cfg.output_kff && !tsv_out) {
+    if (!cfg.count_only && !cfg.output_kff && !tsv_out) {
         std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
         return 1;
     }

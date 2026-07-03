@@ -20,6 +20,7 @@ struct Config {
     bool         hide_progress  = false;
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
+    bool         count_only    = false; // skip output writing after counting (for benchmarking)
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
     bool         canonical     = true;  // count canonical k-mers (lex-min of k-mer and RC); set false with -b

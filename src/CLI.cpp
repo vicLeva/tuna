@@ -56,6 +56,7 @@ void print_usage(const char* prog)
         "              (default: forward and reverse-complement are merged into one count)\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
+        "  -co         count only: skip output writing after counting (for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
@@ -162,6 +163,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.hide_progress = true;
         } else if (arg == "-kt") {
             cfg.keep_tmp = true;
+        } else if (arg == "-co") {
+            cfg.count_only = true;
         } else if (arg == "-tp") {
             cfg.partition_only = true;
         } else if (!arg.empty() && arg[0] == '-') {
