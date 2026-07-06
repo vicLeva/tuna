@@ -29,7 +29,7 @@ TOOLS = ["tuna", "kmc", "fastk", "kfc"]
 
 STYLE = {
     "tuna":  dict(color="#2166ac", marker="o",  label="tuna"),
-    "kmc":   dict(color="#d6604d", marker="s",  label="KMC"),
+    "kmc":   dict(color="#d6604d", marker="s",  label="KMC3"),
     "fastk": dict(color="#4dac26", marker="^",  label="FastK"),
     "kfc":   dict(color="#8856a7", marker="D",  label="KFC"),
 }
@@ -226,7 +226,7 @@ def draw_rss_ax(ax, records, dataset, unit_gb=True, add_legend=False):
 
 DATASET_META = {
     "ecoli": dict(title="E. coli (k=31, 1 genome)",
-                  logtime=False, rss_gb=False),
+                  logtime=False, rss_gb=True),
     "human": dict(title="Human (k=31, 1 genome)",
                   logtime=True,  rss_gb=True),
 }
@@ -250,33 +250,63 @@ def plot_dataset(records, dataset, meta, outprefix):
 # ── combined 2×2 figure ──────────────────────────────────────────────────────
 
 def plot_combined(records, outprefix):
-    fig, axes = plt.subplots(2, 2, figsize=(10, 7),
-                              constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 6))
     fig.suptitle("k-mer counting benchmark  (k = 31, count + text dump)",
                  fontsize=11, fontweight="bold")
 
-    datasets = ["ecoli", "human"]
+    datasets   = ["ecoli", "human"]
     row_labels = ["E. coli", "Human"]
 
     for row, (ds, rl) in enumerate(zip(datasets, row_labels)):
         meta = DATASET_META[ds]
 
         draw_time_ax(axes[row, 0], records, ds,
-                     logscale=meta["logtime"],
-                     add_legend=(row == 0))
-
+                     logscale=False,
+                     add_legend=False)
         draw_rss_ax(axes[row, 1], records, ds,
                     unit_gb=meta["rss_gb"],
-                    add_legend=(row == 1))
+                    add_legend=False)
 
-        # row label on the left spine
-        time_label = "Wall-clock time (log scale)" if meta["logtime"] else "Wall-clock time"
-        axes[row, 0].set_ylabel(
-            f"{rl}\n{time_label}", fontsize=9)
+        axes[row, 0].set_ylabel(f"{rl}\nWall-clock time", fontsize=9)
         axes[row, 1].set_ylabel(
             f"Peak RSS ({'GB' if meta['rss_gb'] else 'MB'})", fontsize=9)
 
-    fig.savefig(f"{outprefix}_combined.png", dpi=500)
+    # ── zoom inset on human wall-time: [100 s, 500 s] detail ─────────────────
+    ax_ht = axes[1, 0]
+    axins = ax_ht.inset_axes([0.28, 0.24, 0.69, 0.56])
+    for tool in ["tuna", "kmc", "fastk"]:
+        st = STYLE[tool]
+        xs, ys = [], []
+        for t in THREADS:
+            val, ok = lookup(records, tool, "human", t, "wall_s")
+            if val is not None and ok:
+                xs.append(t); ys.append(val)
+        if xs:
+            axins.plot(xs, ys, color=st["color"], marker=st["marker"],
+                       linewidth=1.4, markersize=4, zorder=3)
+    axins.set_xlim(THREADS[0] - 0.5, THREADS[-1] + 0.5)
+    axins.set_ylim(90, 550)
+    axins.set_xticks([1, 4, 8, 16, 22, 28])
+    axins.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_time))
+    axins.tick_params(labelsize=6)
+    axins.grid(axis="y", linestyle=":", alpha=0.35)
+    axins.spines[["top", "right"]].set_visible(False)
+    ax_ht.indicate_inset_zoom(axins, edgecolor="grey", alpha=0.55)
+
+    # ── single shared legend below all subplots ───────────────────────────────
+    seen, handles, labels = set(), [], []
+    for ax in axes.flat:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in seen:
+                handles.append(h); labels.append(l); seen.add(l)
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.13, top=0.92)
+    fig.legend(handles, labels,
+               loc="lower center", bbox_to_anchor=(0.5, 0.01),
+               ncol=len(handles), fontsize=8.5, framealpha=0.85)
+
+    fig.savefig(f"{outprefix}_combined.png", dpi=500, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved  {outprefix}_combined.png ")
 

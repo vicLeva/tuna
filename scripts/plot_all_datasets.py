@@ -62,7 +62,7 @@ fig, axes = plt.subplots(2, ND, figsize=(4 * ND, 9))
 if ND == 1:
     axes = axes.reshape(2, 1)
 
-fig.suptitle("tuna vs KMC — per-file benchmark  (k=31, m=21, 8 threads)",
+fig.suptitle("tuna vs KMC3 — per-file benchmark  (k=31, m=21, 8 threads)",
              fontsize=13, fontweight="bold")
 
 for col, ds in enumerate(DATASETS):
@@ -83,7 +83,7 @@ for col, ds in enumerate(DATASETS):
     bp["boxes"][0].set_facecolor(C_TUNA)
     bp["boxes"][1].set_facecolor(C_KMC)
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(["tuna", "KMC"])
+    ax.set_xticklabels(["tuna", "KMC3"])
     ax.set_title(f"{ds}  (n={n})", fontweight="bold")
     ax.set_ylabel("Wall time (s)" if col == 0 else "")
     ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
@@ -102,7 +102,7 @@ for col, ds in enumerate(DATASETS):
     ax.axhline(1.0, color="black", linewidth=1.2, linestyle="--")
     ax.set_xlim(-0.5, n - 0.5)
     ax.set_xlabel("Files (sorted by speedup)")
-    ax.set_ylabel("KMC / tuna  (>1 = tuna faster)" if col == 0 else "")
+    ax.set_ylabel("KMC3 / tuna  (>1 = tuna faster)" if col == 0 else "")
     ax.set_title(f"Speedup  med={np.median(speedup):.2f}×")
     med = np.median(speedup)
     ax.axhline(med, color=C_SPD, linewidth=1.5, linestyle=":",
