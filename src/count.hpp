@@ -644,9 +644,9 @@ uint64_t write_counts(
     return written;
 }
 
-template <uint16_t k, uint16_t m, bool mt_ = false>
+template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t count_output_kmers(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg)
 {
     if (cfg.ci <= 1 && cfg.cx == std::numeric_limits<uint64_t>::max())
