@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
 # bench_all_tools_reads.sh — k-mer counter benchmark: tuna · KMC · FastK · KFC
-# Scenario : count + text dump, k=31, sequencing reads (FASTQ)
+# Scenario : count + text dump, k=31, m=21, sequencing reads (FASTQ)
 # Datasets : SRR2584863_1.fastq.gz (E. coli ~50x) and
 #            SRR622461_1.fastq.gz  (Human NA12878 ~8-10x, one lane)
 # Threads  : 8 (fixed)
 #
 # Usage: bash bench_all_tools_reads.sh <local|cluster>
+#
+# Full pipeline for every tool — no count-only/skip-output shortcuts; each
+# tool writes its real output to disk, timed end to end. No phase1/phase2
+# breakdown here (that's reserved for the tuna-vs-KMC scripts specifically).
 #
 # Notes on tool differences:
 #   tuna  : single command, writes TSV directly (no dump step)
@@ -42,7 +46,7 @@ if [[ "$MODE" == "local" ]]; then
     TABEX="/home/vlevallo/documents/giulio_colab/softs/FASTK/Tabex"
     KFC="/home/vlevallo/documents/giulio_colab/softs/KFC/target/release/kfc"
     DATA_DIR="$HOME/tmp/data/data_sequencing"
-    WORKDIR="$HOME/tuna_bench_tmp/bench_reads_$(date +%Y%m%d_%H%M%S)"
+    WORKDIR="$HOME/tuna_bench_tmp/bench_all_tools_reads_$(date +%Y%m%d_%H%M%S)"
     RAM_GB=16
 else
     # On the cluster, tool paths are injected via environment variables.
@@ -58,7 +62,7 @@ else
     : "${TABEX:=""}"
     : "${KFC:=""}"
     DATA_DIR="/WORKS/vlevallois/data/data_sequencing"
-    WORKDIR="/WORKS/vlevallois/expes_tuna/bench_reads_$(date +%Y%m%d_%H%M%S)"
+    WORKDIR="/WORKS/vlevallois/expes_tuna/bench_all_tools_reads_$(date +%Y%m%d_%H%M%S)"
     RAM_GB=256
 fi
 
@@ -66,6 +70,7 @@ ECOLI_FILE="$DATA_DIR/SRR2584863_1.fastq.gz"
 HUMAN_FILE="$DATA_DIR/SRR622461_1.fastq.gz"
 
 K=31
+M=21     # fixed everywhere (standing convention)
 THREADS=8
 
 TOOLS=(tuna kmc fastk kfc)
@@ -103,7 +108,7 @@ RESULTS="$WORKDIR/results.log"
     echo "# WORKDIR=$WORKDIR"
     echo "# ECOLI=$ECOLI_FILE"
     echo "# HUMAN=$HUMAN_FILE"
-    echo "# K=$K  RAM=${RAM_GB}GB  THREADS=$THREADS"
+    echo "# K=$K  M=$M  RAM=${RAM_GB}GB  THREADS=$THREADS"
 } > "$RESULTS"
 
 # =============================================================================
@@ -122,6 +127,7 @@ _run_tuna() {
     /usr/bin/time -v \
         "$TUNA" \
             -k "$K" \
+            -m "$M" \
             -t "$THREADS" \
             -ram "$RAM_GB" \
             -hp \
@@ -204,7 +210,7 @@ run_one() {
 # Main loop: run all tools on each dataset
 # =============================================================================
 echo "[bench] Starting — $(date)"
-echo "[bench] MODE=$MODE  K=$K  T=$THREADS  RAM=${RAM_GB}GB"
+echo "[bench] MODE=$MODE  K=$K  M=$M  T=$THREADS  RAM=${RAM_GB}GB"
 echo "[bench] E. coli: $(basename "$ECOLI_FILE")"
 echo "[bench] Human  : $(basename "$HUMAN_FILE")"
 

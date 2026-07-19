@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# benchmark/bench_dataset_stats.sh — per-file sequence and k-mer statistics
+# scripts/bench_dataset_stats.sh — per-file sequence and k-mer statistics
 #
 # Processes each file individually (never accumulates across files).
 # Uses a FIFO to pipe tuna output directly into awk so that the full k-mer
 # TSV (up to ~100 GB for human) is never written to disk.
 #
 # Usage:
-#   bash benchmark/bench_dataset_stats.sh [THREADS] [K]
+#   bash scripts/bench_dataset_stats.sh [THREADS] [K]
 #
 # Output: $RESULTS/stats.csv, one row per file:
 #   dataset, file_idx, filename,
@@ -33,13 +33,15 @@ mkdir -p "$RESULTS"
 #   fmt     — fa (FASTA, plain or gz) | fq (FASTQ, plain or gz)
 #   n       — number of files to process (head -n from fof, or 1)
 DATASETS=(
-    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:fa:100"
+    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:fa:3500"
     "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:fa:100"
     "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:fa:100"
-    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:fa:10"
+    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:fa:60"
     "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:fq:10"
     "ecolir:/WORKS/vlevallois/data/data_sequencing/SRR2584863_1.fastq.gz:fq:1"
     "humanr:/WORKS/vlevallois/data/data_sequencing/SRR622461_1.fastq.gz:fq:1"
+    "gallus:/WORKS/vlevallois/data/dataset_reads_gallus/fof.list:fq:999"
+    "human3:/WORKS/vlevallois/data/dataset_reads_human3/fof.list:fq:999"
 )
 
 # ── CSV ───────────────────────────────────────────────────────────────────────

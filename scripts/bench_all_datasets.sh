@@ -1,265 +1,184 @@
 #!/usr/bin/env bash
-# bench_datasets.sh — tuna (m=21) vs KMC on 5 datasets
+# scripts/bench_all_datasets.sh — tuna vs KMC, per-file sweep, 5 datasets
 #
-# Usage: bash bench_datasets.sh [THREADS] [K] [KMC_RAM_GB] [KMC_CACHE_CSV]
-# Example: bash bench_datasets.sh 8 31 250 /path/to/old/bench.csv
+# Tools    : tuna · KMC
+# Datasets : ecoli, human, salmonella, gut, tara (5 datasets)
+# m        : 21 (fixed, all datasets)
+# Mode     : count-only — output writing skipped entirely for both tools
+#            (tuna: -co; KMC: -w), so wall-time reflects counting alone.
 #
-# KMC_CACHE_CSV: path to a previous bench.csv that already contains KMC
-#   per-file rows.  When set, run_kmc will look up (dataset, filename) in
-#   that file and copy the cached row instead of re-running KMC.
+# Phase breakdown (both tools support it, verified against source):
+#   tuna : own "phase1:"/"phase2:" stderr lines
+#   KMC  : "1st stage:"/"2nd stage:" stderr lines — printed unconditionally
+#          by kmc_CLI/kmc.cpp's print_summary() (undocumented in -h usage
+#          text, but always emitted regardless of -w/-hp)
 #
-# Per-file experiment: N files selected from the fof (head or spread mode),
-#   one tuna + one KMC call per file.  Measures single-file throughput.
-#
-# Sampling modes:
-#   head   — take the first N files in the fof (default)
-#   spread — pick N files evenly spread across the full fof (always
-#             includes first and last)
-#
-# Output layout:
-#   $RESULTS/bench.csv            — one row per (dataset, file, tool, m)
-#   $RESULTS/<ds>/<tag>.stderr    — tuna structured timing lines
-#   $RESULTS/<ds>/<tag>.timefile  — GNU time -v output
-#   $RESULTS/<ds>/<tag>.kmc.log   — KMC stdout/stderr
-#
-# file_idx=0 / filename="full" marks the whole-dataset rows in the CSV.
-#
-# k-mer output files are written to a temp path and deleted after counting
-# to avoid accumulating hundreds of GB of TSV.
+# Output: $RESULTS_DIR/bench_datasets.csv
+#   dataset,file_idx,filename,tool,m,wall_s,rss_mb,phase1_s,phase2_s,unique_kmers
+# Aux files (timefile, stderr) in $RESULTS_DIR/aux_datasets/
 
-set -euo pipefail
+set -uo pipefail
+export LC_ALL=C LANG=C
 
-# ── Parameters ────────────────────────────────────────────────────────────────
+# =============================================================================
+# CONFIGURE
+# =============================================================================
+: "${TUNA:=""}"
+: "${KMC:=""}"
 
-THREADS=${1:-8}
-K=${2:-31}
-KMC_RAM=${3:-250}      # GB — KMC -m flag
-KMC_CACHE_CSV=${4:-}   # optional: path to prior bench.csv with KMC per-file rows
+THREADS=${THREADS:-8}
+K=31
+M=21
+RAM_GB=256      # tuna -ram budget; also used as KMC -m
 
-M_VALUES=(21)
+EXPES_ROOT="/WORKS/vlevallois/expes_tuna"
+RESULTS_DIR="$EXPES_ROOT/bench_all_datasets_$(date +%Y%m%d_%H%M%S)"
+WORKDIR="$EXPES_ROOT"
 
-TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
-KMC=kmc
-KMC_DUMP=kmc_dump
-WORK=/WORKS/vlevallois/expes_tuna
-RESULTS="$WORK/bench_datasets_$(date +%Y%m%d_%H%M%S)"
-
-mkdir -p "$RESULTS"
-
-# ── Dataset registry ──────────────────────────────────────────────────────────
-# Format: "name:fof_path:kmc_format:max_files:mode"
-#   max_files — how many files to use for the per-file experiment
-#   mode      — head (default) or spread
+# Dataset registry: "name:fof_path:kmc_format:max_files"
 DATASETS=(
-    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm:100:head"
-    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:10:head"
-    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm:100:head"
-    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm:100:head"
-    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:10:head"
+    "ecoli:/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list:-fm:100"
+    "human:/WORKS/vlevallois/data/dataset_genome_human/fof.list:-fm:10"
+    "salmonella:/WORKS/vlevallois/data/dataset_pangenome_salmonella/fof.list:-fm:100"
+    "gut:/WORKS/vlevallois/data/dataset_metagenome_gut/fof.list:-fm:100"
+    "tara:/WORKS/vlevallois/data/dataset_metagenome_tara/fof.list:-fq:10"
 )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# =============================================================================
+# Sanity checks
+# =============================================================================
+err=0
+for var in TUNA KMC; do
+    [[ -z "${!var}" ]]              && { echo "[error] $var is not set"; err=1; }
+    [[ -n "${!var}" && ! -x "${!var}" ]] && { echo "[error] not executable: ${!var}"; err=1; }
+done
+[[ "$err" -eq 1 ]] && exit 1
 
-# GNU time "Elapsed" field (M:SS.ss or H:MM:SS.ss) → seconds
-wall_to_s() {
-    awk -F: '{if(NF==3) printf "%.2f", $1*3600+$2*60+$3;
-              else       printf "%.2f", $1*60+$2}' <<< "$1"
+# =============================================================================
+# Setup
+# =============================================================================
+mkdir -p "$RESULTS_DIR" "$RESULTS_DIR/aux_datasets"
+CSV="$RESULTS_DIR/bench_datasets.csv"
+echo "dataset,file_idx,filename,tool,m,wall_s,rss_mb,phase1_s,phase2_s,unique_kmers" > "$CSV"
+
+echo "[bench] tuna vs KMC — per-file dataset sweep (count-only, m=$M)"
+echo "[bench] TUNA=$TUNA"
+echo "[bench] KMC=$KMC"
+echo "[bench] k=$K  m=$M  threads=$THREADS  ram=${RAM_GB}GB"
+echo "[bench] Results: $CSV"
+
+# =============================================================================
+# Helpers
+# =============================================================================
+wall_from_file() {
+    local t; t=$(grep "Elapsed (wall clock)" "$1" | awk '{print $NF}')
+    awk -F: '{if(NF==3) printf "%.3f",$1*3600+$2*60+$3; else printf "%.3f",$1*60+$2}' <<< "$t"
 }
-
 rss_mb() {
-    local kb
-    kb=$(grep "Maximum resident" "$1" | awk '{print $NF}')
+    local kb; kb=$(grep "Maximum resident" "$1" | awk '{print $NF}')
     awk "BEGIN{printf \"%.0f\", $kb/1024}"
 }
+se_val() { grep "^${1}:" "$2" 2>/dev/null | awk -F: '{v=$2; gsub(/^ +| +s$/,"",v); print v}' || echo na; }
 
-wall_from_file() {
-    local t
-    t=$(grep "Elapsed (wall clock)" "$1" | awk '{print $NF}')
-    wall_to_s "$t"
+# =============================================================================
+# Per-tool run functions
+# Args: file work timefile stderrfile [kmc_fmt]
+# =============================================================================
+
+_run_tuna() {
+    local file="$1" work="$2" tf="$3" se="$4"
+    # -co: skip output writing after counting
+    /usr/bin/time -v -o "$tf" \
+        "$TUNA" -k "$K" -m "$M" -t "$THREADS" -ram "$RAM_GB" -hp -co \
+        -w "$work/" "$file" /dev/null \
+        > /dev/null 2>"$se"
 }
 
-# ── CSV header ────────────────────────────────────────────────────────────────
+_run_kmc() {
+    local file="$1" work="$2" tf="$3" se="$4" fmt="$5"
+    # -w: without output — binary db is never written (true count-only)
+    mkdir -p "$work/tmp"
+    /usr/bin/time -v -o "$tf" \
+        "$KMC" -k${K} -ci1 -cs4294967295 "$fmt" -m${RAM_GB} -hp -t${THREADS} -w \
+        "$file" "$work/out" "$work/tmp" \
+        > /dev/null 2>"$se"
+    rm -rf "$work/tmp"
+}
 
-CSV="$RESULTS/bench.csv"
-echo "dataset,file_idx,filename,tool,m,wall_s,rss_mb,unique_kmers,phase1_s,phase2_s" > "$CSV"
-# For tuna: phase1_s=partitioning, phase2_s=counting+writing
-# For kmc:  phase1_s=kmc_count_wall, phase2_s=kmc_dump_wall, wall_s=sum
-# file_idx=0 / filename=full → whole-dataset row
+# =============================================================================
+# Dispatcher: run one tool on one file and record results
+# =============================================================================
+run_one() {
+    local tool="$1" ds="$2" file="$3" fidx="$4" fname="$5" kmc_fmt="$6"
+    local tag="${ds}_f$(printf '%04d' "$fidx")_${tool}"
+    local tf="$RESULTS_DIR/aux_datasets/${tag}.time"
+    local se="$RESULTS_DIR/aux_datasets/${tag}.stderr"
+    local work="$WORKDIR/ds_work_${tag}"
+    mkdir -p "$work"
 
-echo "=== Dataset benchmark ==="
-echo "    k=$K  m=${M_VALUES[*]}  threads=$THREADS  kmc_ram=${KMC_RAM}GB"
-echo "    results: $RESULTS"
+    local ok=true
+    case "$tool" in
+        tuna) _run_tuna "$file" "$work" "$tf" "$se" ;;
+        kmc)  _run_kmc  "$file" "$work" "$tf" "$se" "$kmc_fmt" ;;
+    esac || ok=false
+
+    rm -rf "$work"
+    $ok || { echo "    [FAIL] $tool"; return; }
+
+    local wall rss p1 p2 unique
+    wall=$(wall_from_file "$tf")
+    rss=$(rss_mb "$tf")
+    case "$tool" in
+        tuna) p1=$(se_val "phase1"    "$se")
+              p2=$(se_val "phase2"    "$se")
+              unique=$(se_val "unique_kmers" "$se") ;;
+        kmc)  p1=$(se_val "1st stage" "$se")
+              p2=$(se_val "2nd stage" "$se")
+              unique=$(grep "No. of unique k-mers" "$se" | awk -F: '{gsub(/^ +/,"",$2); print $2}') ;;
+    esac
+
+    printf "    [%-4s] wall=%8ss  p1=%8ss  p2=%8ss  RSS=%6sMB  unique=%s\n" \
+        "$tool" "$wall" "$p1" "$p2" "$rss" "$unique"
+    echo "$ds,$fidx,$fname,$tool,$M,$wall,$rss,$p1,$p2,$unique" >> "$CSV"
+}
+
+# =============================================================================
+# Main loop
+# =============================================================================
 echo ""
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
+echo "[bench] Starting — $(date)"
 
 for ENTRY in "${DATASETS[@]}"; do
+    IFS=: read -r DS_NAME FOF KMC_FMT DS_MAX <<< "$ENTRY"
 
-    IFS=: read -r DS_NAME FOF KMC_FMT DS_MAX DS_MODE <<< "$ENTRY"
-    DS_MAX="${DS_MAX:-10}"
-    DS_MODE="${DS_MODE:-head}"
-
-    if [ ! -f "$FOF" ]; then
+    if [[ ! -f "$FOF" ]]; then
         echo "  [SKIP] $DS_NAME: fof not found: $FOF"
         continue
     fi
 
     TOTAL=$(wc -l < "$FOF")
     N=$(( TOTAL < DS_MAX ? TOTAL : DS_MAX ))
+    mapfile -t FILES < <(head -n "$N" "$FOF")
 
-    DS_DIR="$RESULTS/$DS_NAME"
-    mkdir -p "$DS_DIR"
-
-    echo "──── Dataset: $DS_NAME  ($N / $TOTAL files, format: $KMC_FMT, mode: $DS_MODE) ────────"
-
-    if [ "$DS_MODE" = "spread" ] && [ "$N" -ge 2 ] && [ "$TOTAL" -gt "$N" ]; then
-        mapfile -t ALL_FILES < "$FOF"
-        FILES=()
-        for i in $(seq 0 $(( N - 1 ))); do
-            idx=$(( i * (TOTAL - 1) / (N - 1) ))
-            FILES+=("${ALL_FILES[$idx]}")
-        done
-        unset ALL_FILES
-    else
-        mapfile -t FILES < <(head -n "$N" "$FOF")
-    fi
-
-    # Defined here so they share DS_DIR, KMC_FMT, CSV, etc. via closure.
-
-    run_kmc() {
-        local tag="$1" file="$2" fidx="$3" fname="$4"
-
-        # ── Cache lookup (per-file only) ───────────────────────────────────────
-        # For full-dataset rows (fname="full") always run KMC — no prior data.
-        if [ -n "$KMC_CACHE_CSV" ] && [ -f "$KMC_CACHE_CSV" ] && [ "$fname" != "full" ]; then
-            local cached
-            cached=$(awk -F, -v ds="$DS_NAME" -v fn="$fname" \
-                '$1==ds && $3==fn && $4=="kmc" {print; exit}' "$KMC_CACHE_CSV")
-            if [ -n "$cached" ]; then
-                # Columns: dataset,file_idx,filename,tool,m,wall_s,rss_mb,unique_kmers,phase1_s,phase2_s
-                local k_wall k_rss k_p1 k_p2
-                k_wall=$(echo "$cached" | cut -d, -f6)
-                k_rss=$(echo  "$cached" | cut -d, -f7)
-                K_KMERS=$(echo "$cached" | cut -d, -f8)
-                k_p1=$(echo   "$cached" | cut -d, -f9)
-                k_p2=$(echo   "$cached" | cut -d, -f10)
-                echo "    [kmc]  total=${k_wall}s (count=${k_p1}s dump=${k_p2}s)  RSS=${k_rss}MB  kmers=${K_KMERS}  [cached]"
-                echo "${DS_NAME},${fidx},${fname},kmc,na,${k_wall},${k_rss},${K_KMERS},${k_p1},${k_p2}" >> "$CSV"
-                return
-            fi
-            echo "    [kmc]  no cache hit for $DS_NAME/$fname — running KMC"
-        fi
-
-        # ── Run KMC ───────────────────────────────────────────────────────────
-        local kmc_db="$WORK/kmc_db_${tag}"
-        local kmc_tmp="$WORK/kmc_tmp_${tag}"
-        local kmc_dump_out
-        kmc_dump_out=$(mktemp "$WORK/kmc_dump_XXXXXX.tsv")
-        mkdir -p "$kmc_tmp"
-
-        /usr/bin/time -v -o "$DS_DIR/${tag}.kmc.timefile" \
-            "$KMC" -k"$K" -m"$KMC_RAM" -ci1 -cs4294967295 "$KMC_FMT" -t"$THREADS" \
-            "$file" "$kmc_db" "$kmc_tmp" \
-            > "$DS_DIR/${tag}.kmc.log" 2>&1 || {
-                echo "    [kmc] FAILED — check $DS_DIR/${tag}.kmc.log"
-            }
-        rm -rf "$kmc_tmp"
-
-        /usr/bin/time -v -o "$DS_DIR/${tag}.kmc_dump.timefile" \
-            "$KMC_DUMP" -ci1 "$kmc_db" "$kmc_dump_out" \
-            >> "$DS_DIR/${tag}.kmc.log" 2>&1 || {
-                echo "    [kmc_dump] FAILED — check $DS_DIR/${tag}.kmc.log"
-            }
-        rm -f "${kmc_db}.kmc_pre" "${kmc_db}.kmc_suf"
-
-        local k_count_wall k_dump_wall k_wall k_rss
-        k_count_wall=$(wall_from_file "$DS_DIR/${tag}.kmc.timefile")
-        k_dump_wall=$(wall_from_file "$DS_DIR/${tag}.kmc_dump.timefile")
-        k_wall=$(awk "BEGIN{printf \"%.2f\", $k_count_wall + $k_dump_wall}")
-        k_rss=$(rss_mb "$DS_DIR/${tag}.kmc.timefile")
-        K_KMERS=$([ -f "$kmc_dump_out" ] && wc -l < "$kmc_dump_out" || echo 0)
-        rm -f "$kmc_dump_out"
-
-        echo "    [kmc]  total=${k_wall}s (count=${k_count_wall}s dump=${k_dump_wall}s)  RSS=${k_rss}MB  kmers=${K_KMERS}"
-        echo "${DS_NAME},${fidx},${fname},kmc,na,${k_wall},${k_rss},${K_KMERS},${k_count_wall},${k_dump_wall}" >> "$CSV"
-    }
-
-    run_tuna() {
-        local tag="$1" file="$2" fidx="$3" fname="$4"
-        for M in "${M_VALUES[@]}"; do
-            local tuna_out tuna_work
-            tuna_out=$(mktemp "$WORK/tuna_out_XXXXXX.tsv")
-            tuna_work="$WORK/tuna_work_${tag}_m${M}"
-            mkdir -p "$tuna_work"
-
-            /usr/bin/time -v -o "$DS_DIR/${tag}.m${M}.timefile" \
-                "$TUNA" -k "$K" -m "$M" -t "$THREADS" \
-                -w "$tuna_work/" "$file" "$tuna_out" \
-                2>"$DS_DIR/${tag}.m${M}.stderr" || {
-                    echo "    [tuna m=$M] FAILED — check $DS_DIR/${tag}.m${M}.stderr"
-                }
-            rm -rf "$tuna_work"
-
-            local t_wall t_rss t_kmers t_p1 t_p2
-            t_wall=$(wall_from_file "$DS_DIR/${tag}.m${M}.timefile")
-            t_rss=$(rss_mb "$DS_DIR/${tag}.m${M}.timefile")
-            t_kmers=$([ -f "$tuna_out" ] && wc -l < "$tuna_out" || echo 0)
-            t_p1=$(grep "^phase1:" "$DS_DIR/${tag}.m${M}.stderr" \
-                   | awk -F: '{gsub(/s/,"",$2); printf "%.3f", $2}' || echo na)
-            t_p2=$(grep "^phase2:" "$DS_DIR/${tag}.m${M}.stderr" \
-                   | awk -F: '{gsub(/s/,"",$2); printf "%.3f", $2}' || echo na)
-            rm -f "$tuna_out"
-
-            echo "    [tuna m=$M]  wall=${t_wall}s (p1=${t_p1}s p2=${t_p2}s)  RSS=${t_rss}MB  kmers=${t_kmers}"
-            echo "${DS_NAME},${fidx},${fname},tuna,${M},${t_wall},${t_rss},${t_kmers},${t_p1},${t_p2}" >> "$CSV"
-
-            TUNA_KMERS[$M]=$t_kmers
-        done
-    }
-
-    # ── Per-file experiment ────────────────────────────────────────────────────
+    echo ""
+    echo "──── $DS_NAME  ($N / $TOTAL files) ────────────────────"
 
     for IDX in "${!FILES[@]}"; do
-
         FILE="${FILES[$IDX]}"
         FNAME=$(basename "$FILE")
         FIDX=$(( IDX + 1 ))
-        TAG="${DS_NAME}_f$(printf '%04d' $FIDX)"
-        K_KMERS=0        # set by run_kmc
-        declare -A TUNA_KMERS  # set by run_tuna: TUNA_KMERS[m]=count
-
+        printf "  [%d/%d] %s\n" "$FIDX" "$N" "$FNAME"
         # Alternate order each file so neither tool consistently gets warm cache.
         if (( FIDX % 2 == 1 )); then
-            echo "  [$FIDX/$N] $FNAME  (kmc→tuna)"
-            run_kmc  "$TAG" "$FILE" "$FIDX" "$FNAME"
-            run_tuna "$TAG" "$FILE" "$FIDX" "$FNAME"
+            run_one kmc  "$DS_NAME" "$FILE" "$FIDX" "$FNAME" "$KMC_FMT"
+            run_one tuna "$DS_NAME" "$FILE" "$FIDX" "$FNAME" ""
         else
-            echo "  [$FIDX/$N] $FNAME  (tuna→kmc)"
-            run_tuna "$TAG" "$FILE" "$FIDX" "$FNAME"
-            run_kmc  "$TAG" "$FILE" "$FIDX" "$FNAME"
+            run_one tuna "$DS_NAME" "$FILE" "$FIDX" "$FNAME" ""
+            run_one kmc  "$DS_NAME" "$FILE" "$FIDX" "$FNAME" "$KMC_FMT"
         fi
-
-        # Correctness check — only print on mismatch.
-        any_diff=0
-        for M in "${M_VALUES[@]}"; do
-            t_kmers=${TUNA_KMERS[$M]:-0}
-            if [ "$t_kmers" -ne "$K_KMERS" ] 2>/dev/null; then
-                echo "    [DIFF] tuna m=$M: tuna=$t_kmers  kmc=$K_KMERS"
-                any_diff=1
-            fi
-        done
-        [ $any_diff -eq 0 ] && echo "    [OK]  all m values match kmc ($K_KMERS unique k-mers)"
-
-        unset TUNA_KMERS
     done
-
-    echo ""
 done
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-echo "=== Done ==="
-echo "Results: $RESULTS/bench.csv  ($(wc -l < "$CSV") rows)"
 echo ""
-column -t -s, "$CSV" | head -40
-echo "..."
+echo "[bench] Done — $(date)"
+echo "[bench] Results: $CSV  ($(( $(wc -l < "$CSV") - 1 )) rows)"

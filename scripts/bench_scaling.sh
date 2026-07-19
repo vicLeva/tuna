@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
-# scripts/bench_scaling.sh — n-files scaling sweep
+# scripts/bench_scaling.sh — n-files scaling sweep, count-only, 3 tools
 #
 # Sweeps the number of input files for tuna, KMC, and FastK on E. coli and
 # Human assembly datasets.  Tool order: one tool processes all (dataset × N)
 # combinations before the next tool starts — so partial runs give complete
 # curves per tool.
+#
+# Count-only for all 3 tools — no disk output, wall-time reflects counting
+# alone (each tool's own native mechanism, verified against source/docs):
+#   tuna  : -co (skip output writing after counting)
+#   KMC   : -w (without output) — binary db never written; kmc_dump step
+#           removed entirely (nothing to dump)
+#   FastK : no -t/-p — DO_TABLE/DO_PROFILE stay 0, so Merge_Tables/
+#           Merge_Profiles never run (core Sorting() still happens
+#           unconditionally); Tabex dump step removed entirely (no .ktab
+#           ever gets written, so there is nothing to dump)
+#
+# Phase breakdown:
+#   tuna : own "phase1:"/"phase2:" stderr lines
+#   KMC  : "1st stage:"/"2nd stage:" stderr lines — printed unconditionally
+#          by kmc_CLI/kmc.cpp's print_summary() (undocumented in -h usage
+#          text, but always emitted; verified directly against KMC's own
+#          CLI source and empirically against the local binary)
+#   FastK: no equivalent phase breakdown found; left as "na"
 #
 # Usage:
 #   bash scripts/bench_scaling.sh
@@ -14,11 +32,8 @@
 #   dataset,n_files,tool,wall_s,rss_mb,phase1_s,phase2_s
 #
 # Notes:
-#   tuna  : output written to a temp TSV in $WORKDIR, deleted after timing
-#   KMC   : phase1=kmc count (binary db), phase2=kmc_dump (TSV); both deleted
-#   FastK : phase1=FastK (ktab), phase2=Tabex -A (TSV); both deleted
-#           .fna files need .fa symlinks (created once at setup in $WORKDIR/fastk_links/)
-#           FastK does not support @fof — files are passed as individual arguments
+#   FastK does not support @fof — files are passed as individual arguments;
+#   .fna files need .fa symlinks (created once at setup in $WORKDIR/fastk_links/)
 
 set -uo pipefail
 export LC_ALL=C LANG=C
@@ -29,9 +44,7 @@ export LC_ALL=C LANG=C
 
 : "${TUNA:=""}"      # /path/to/tuna
 : "${KMC:=""}"       # /path/to/kmc
-: "${KMC_DUMP:=""}"  # /path/to/kmc_dump
 : "${FASTK:=""}"     # /path/to/FastK
-: "${TABEX:=""}"     # /path/to/Tabex
 
 WORKDIR="/WORKS/vlevallois/expes_tuna"
 ECOLI_FOF="/WORKS/vlevallois/data/dataset_genome_ecoli/fof.list"
@@ -43,7 +56,7 @@ RAM_GB=256
 THREADS=${THREADS:-8}
 
 ECOLI_NS=(1 2 3 5 10 20 50 100 200 500 1000 1500 2000 2500 3000 3500)
-HUMAN_NS=(1 2 3 4 5 6 7 8 9 10 15 20 25 30)
+HUMAN_NS=(1 2 3 4 5 6 7 8 9 10 15 20 25 30 60)
 
 TOOLS=(tuna kmc fastk)
 
@@ -52,10 +65,10 @@ TOOLS=(tuna kmc fastk)
 # =============================================================================
 
 err=0
-for var in TUNA KMC KMC_DUMP FASTK TABEX; do
+for var in TUNA KMC FASTK; do
     [[ -z "${!var}" ]] && { echo "[error] $var is not set"; err=1; }
 done
-for var in TUNA KMC KMC_DUMP FASTK TABEX; do
+for var in TUNA KMC FASTK; do
     [[ -n "${!var}" && ! -x "${!var}" ]] && { echo "[error] not executable: ${!var}"; err=1; }
 done
 for var in ECOLI_FOF HUMAN_FOF; do
@@ -85,7 +98,7 @@ mkdir -p "$RESULTS" "$WORKDIR/fastk_links"
 CSV="$RESULTS/bench_scaling.csv"
 echo "dataset,n_files,tool,wall_s,rss_mb,phase1_s,phase2_s" > "$CSV"
 echo "[bench] Results: $CSV"
-echo "[bench] k=$K  m=$M  threads=$THREADS  ram=${RAM_GB}GB"
+echo "[bench] k=$K  m=$M  threads=$THREADS  ram=${RAM_GB}GB  (count-only)"
 
 # FastK requires .fa / .fa.gz extensions; .fna files need symlinks.
 # Build FastK-compatible fofs once upfront for all files we will use.
@@ -124,23 +137,18 @@ echo "[setup] Done."
 # Helpers
 # =============================================================================
 
-wall_to_s() {
-    awk -F: '{if(NF==3) printf "%.2f",$1*3600+$2*60+$3;
-              else       printf "%.2f",$1*60+$2}' <<< "$1"
-}
-
 wall_from_file() {
     local t; t=$(grep "Elapsed (wall clock)" "$1" | awk '{print $NF}')
-    wall_to_s "$t"
+    awk -F: '{if(NF==3) printf "%.3f",$1*3600+$2*60+$3; else printf "%.3f",$1*60+$2}' <<< "$t"
 }
-
 rss_mb() {
     local kb; kb=$(grep "Maximum resident" "$1" | awk '{print $NF}')
     awk "BEGIN{printf \"%.0f\", $kb/1024}"
 }
+se_val() { grep "^${1}:" "$2" 2>/dev/null | awk -F: '{v=$2; gsub(/^ +| +s$/,"",v); print v}' || echo na; }
 
 # =============================================================================
-# Run functions
+# Run functions — count-only, single timed call per tool, no dump step
 # =============================================================================
 
 run_tuna() {
@@ -156,20 +164,20 @@ run_tuna() {
     local se="$RESULTS/${ds}_n${n}_tuna.stderr"
     mkdir -p "$work"
 
-    local out="$WORKDIR/tuna_scaling_out_${ds}_n${n}.tsv"
+    # -co: skip output writing after counting
     /usr/bin/time -v -o "$tf" \
-        "$TUNA" -k "$K" -m "$M" -t "$THREADS" -hp \
+        "$TUNA" -k "$K" -m "$M" -t "$THREADS" -hp -co \
         -ram "$RAM_GB" \
-        -w "$work/" "@$subfof" "$out" \
+        -w "$work/" "@$subfof" /dev/null \
         > /dev/null 2>"$se" \
-    || { echo "  [FAIL] tuna $ds n=$n"; rm -rf "$work" "$subfof" "$out"; return; }
-    rm -rf "$work" "$subfof" "$out"
+    || { echo "  [FAIL] tuna $ds n=$n"; rm -rf "$work" "$subfof"; return; }
+    rm -rf "$work" "$subfof"
 
     local wall rss p1 p2
     wall=$(wall_from_file "$tf")
     rss=$(rss_mb "$tf")
-    p1=$(grep  "^phase1:" "$se" | awk -F: '{gsub(/s/,"",$2); printf "%.3f",$2}' || echo na)
-    p2=$(grep  "^phase2:" "$se" | awk -F: '{gsub(/s/,"",$2); printf "%.3f",$2}' || echo na)
+    p1=$(se_val "phase1" "$se")
+    p2=$(se_val "phase2" "$se")
 
     printf "    tuna   n=%-5d  wall=%7ss  p1=%ss  p2=%ss  RSS=%sMB\n" \
         "$n" "$wall" "$p1" "$p2" "$rss"
@@ -186,35 +194,27 @@ run_kmc() {
 
     local db="$WORKDIR/kmc_scaling_${ds}_n${n}"
     local tmp="$WORKDIR/kmc_scaling_tmp_${ds}_n${n}"
-    local tf_count="$RESULTS/${ds}_n${n}_kmc_count.timefile"
-    local tf_dump="$RESULTS/${ds}_n${n}_kmc_dump.timefile"
+    local tf="$RESULTS/${ds}_n${n}_kmc.timefile"
+    local se="$RESULTS/${ds}_n${n}_kmc.stderr"
     mkdir -p "$tmp"
 
-    local se_count="$RESULTS/${ds}_n${n}_kmc_count.stderr"
-    /usr/bin/time -v -o "$tf_count" \
-        "$KMC" -k"$K" -m"$RAM_GB" -ci1 -cs4294967295 -fm -hp -t"$THREADS" \
+    # -w: without output — binary db is never written (true count-only)
+    /usr/bin/time -v -o "$tf" \
+        "$KMC" -k"$K" -m"$RAM_GB" -ci1 -cs4294967295 -fm -hp -t"$THREADS" -w \
         "@$subfof" "$db" "$tmp" \
-        > /dev/null 2>"$se_count" \
-    || { echo "  [FAIL] kmc count $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
-    rm -rf "$tmp"
+        > /dev/null 2>"$se" \
+    || { echo "  [FAIL] kmc $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
+    rm -rf "$tmp" "$subfof"
 
-    local dump_out="$WORKDIR/kmc_scaling_dump_${ds}_n${n}.tsv"
-    local se_dump="$RESULTS/${ds}_n${n}_kmc_dump.stderr"
-    /usr/bin/time -v -o "$tf_dump" \
-        "$KMC_DUMP" -ci1 "$db" "$dump_out" \
-        > /dev/null 2>"$se_dump" \
-    || echo "  [WARN] kmc_dump $ds n=$n"
-    rm -f "${db}.kmc_pre" "${db}.kmc_suf" "$dump_out" "$subfof"
+    local wall rss p1 p2
+    wall=$(wall_from_file "$tf")
+    rss=$(rss_mb "$tf")
+    p1=$(se_val "1st stage" "$se")
+    p2=$(se_val "2nd stage" "$se")
 
-    local w1 w2 wall rss
-    w1=$(wall_from_file "$tf_count")
-    w2=$(wall_from_file "$tf_dump")
-    wall=$(awk "BEGIN{printf \"%.2f\",$w1+$w2}")
-    rss=$(rss_mb "$tf_count")
-
-    printf "    kmc    n=%-5d  wall=%7ss (count=%ss dump=%ss)  RSS=%sMB\n" \
-        "$n" "$wall" "$w1" "$w2" "$rss"
-    echo "$ds,$n,kmc,$wall,$rss,$w1,$w2" >> "$CSV"
+    printf "    kmc    n=%-5d  wall=%7ss  p1=%ss  p2=%ss  RSS=%sMB\n" \
+        "$n" "$wall" "$p1" "$p2" "$rss"
+    echo "$ds,$n,kmc,$wall,$rss,$p1,$p2" >> "$CSV"
 }
 
 run_fastk() {
@@ -227,37 +227,28 @@ run_fastk() {
 
     local db="$WORKDIR/fastk_scaling_${ds}_n${n}"
     local tmp="$WORKDIR/fastk_scaling_tmp_${ds}_n${n}"
-    local tf_count="$RESULTS/${ds}_n${n}_fastk_count.timefile"
-    local tf_dump="$RESULTS/${ds}_n${n}_fastk_dump.timefile"
+    local tf="$RESULTS/${ds}_n${n}_fastk.timefile"
+    local se="$RESULTS/${ds}_n${n}_fastk.stderr"
     mkdir -p "$tmp"
 
+    # No -t/-p: DO_TABLE/DO_PROFILE stay 0, so no .ktab ever gets written —
+    # true count-only (core Sorting() still happens unconditionally either
+    # way); no Tabex dump step since there is nothing to dump.
     mapfile -t fastk_files < "$subfof"
-    local se_count="$RESULTS/${ds}_n${n}_fastk_count.stderr"
-    /usr/bin/time -v -o "$tf_count" \
-        "$FASTK" -k"$K" -t1 -T"$THREADS" -M"$RAM_GB" \
+    /usr/bin/time -v -o "$tf" \
+        "$FASTK" -k"$K" -T"$THREADS" -M"$RAM_GB" \
         -N"$db" -P"$tmp" "${fastk_files[@]}" \
-        > /dev/null 2>"$se_count" \
+        > /dev/null 2>"$se" \
     || { echo "  [FAIL] FastK $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
     rm -rf "$tmp"
+    rm -f "${db}"* "$subfof" 2>/dev/null || true
 
-    local tabex_out="$WORKDIR/fastk_scaling_dump_${ds}_n${n}.tsv"
-    local se_dump="$RESULTS/${ds}_n${n}_fastk_dump.stderr"
-    /usr/bin/time -v -o "$tf_dump" \
-        "$TABEX" -A "$db" \
-        > "$tabex_out" 2>"$se_dump" \
-    || echo "  [WARN] Tabex $ds n=$n"
-    rm -f "${db}.hist" "${db}.ktab" "${db}"* "$tabex_out" 2>/dev/null || true
-    rm -f "$subfof"
+    local wall rss
+    wall=$(wall_from_file "$tf")
+    rss=$(rss_mb "$tf")
 
-    local w1 w2 wall rss
-    w1=$(wall_from_file "$tf_count")
-    w2=$(wall_from_file "$tf_dump")
-    wall=$(awk "BEGIN{printf \"%.2f\",$w1+$w2}")
-    rss=$(rss_mb "$tf_count")
-
-    printf "    fastk  n=%-5d  wall=%7ss (count=%ss dump=%ss)  RSS=%sMB\n" \
-        "$n" "$wall" "$w1" "$w2" "$rss"
-    echo "$ds,$n,fastk,$wall,$rss,$w1,$w2" >> "$CSV"
+    printf "    fastk  n=%-5d  wall=%7ss  RSS=%sMB\n" "$n" "$wall" "$rss"
+    echo "$ds,$n,fastk,$wall,$rss,na,na" >> "$CSV"
 }
 
 # =============================================================================

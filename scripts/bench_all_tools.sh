@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bench_default.sh — k-mer counter benchmark: tuna · KMC · FastK · KFC
-# Scenario : count + text dump, k=31, one genome per species
+# bench_all_tools.sh — k-mer counter benchmark: tuna · KMC · FastK · KFC
+# Scenario : count + text dump, k=31, m=21, one genome per species
 # Datasets : first genome from ECOLI_FOF, first genome from HUMAN_FOF
 # Threads  : 1, 4, 8, 16   —   RAM budget: 256 GB
+#
+# Full pipeline for every tool — no count-only/skip-output shortcuts; each
+# tool writes its real output to disk, timed end to end. No phase1/phase2
+# breakdown here (that's reserved for the tuna-vs-KMC scripts specifically).
 #
 # Notes on tool differences:
 #   tuna  : single command, writes TSV directly (no dump step)
@@ -32,11 +36,13 @@ set -uo pipefail
 : "${TABEX:=""}"      # /path/to/Tabex
 : "${KFC:=""}"        # /path/to/kfc
 
-WORKDIR="/WORKS/vlevallois/expes_tuna"      
+EXPES_ROOT="/WORKS/vlevallois/expes_tuna"
+WORKDIR="$EXPES_ROOT/bench_all_tools_$(date +%Y%m%d_%H%M%S)"
 ECOLI_FOF="/WORKS/vlevallois/data/dataset_genome_ecoli/fof_1000.list"    # absolute path, one genome path per line, 1000 E. coli genomes
 HUMAN_FOF="/WORKS/vlevallois/data/dataset_genome_human/fof_10.list"      # absolute path, one genome path per line, 10 human genomes
 
 K=31
+M=21     # fixed everywhere (standing convention going forward)
 RAM_GB=256
 THREADS_LIST=(1 2 4 6 8 10 16 22 28 32)
 
@@ -72,7 +78,7 @@ done
 
 RESULTS="$WORKDIR/results.log"
 {
-    echo "# bench_compare.sh — $(date)"
+    echo "# bench_all_tools.sh — $(date)"
     echo "# TUNA=$TUNA"
     echo "# KMC=$KMC  KMC_DUMP=$KMC_DUMP"
     echo "# FASTK=$FASTK  TABEX=$TABEX"
@@ -80,7 +86,7 @@ RESULTS="$WORKDIR/results.log"
     echo "# WORKDIR=$WORKDIR"
     echo "# ECOLI=$ECOLI_GENOME"
     echo "# HUMAN=$HUMAN_GENOME"
-    echo "# K=$K  RAM=${RAM_GB}GB  THREADS=${THREADS_LIST[*]}"
+    echo "# K=$K  M=$M  RAM=${RAM_GB}GB  THREADS=${THREADS_LIST[*]}"
 } > "$RESULTS"
 
 # =============================================================================
@@ -123,6 +129,7 @@ _run_tuna() {
     /usr/bin/time -v \
         "$TUNA" \
             -k "$K" \
+            -m "$M" \
             -t "$threads" \
             -ram "$RAM_GB" \
             -hp \
