@@ -125,14 +125,22 @@ _run_fastk() {
     # .fastq.gz is recognised natively by FastK; no symlinks needed
     # No -t/-p: DO_TABLE/DO_PROFILE stay 0, so no .ktab ever gets written —
     # true count-only (core Sorting() still happens unconditionally either way)
+    #
+    # Known FastK bug (root-caused 2026-07-21): Scan_All_Input can hang
+    # indefinitely on certain file-count/thread-count combinations (confirmed
+    # N=threads+1 on a different dataset; not a tuna issue). gallus/human3
+    # both left empty output on a prior run, consistent with this. Wrapped
+    # in `timeout` so it fails after 6h instead of stalling indefinitely.
     mkdir -p "$work/tmp"
     mapfile -t files < "$fof"
-    /usr/bin/time -v -o "$tf" \
+    timeout 21600 /usr/bin/time -v -o "$tf" \
         "$FASTK" -k${K} -T${THREADS} -M${RAM_GB} \
         -N"$work/out" -P"$work/tmp" \
         "${files[@]}" \
         > /dev/null 2>"$se"
+    local rc=$?
     rm -rf "$work/tmp"
+    return "$rc"
 }
 
 # =============================================================================
@@ -146,15 +154,21 @@ run_one() {
     local work="$WORKDIR/big_data_work_${tag}"
     mkdir -p "$work"
 
-    local ok=true
+    local rc=0
     case "$tool" in
         tuna)  _run_tuna  "$fof" "$work" "$tf" "$se" ;;
         kmc)   _run_kmc   "$fof" "$work" "$tf" "$se" ;;
         fastk) _run_fastk "$fof" "$work" "$tf" "$se" ;;
-    esac || ok=false
+    esac
+    rc=$?
 
     rm -rf "$work"
-    $ok || { echo "  [FAIL] $tool $ds"; return; }
+    if [[ "$rc" -eq 124 ]]; then
+        echo "  [TIMEOUT] $tool $ds (known FastK N=threads+1-class hang, see memory)"
+        echo "$ds,$n_files,$tool,timeout,,na,na,na" >> "$CSV"
+        return
+    fi
+    [[ "$rc" -eq 0 ]] || { echo "  [FAIL] $tool $ds"; return; }
 
     local wall rss p1 p2 unique
     wall=$(wall_from_file "$tf")

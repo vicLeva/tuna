@@ -236,12 +236,28 @@ run_fastk() {
     # No -t/-p: DO_TABLE/DO_PROFILE stay 0, so no .ktab ever gets written —
     # true count-only (core Sorting() still happens unconditionally either
     # way); no Tabex dump step since there is nothing to dump.
+    #
+    # Known FastK bug (root-caused 2026-07-21): hangs indefinitely in
+    # Scan_All_Input when input file count == thread count + 1 (confirmed
+    # via live gdb repro; not a tuna issue). human n=9 at THREADS=8 hits
+    # this exactly. Wrapped in `timeout` so one bad (n, THREADS) pair
+    # can't stall the whole sweep; recorded as "timeout" in the CSV.
     mapfile -t fastk_files < "$subfof"
-    /usr/bin/time -v -o "$tf" \
+    timeout 900 /usr/bin/time -v -o "$tf" \
         "$FASTK" -k"$K" -T"$THREADS" -M"$RAM_GB" \
         -N"$db" -P"$tmp" "${fastk_files[@]}" \
-        > /dev/null 2>"$se" \
-    || { echo "  [FAIL] FastK $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
+        > /dev/null 2>"$se"
+    rc=$?
+    if [[ "$rc" -eq 124 ]]; then
+        echo "  [TIMEOUT] FastK $ds n=$n (known N=threads+1 hang, see memory)"
+        echo "$ds,$n,fastk,timeout,,na,na" >> "$CSV"
+        rm -rf "$tmp" "$subfof" "${db}"* 2>/dev/null
+        return
+    elif [[ "$rc" -ne 0 ]]; then
+        echo "  [FAIL] FastK $ds n=$n"
+        rm -rf "$tmp" "$subfof"
+        return
+    fi
     rm -rf "$tmp"
     rm -f "${db}"* "$subfof" 2>/dev/null || true
 

@@ -61,7 +61,7 @@ def load(csv_path):
 
             def _f(k):
                 v = row.get(k, "")
-                return float(v) if v not in ("", "na") else None
+                return float(v) if v not in ("", "na", "timeout") else None
 
             wall = _f("wall_s")
             rss = _f("rss_mb")
