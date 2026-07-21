@@ -2525,7 +2525,11 @@ PartitionStats partition_kmers_plain_pc(
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
-    using Batch = std::vector<std::string_view>;
+    // Fixed the same cross-thread use-after-free as the in-memory sibling
+    // in partition_kmers_mem_impl: chunks are now copied into owned
+    // std::strings instead of zero-copy views into get_dna_raw()'s buffer,
+    // which the producer could overwrite while a consumer still held it.
+    using Batch = std::vector<std::string>;
 
     constexpr size_t MAX_QUEUE = 32;
     constexpr size_t MAX_BATCH_ITEMS = 8192;
@@ -2540,7 +2544,6 @@ PartitionStats partition_kmers_plain_pc(
     std::mutex q_mutex;
     std::condition_variable q_cv;
     bool producer_done = false;
-    size_t active_batches = 0;
     std::atomic<bool> stop{false};
     std::exception_ptr producer_error = nullptr;
     std::exception_ptr consumer_error = nullptr;
@@ -2565,14 +2568,6 @@ PartitionStats partition_kmers_plain_pc(
         q_cv.notify_one();
         batch = Batch{};
         batch_bases = 0;
-    };
-
-    auto wait_until_consumed = [&]() {
-        std::unique_lock<std::mutex> lk(q_mutex);
-        q_cv.wait(lk, [&]{
-            return (queue.empty() && active_batches == 0) ||
-                   stop.load(std::memory_order_relaxed);
-        });
     };
 
     auto producer_fn = [&]() {
@@ -2602,7 +2597,6 @@ PartitionStats partition_kmers_plain_pc(
             }
             if (!stop.load(std::memory_order_relaxed))
                 push_batch(batch, batch_bases);
-            wait_until_consumed();
         };
 
         try {
@@ -2657,23 +2651,16 @@ PartitionStats partition_kmers_plain_pc(
                     if (queue.empty()) break;
                     batch = std::move(queue.front());
                     queue.pop_front();
-                    ++active_batches;
                 }
                 q_cv.notify_all();
 
-                for (const auto chunk : batch) {
+                for (const auto& chunk : batch) {
                     if (stop.load(std::memory_order_relaxed)) break;
                     extract_superkmers_from_actg<k, m>(
                         chunk.data(), chunk.size(), partition_fn,
                         min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
                     ++local_seqs;
                 }
-
-                {
-                    std::lock_guard<std::mutex> lk(q_mutex);
-                    --active_batches;
-                }
-                q_cv.notify_all();
             }
 
             for (size_t p = 0; p < n_parts; ++p) {
@@ -3093,7 +3080,13 @@ PartitionStats partition_kmers_mem_impl(
                            input_path.compare(input_path.size() - 3, 3, ".gz") == 0;
 
         if (!is_gz) {
-            using Batch = std::vector<std::string_view>;
+            // Fixed a cross-thread use-after-free: this used to store a
+            // zero-copy std::string_view into get_dna_raw()'s buffer and
+            // queue it for a consumer thread, but that buffer is overwritten
+            // on the very next next() call, corrupting data a consumer could
+            // still be reading. Copying into an owned std::string removes
+            // the shared, reused buffer.
+            using Batch = std::vector<std::string>;
             constexpr size_t MAX_QUEUE  = 32;
             constexpr size_t MAX_BATCH_ITEMS = 8192;
             constexpr size_t TARGET_BATCH_BASES = 1u << 20;
@@ -3104,7 +3097,6 @@ PartitionStats partition_kmers_mem_impl(
             std::mutex              q_mutex;
             std::condition_variable q_cv;
             bool                    producer_done = false;
-            size_t                  active_batches = 0;
             std::exception_ptr      producer_error = nullptr;
             std::atomic<bool>       stop{false};
             std::exception_ptr      consumer_error = nullptr;
@@ -3127,14 +3119,6 @@ PartitionStats partition_kmers_mem_impl(
                     q_cv.notify_one();
                     batch = Batch{};
                     batch_bases = 0;
-                };
-
-                auto wait_until_consumed = [&]() {
-                    std::unique_lock<std::mutex> lk(q_mutex);
-                    q_cv.wait(lk, [&]{
-                        return (queue.empty() && active_batches == 0) ||
-                               stop.load(std::memory_order_relaxed);
-                    });
                 };
 
                 auto feed = [&](auto& parser) {
@@ -3168,7 +3152,6 @@ PartitionStats partition_kmers_mem_impl(
                         producer_done = true;
                     }
                     q_cv.notify_all();
-                    wait_until_consumed();
                 };
 
                 try {
@@ -3210,21 +3193,15 @@ PartitionStats partition_kmers_mem_impl(
                             if (queue.empty()) break;
                             batch = std::move(queue.front());
                             queue.pop_front();
-                            ++active_batches;
                         }
-                        q_cv.notify_all();
-                        for (const auto chunk : batch) {
+                        q_cv.notify_one();
+                        for (const auto& chunk : batch) {
                             if (stop.load(std::memory_order_relaxed)) break;
                             extract_superkmers_from_actg<k, m>(
                                 chunk.data(), chunk.size(), partition_fn,
                                 min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
                             ++local_seqs;
                         }
-                        {
-                            std::lock_guard<std::mutex> lk(q_mutex);
-                            --active_batches;
-                        }
-                        q_cv.notify_all();
                     }
                     for (size_t p = 0; p < n_parts; ++p)
                         writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
