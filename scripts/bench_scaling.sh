@@ -199,10 +199,12 @@ run_kmc() {
     mkdir -p "$tmp"
 
     # -w: without output — binary db is never written (true count-only)
+    # Note: this cluster's KMC build prints its 1st/2nd-stage summary to
+    # stdout, not stderr — capture both streams into $se so se_val can find it.
     /usr/bin/time -v -o "$tf" \
         "$KMC" -k"$K" -m"$RAM_GB" -ci1 -cs4294967295 -fm -hp -t"$THREADS" -w \
         "@$subfof" "$db" "$tmp" \
-        > /dev/null 2>"$se" \
+        > "$se" 2>&1 \
     || { echo "  [FAIL] kmc $ds n=$n"; rm -rf "$tmp" "$subfof"; return; }
     rm -rf "$tmp" "$subfof"
 

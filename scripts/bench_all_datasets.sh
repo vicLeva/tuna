@@ -97,11 +97,14 @@ _run_tuna() {
 _run_kmc() {
     local file="$1" work="$2" tf="$3" se="$4" fmt="$5"
     # -w: without output — binary db is never written (true count-only)
+    # Note: this cluster's KMC build prints its 1st/2nd-stage summary to
+    # stdout, not stderr (differs from a newer git build tested locally) —
+    # capture both streams into $se so se_val can find it.
     mkdir -p "$work/tmp"
     /usr/bin/time -v -o "$tf" \
         "$KMC" -k${K} -ci1 -cs4294967295 "$fmt" -m${RAM_GB} -hp -t${THREADS} -w \
         "$file" "$work/out" "$work/tmp" \
-        > /dev/null 2>"$se"
+        > "$se" 2>&1
     rm -rf "$work/tmp"
 }
 

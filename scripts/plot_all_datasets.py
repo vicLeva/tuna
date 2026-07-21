@@ -30,6 +30,10 @@ out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else results_dir / "datasets.p
 
 
 def _f(v):
+    # phase1_s/phase2_s carry a trailing "s" from tuna/KMC's own stderr
+    # formatting (e.g. "0.053951s") that the bench script's se_val helper
+    # doesn't always strip (only does so when preceded by a space).
+    v = v.rstrip("s") if v not in ("", "na") else v
     return float(v) if v not in ("", "na") else None
 
 
