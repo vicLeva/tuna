@@ -175,6 +175,7 @@ Instead of listing files directly, you can pass `@list.txt`, or a single `.fof`,
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
 | `-p2` | — | off | Run Phase 2 only from kept partition files in `-w` |
 | `-co` | — | off | Count only; skip output writing after k-mer counting |
+| `-dedup` | `on`/`off` | auto | Phase 2: deduplicate repeated superkmer records into an aux table (with a multiplicity count) before inserting k-mers into the hash table, instead of inserting every k-mer directly. Auto-detected from input file type when omitted: `on` for FASTQ, `off` for FASTA — FASTQ reads often repeat identical short reads/superkmers (dedup pays off), while FASTA assemblies rarely do. This is only a default heuristic based on file type, not the input's actual redundancy — the optimal choice depends on the data, so set it explicitly when the default doesn't fit. For example, low-redundancy reads (e.g. many metagenomic samples) have few repeated superkmers, making the dedup step overhead pure cost with little payoff; `-dedup off` is likely better there despite the FASTQ default |
 | `-lz4` | — | off | Compress disk-mode Phase 1 bucket files with default LZ4 when LZ4 support is available |
 | `-lz4-shards` | — | off | Compress recursive Phase 2 dedup shard files with default LZ4 when LZ4 support is available |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |

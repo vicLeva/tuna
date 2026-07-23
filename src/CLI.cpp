@@ -61,6 +61,12 @@ void print_usage(const char* prog)
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
         "  -p2         run phase 2 only from kept partition files in -w\n"
         "  -co         count only: skip output writing after k-mer counting\n"
+        "  -dedup on/off  override the auto choice of whether to deduplicate repeated\n"
+        "              superkmers into an aux table before hashing k-mers\n"
+        "              [default: auto -- on for FASTQ input, off for FASTA]\n"
+        "              auto is only a file-type heuristic, not a redundancy estimate --\n"
+        "              set explicitly for atypical data (e.g. low-redundancy reads such\n"
+        "              as many metagenomic samples: dedup off is usually better there)\n"
         "  -p1-adaptive use experimental adaptive phase-1 scheduler for gz FASTQ\n"
 #ifdef TUNA_LZ4_BUCKETS
         "  -lz4        compress disk-mode phase-1 buckets with default LZ4\n"
@@ -175,6 +181,12 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.partition_only = true;
         } else if (arg == "-p2") {
             cfg.phase2_only = true;
+        } else if (arg == "-dedup") {
+            const char* v = next_val("-dedup"); if (!v) return false;
+            const std::string_view val(v);
+            if (val == "on") cfg.dedup_override = true;
+            else if (val == "off") cfg.dedup_override = false;
+            else { std::cerr << "tuna: error: -dedup expects 'on' or 'off', got: " << val << "\n"; return false; }
         } else if (arg == "-co") {
             cfg.count_only = true;
         } else if (arg == "-p1-adaptive") {

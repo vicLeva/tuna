@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 struct PartitionStats { uint64_t seqs = 0, kmers = 0, superkmers = 0; };
 
@@ -29,4 +30,12 @@ struct Config {
     bool         phase1_adaptive = false; // use experimental adaptive phase-1 scheduler for gz FASTQ
     bool         canonical     = true;  // count canonical k-mers (lex-min of k-mer and RC); set false with -b
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
+
+    // Phase 2: deduplicate repeated superkmer records into an aux table (with
+    // a multiplicity count) before inserting k-mers into the hash table, vs.
+    // inserting every k-mer directly with no aux dedup step. Set explicitly
+    // with -dedup on|off; when unset (dedup_override empty), resolved once in
+    // main() from input file type: FASTQ -> true, FASTA -> false.
+    std::optional<bool> dedup_override;
+    bool         use_dedup     = true;  // resolved decision (see above); read by count.hpp dispatch
 };

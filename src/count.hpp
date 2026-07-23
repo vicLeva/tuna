@@ -1230,7 +1230,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 const auto count_t0 = collect_phase2_stats
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                if (!cfg.debug_stats) {
+                if (!cfg.debug_stats && cfg.use_dedup) {
                     ins = count_disk_dedup_exact<k, m, canonical_>(
                         path, cfg, p, 0, dedup_budget, table, token,
                         collect_phase2_stats ? &dedup_stats : nullptr);
@@ -1444,7 +1444,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
 
             uint64_t ins;
-            if (!cfg.debug_stats) {
+            if (!cfg.debug_stats && cfg.use_dedup) {
                 ins = count_partition_mem_aggregated<k, m, canonical_>(part_bufs[p], table, token);
             } else {
                 MemoryReader<k, m> reader(part_bufs[p]);

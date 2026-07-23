@@ -69,6 +69,16 @@ int main(int argc, char* argv[])
     // Round up to next power of 2 so partition_fn can use bitmask instead of division.
     cfg.num_partitions = round_pow2(cfg.num_partitions);
 
+    // Resolve the phase-2 dedup decision: explicit -dedup wins; otherwise
+    // auto-detect from the first input file's actual content (FASTQ -> on,
+    // FASTA -> off). Falls back to the default (on) if input type can't be
+    // determined (e.g. -p2 resuming with no input files given).
+    if (cfg.dedup_override.has_value()) {
+        cfg.use_dedup = *cfg.dedup_override;
+    } else if (!cfg.input_files.empty()) {
+        cfg.use_dedup = gz_first_byte(cfg.input_files[0]) == '@';
+    }
+
     if (!cfg.hide_progress) {
         std::cerr << "tuna  k=" << cfg.k
                   << "  m=" << cfg.l
