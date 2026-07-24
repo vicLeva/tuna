@@ -75,9 +75,18 @@ public:
     // Initializes directly from k bases packed four per byte, MSB-first.
     void init_packed_2bit_msb(const uint8_t* packed);
 
+    // Initializes only the rolling hash state from packed DNA. The caller must
+    // subsequently use advance_known_out(), since the circular base queue is
+    // intentionally left untouched.
+    void init_packed_2bit_msb_known_out(const uint8_t* packed);
+
     // Advances the hasher in its underlying sequence by the nucleobase `b` to
     // the right.
     void advance(DNA::Base b);
+
+    // Advances when the caller already has the outgoing base. This avoids
+    // maintaining a duplicate circular queue alongside the rolling k-mer.
+    void advance_known_out(DNA::Base out, DNA::Base in);
 
     // Advances the hasher in its underlying sequence by the character `ch` to
     // the right.
@@ -142,6 +151,21 @@ inline void Rolling_Hash<k, canonical>::init_packed_2bit_msb(
     }
 }
 
+template <uint16_t k, bool canonical>
+inline void Rolling_Hash<k, canonical>::init_packed_2bit_msb_known_out(
+    const uint8_t* const packed)
+{
+    h_f = h_r = 0;
+    for(std::size_t i = 0; i < k; ++i)
+    {
+        const auto b = static_cast<uint8_t>(
+            (packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u);
+        h_f ^= rotl(s[b], k - 1 - i);
+        if constexpr(canonical)
+            h_r ^= rotl(s[DNA_Utility::complement(DNA::Base(b))], i);
+    }
+}
+
 
 template <uint16_t k, bool canonical>
 inline void Rolling_Hash<k, canonical>::advance(const DNA::Base b)
@@ -151,11 +175,20 @@ inline void Rolling_Hash<k, canonical>::advance(const DNA::Base b)
     const auto in = base[off];
     off = (off + 1 >= k ? 0 : off + 1);
 
+    advance_known_out(DNA::Base(out), DNA::Base(in));
+}
+
+
+template <uint16_t k, bool canonical>
+inline void Rolling_Hash<k, canonical>::advance_known_out(
+    const DNA::Base out,
+    const DNA::Base in)
+{
     h_f = rotl(h_f ^ rotl_km1[out], 1) ^ s[in];
     if constexpr(canonical)
     {
-        const auto o = DNA_Utility::complement(DNA::Base(out));
-        const auto i = DNA_Utility::complement(DNA::Base(in));
+        const auto o = DNA_Utility::complement(out);
+        const auto i = DNA_Utility::complement(in);
         h_r = rotr(h_r ^ s[o], 1) ^ rotl_km1[i];
     }
 }

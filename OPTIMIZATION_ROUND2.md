@@ -37,8 +37,9 @@ table.
 
 ## Implemented changes
 
-1. **Separate partitioning from table routing.** Phase 1 now uses a shorter
-   `m=15` minimizer to make longer superkmers. Phase 2 routes every canonical
+1. **Separate partitioning from table routing.** Phase 1 now uses an `m=17`
+   minimizer to make compact superkmers without sacrificing partition entropy.
+   Phase 2 routes every canonical
    k-mer by Tuna's rolling k-mer hash, independently of that minimizer. This
    retains Tuna's hash-table counting method while avoiding minimizer-induced
    overflow skew.
@@ -47,7 +48,7 @@ table.
    record.
 3. **Use compact partition records.** A record contains only its length and
    packed bases. The obsolete stored minimizer coordinate was removed; the
-   common `k=31, m=15` record header is one byte.
+   common `k=31, m=17` record header is one byte.
 4. **Pipeline compressed input.** A dedicated gzip worker inflates into a
    reusable buffer ring while the FASTX parser fills recycled contiguous
    batches and consumer workers perform minimizer extraction. Multiple gzip
@@ -79,6 +80,22 @@ table.
     copies per k-mer. Each batch uses the smallest lossless 1–4 byte count
     width by opening a standards-compliant KFF raw section when the width
     changes.
+13. **Avoid duplicate rolling-hash state.** Counting already retains the
+    outgoing base in its directed k-mer window. A known-outgoing-base advance
+    path now updates ntHash directly instead of also maintaining a 31-byte
+    circular base queue.
+14. **Prefetch aggregated records.** Exact superkmer replay alternates two
+    initialized windows so the next unique record's table bucket is prefetched
+    while the current record is inserted.
+15. **Remove KFF per-record vector growth.** KFF workers allocate one fixed
+    batch and reuse it by index. Compile-time 1-, 2-, and 3-byte compaction
+    loops replace runtime-sized moves in the billion-record output path.
+16. **Overlap temporary-file cleanup.** Disk workers unlink each consumed
+    partition after closing its mmap, distributing cleanup across Phase 2
+    instead of serially unlinking 32,768 files after all workers join.
+17. **Treat empty partitions as valid.** The mmap reader accepts a zero-byte
+    partition as an empty stream. This is required for valid sparse minimizer
+    distributions and was exposed by the minimizer sweep.
 
 The shorter partition minimizer and rolling-hash route are a hybrid, not a KMC
 counting clone: KMC sorts records, while Tuna still performs canonical rolling
@@ -239,4 +256,64 @@ Authoritative real-output logs are retained under:
 
 ```text
 /scratch4/rob/tuna_benchmarking/results/round2_output_20260724/
+```
+
+## Thread scaling and final continuation
+
+The output-enabled `m=15` checkpoint was also measured at 8 and 32 threads
+with the same 36-file manifest and 256 GB RAM budget:
+
+| Threads | Tuna Phase 1 | Tuna Phase 2 + KFF | Tuna wall | KMC Phase 1 | KMC Phase 2 + DB | KMC wall | Tuna wall advantage |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 955.91 s | 595.02 s | 1,586.36 s | 992.32 s | 983.29 s | 1,975.66 s | 19.7% |
+| 16 | 496.70 s | 294.80 s | 822.27 s | 542.07 s | 604.55 s | 1,146.69 s | 28.3% |
+| 32 | 271.03 s | 260.14 s | 564.63 s | 463.38 s | 398.38 s | 861.82 s | 34.5% |
+
+Tuna Phase 1 scales strongly through 32 threads. Phase 2 scales nearly linearly
+from 8 to 16 threads but only improves from 294.80 to 260.14 seconds from 16
+to 32, identifying counting and sustained output traffic as the remaining
+scaling limit.
+
+An output-enabled two-file minimizer sweep selected `m=17`, not the
+count-only winner:
+
+| `m` | Mode | Phase 1 | Phase 2 | Wall | Superkmers |
+|---:|---|---:|---:|---:|---:|
+| 13 | count only | 63.06 s | 40.93 s | 104.10 s | 3,570,084,037 |
+| 15 | count only | 64.31 s | 26.03 s | 90.42 s | 3,914,225,849 |
+| 17 | count only | 64.69 s | 17.72 s | 82.53 s | 4,349,968,508 |
+| 19 | count only | 63.59 s | 17.24 s | 80.93 s | 4,906,939,931 |
+| 21 | count only | 63.49 s | 19.00 s | 82.60 s | 5,644,207,915 |
+| 17 | KFF output | 60.70 s | 21.54 s | 82.50 s | 4,349,968,508 |
+| 19 | KFF output | 61.26 s | 23.53 s | 85.03 s | 4,906,939,931 |
+
+All sweep rows report exactly 31,697,312,651 total and 3,848,420,222 distinct
+k-mers. The shorter `m=13` reduces record count but loses partition entropy;
+`m=19` narrowly wins count-only while its additional records make real output
+slower. The production default is therefore `m=17`.
+
+The retained rolling-hash, prefetch, KFF, cleanup, and `m=17` changes were then
+run through the full 32-thread output gate:
+
+| Tool/output | Phase 1 | Phase 2 + output | Process wall | Output bytes |
+|---|---:|---:|---:|---:|
+| Tuna final candidate KFF | 272.43 s | 198.25 s | 471.15 s | 212,496,712,212 |
+| Tuna `m=15` checkpoint KFF | 271.03 s | 260.14 s | 564.63 s | 212,230,376,419 |
+| KMC native DB | 463.38 s | 398.38 s | 861.82 s | 204,998,649,924 |
+
+The final candidate is another 16.6 percent faster than the preceding Tuna
+checkpoint and 45.3 percent faster than KMC overall. It reduces Tuna Phase 2
+plus output by 23.8 percent without materially changing Phase 1. Tuna and KMC
+again report exactly 516,924,379,564 total and 20,868,636,896 distinct
+canonical k-mers. An independent KFF API scan decoded all 20,868,636,896
+records, recovered the same 516,924,379,564 count sum, and observed a maximum
+count of 54,689,425.
+
+Continuation logs are retained under:
+
+```text
+/scratch4/rob/tuna_benchmarking/results/round2_output_scaling_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_m_count_sweep2_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_m_output_sweep_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_final_candidate_20260724/
 ```

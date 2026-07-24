@@ -542,6 +542,16 @@ public:
         use_precomp_ = false;
     }
 
+    // Counting-specific packed initialization. Subsequent advances use the
+    // outgoing base already held by v instead of Rolling_Hash's duplicate
+    // circular queue.
+    void init_packed_known_out(const uint8_t* packed)
+    {
+        v.from_packed_2bit_msb(packed);
+        rh.init_packed_2bit_msb_known_out(packed);
+        use_precomp_ = false;
+    }
+
     // Initializes the k-mer window from ASCII sequence `s` with a precomputed
     // canonical ntHash of the minimizer l-mer (e.g. from MinimizerWindow::hash()).
     // Skips MinimizerWindow::reset() — nt_h is reused for all k-mers in the
@@ -609,6 +619,13 @@ public:
     {
         v.roll_forward(b);
         rh.advance(b);
+    }
+
+    void advance_known_out(const DNA::Base b)
+    {
+        const DNA::Base out = v.kmer().base_at(k - 1);
+        v.roll_forward(b);
+        rh.advance_known_out(out, b);
     }
 
     // Advances the window by one ASCII character `ch`.

@@ -30,6 +30,7 @@
 #include <charconv>
 #include <cstring>
 #include <string_view>
+#include <filesystem>
 
 #include <ankerl/unordered_dense.h>
 #include "xxHash/xxhash.h"
@@ -104,7 +105,7 @@ uint64_t count_partition(
             const uint64_t mh = win->init_packed_with_min(cur_packed, cur_min_pos);
             if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
         } else {
-            win->init_packed(cur_packed);
+            win->init_packed_known_out(cur_packed);
         }
         table.prefetch(*win);
     }
@@ -120,7 +121,7 @@ uint64_t count_partition(
                 const uint64_t mh = next_win->init_packed_with_min(nxt_packed, nxt_min_pos);
                 if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(nxt_len - k + 1);
             } else {
-                next_win->init_packed(nxt_packed);
+                next_win->init_packed_known_out(nxt_packed);
             }
             table.prefetch(*next_win);
         }
@@ -137,7 +138,7 @@ uint64_t count_partition(
                 const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
                 shift -= 2;
                 if (shift < 0) { shift = 6; ++byte_ptr; }
-                win->advance(b);
+                win->advance_known_out(b);
                 table.upsert(*win, inc, uint32_t(1), token);
                 ++inserted;
             }
@@ -159,7 +160,7 @@ uint64_t count_partition(
             const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
             shift -= 2;
             if (shift < 0) { shift = 6; ++byte_ptr; }
-            win->advance(b);
+            win->advance_known_out(b);
             table.upsert(*win, inc, uint32_t(1), token);
             ++inserted;
         }
@@ -177,6 +178,33 @@ uint64_t count_partition(
 // Insert every k-mer represented by one packed superkmer, increasing counts by
 // multiplicity. This is the replay primitive for exact record aggregation.
 template <uint16_t k, uint16_t m, bool canonical_ = true>
+uint64_t count_initialized_superkmer_record(
+    const uint8_t* packed,
+    size_t len,
+    uint32_t multiplicity,
+    kache_hash::Kmer_Window<k, m>& win,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>& table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
+{
+    if (len < k || multiplicity == 0) return 0;
+
+    auto inc = [multiplicity](uint32_t v) { return v + multiplicity; };
+    table.upsert(win, inc, multiplicity, token);
+
+    const uint8_t* byte_ptr = packed + (k >> 2);
+    int shift = static_cast<int>(6u - 2u * (k & 3u));
+    for (size_t i = k; i < len; ++i) {
+        const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
+        shift -= 2;
+        if (shift < 0) { shift = 6; ++byte_ptr; }
+        win.advance_known_out(b);
+        table.upsert(win, inc, multiplicity, token);
+    }
+
+    return static_cast<uint64_t>(multiplicity) * (len - k + 1);
+}
+
+template <uint16_t k, uint16_t m, bool canonical_ = true>
 uint64_t count_superkmer_record(
     const uint8_t* packed,
     size_t len,
@@ -186,23 +214,11 @@ uint64_t count_superkmer_record(
 {
     if (len < k || multiplicity == 0) return 0;
 
-    auto inc = [multiplicity](uint32_t v) { return v + multiplicity; };
     kache_hash::Kmer_Window<k, m> win;
-    win.init_packed(packed);
+    win.init_packed_known_out(packed);
     table.prefetch(win);
-    table.upsert(win, inc, multiplicity, token);
-
-    const uint8_t* byte_ptr = packed + (k >> 2);
-    int shift = static_cast<int>(6u - 2u * (k & 3u));
-    for (size_t i = k; i < len; ++i) {
-        const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
-        shift -= 2;
-        if (shift < 0) { shift = 6; ++byte_ptr; }
-        win.advance(b);
-        table.upsert(win, inc, multiplicity, token);
-    }
-
-    return static_cast<uint64_t>(multiplicity) * (len - k + 1);
+    return count_initialized_superkmer_record<k, m, canonical_>(
+        packed, len, multiplicity, win, table, token);
 }
 
 inline size_t superkmer_dedup_worker_budget(const Config& cfg, size_t n_threads)
@@ -311,13 +327,55 @@ uint64_t count_partition_aggregated(
     using hdr_t = sk_hdr_t<k, m>;
     uint64_t total_inserted = 0;
     const auto replay_start = std::chrono::steady_clock::now();
-    for (const auto& [record, multiplicity] : multiplicities) {
-        hdr_t len;
-        std::memcpy(&len, record.data(), sizeof(hdr_t));
-        const auto* packed =
-            reinterpret_cast<const uint8_t*>(record.data() + sizeof(hdr_t));
-        total_inserted += count_superkmer_record<k, m, canonical_>(
-            packed, static_cast<size_t>(len), multiplicity, table, token);
+
+    auto decode_record = [](const std::string_view record,
+                            const uint8_t*& packed,
+                            size_t& len) {
+        hdr_t encoded_len;
+        std::memcpy(&encoded_len, record.data(), sizeof(hdr_t));
+        len = static_cast<size_t>(encoded_len);
+        packed = reinterpret_cast<const uint8_t*>(
+            record.data() + sizeof(hdr_t));
+    };
+
+    auto it = multiplicities.begin();
+    const auto end = multiplicities.end();
+    std::array<kache_hash::Kmer_Window<k, m>, 2> windows;
+    auto* win = &windows[0];
+    auto* next_win = &windows[1];
+
+    const uint8_t* cur_packed = nullptr;
+    size_t cur_len = 0;
+    uint32_t cur_multiplicity = 0;
+    if (it != end) {
+        decode_record(it->first, cur_packed, cur_len);
+        cur_multiplicity = it->second;
+        win->init_packed_known_out(cur_packed);
+        table.prefetch(*win);
+        ++it;
+    }
+
+    while (it != end) {
+        const uint8_t* next_packed = nullptr;
+        size_t next_len = 0;
+        decode_record(it->first, next_packed, next_len);
+        const uint32_t next_multiplicity = it->second;
+        next_win->init_packed_known_out(next_packed);
+        table.prefetch(*next_win);
+
+        total_inserted += count_initialized_superkmer_record<k, m, canonical_>(
+            cur_packed, cur_len, cur_multiplicity, *win, table, token);
+
+        cur_packed = next_packed;
+        cur_len = next_len;
+        cur_multiplicity = next_multiplicity;
+        std::swap(win, next_win);
+        ++it;
+    }
+
+    if (cur_packed != nullptr) {
+        total_inserted += count_initialized_superkmer_record<k, m, canonical_>(
+            cur_packed, cur_len, cur_multiplicity, *win, table, token);
     }
     if (stats) {
         const auto replay_ns = static_cast<uint64_t>(
@@ -408,8 +466,10 @@ uint64_t write_counts_kff(
     constexpr size_t RECORD_SIZE = KMER_BYTES + 4;
     constexpr size_t BATCH_KMERS = (size_t(1) << 20) / RECORD_SIZE;
 
-    std::vector<uint8_t> records;
-    records.reserve(BATCH_KMERS * RECORD_SIZE);
+    // Keep the backing storage at its full size and reuse it by index. Calling
+    // vector::resize for every emitted k-mer survives as an out-of-line call in
+    // optimized builds and is prohibitively expensive at billion-record scale.
+    std::vector<uint8_t> records(BATCH_KMERS * RECORD_SIZE);
     size_t buffered = 0;
     uint32_t max_buffered_count = 0;
 
@@ -421,20 +481,26 @@ uint64_t write_counts_kff(
                 max_buffered_count <= 0xFFFFFFu ? 3 : 4;
 
             if (count_bytes != 4) {
-                const size_t compact_size = KMER_BYTES + count_bytes;
-                for (size_t i = 0; i < buffered; ++i) {
-                    const uint8_t* src = records.data() + i * RECORD_SIZE;
-                    uint8_t* dst = records.data() + i * compact_size;
-                    std::memmove(dst, src, KMER_BYTES);
-                    std::memmove(
-                        dst + KMER_BYTES,
-                        src + KMER_BYTES + 4 - count_bytes,
-                        count_bytes);
+                const auto compact = [&]<size_t COUNT_BYTES>() {
+                    constexpr size_t COMPACT_SIZE = KMER_BYTES + COUNT_BYTES;
+                    for (size_t i = 0; i < buffered; ++i) {
+                        const uint8_t* src = records.data() + i * RECORD_SIZE;
+                        uint8_t* dst = records.data() + i * COMPACT_SIZE;
+                        std::memmove(dst, src, KMER_BYTES);
+                        std::memcpy(
+                            dst + KMER_BYTES,
+                            src + KMER_BYTES + 4 - COUNT_BYTES,
+                            COUNT_BYTES);
+                    }
+                };
+                switch (count_bytes) {
+                    case 1: compact.template operator()<1>(); break;
+                    case 2: compact.template operator()<2>(); break;
+                    case 3: compact.template operator()<3>(); break;
+                    default: break;
                 }
-                records.resize(buffered * compact_size);
             }
             kff_out.write_batch(records.data(), buffered, count_bytes);
-            records.clear();
             buffered = 0;
             max_buffered_count = 0;
         }
@@ -446,8 +512,7 @@ uint64_t write_counts_kff(
         const uint64_t cnt = entry.second;
         if (cnt < cfg.ci || cnt > cfg.cx) return;
 
-        const size_t offset = records.size();
-        records.resize(offset + RECORD_SIZE);
+        const size_t offset = buffered * RECORD_SIZE;
         uint8_t* dst = records.data() + offset;
         entry.first.write_packed_2bit_msb(dst);
         const uint32_t c = static_cast<uint32_t>(cnt);
@@ -635,7 +700,8 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                 const std::string path = partition_path(cfg.work_dir, p);
                 SuperkmerReader<k, m> reader(path);
                 if (!reader.ok())
-                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
+                    throw std::runtime_error(
+                        "tuna: cannot open partition file for reading: " + path);
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
                 size_t init_sz;
                 if (cal > 0) {
@@ -976,9 +1042,6 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
                 if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
-                SuperkmerReader<k, m> reader(path);
-                if (!reader.ok())
-                    throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
                 size_t init_sz;
                 if (cal > 0) {
@@ -993,13 +1056,24 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 table_t table(init_sz, 1);
 
                 PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
-                const uint64_t ins =
-                    cfg.dedup_mode == SuperkmerDedupMode::Off
-                        ? count_partition<k, m, canonical_>(reader, table, token, dbg)
-                        : count_partition_aggregated<k, m, canonical_>(
-                            reader, cfg.dedup_mode, dedup_budget,
-                            table, token, dbg,
-                            cfg.debug_stats ? &dedup_stats : nullptr);
+                uint64_t ins;
+                {
+                    SuperkmerReader<k, m> reader(path);
+                    if (!reader.ok())
+                        throw std::runtime_error(
+                            "tuna: cannot open partition file for reading: " + path);
+                    ins =
+                        cfg.dedup_mode == SuperkmerDedupMode::Off
+                            ? count_partition<k, m, canonical_>(reader, table, token, dbg)
+                            : count_partition_aggregated<k, m, canonical_>(
+                                reader, cfg.dedup_mode, dedup_budget,
+                                table, token, dbg,
+                                cfg.debug_stats ? &dedup_stats : nullptr);
+                }
+                if (!cfg.keep_tmp) {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                }
                 total_inserted.fetch_add(ins, std::memory_order_relaxed);
                 if (cal == 0) {
                     const uint64_t unique = static_cast<uint64_t>(table.size());
