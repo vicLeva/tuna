@@ -156,7 +156,7 @@ int run(const Config& cfg)
         auto do_count_mem = [&](auto canonical_tag) {
             constexpr bool C = decltype(canonical_tag)::value;
             if (cfg.output_kff) {
-                KffOutput kff_out(cfg.output_file, cfg.k);
+                KffOutput kff_out(cfg.output_file, cfg.k, cfg.canonical);
                 auto r = count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
                 kff_out.close();
                 return r;
@@ -181,6 +181,7 @@ int run(const Config& cfg)
                   << "phase2: "        << t_phase2            << "s\n"
                   << "superkmers: "    << stats.superkmers     << "\n"
                   << "n_parts: "       << cfg.num_partitions   << "\n"
+                  << "total_kmers: "   << total_inserted       << "\n"
                   << "unique_kmers: "  << total_written        << "\n";
         if (!cfg.hide_progress)
             std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
@@ -243,7 +244,7 @@ int run(const Config& cfg)
     auto do_count = [&](auto canonical_tag) {
         constexpr bool C = decltype(canonical_tag)::value;
         if (cfg.output_kff) {
-            KffOutput kff_out(cfg.output_file, cfg.k);
+            KffOutput kff_out(cfg.output_file, cfg.k, cfg.canonical);
             auto r = count_and_write<k, m, C>(cfg, stats.kmers, nullptr, &kff_out);
             kff_out.close();
             return r;
@@ -267,7 +268,10 @@ int run(const Config& cfg)
     // Always emit structured phase timings for tooling (bench.sh).
     std::cerr << "phase1: "     << t_phase1        << "s\n"
               << "phase2: "     << t_phase2        << "s\n"
-              << "superkmers: " << stats.superkmers << "\n";
+              << "superkmers: " << stats.superkmers << "\n"
+              << "n_parts: "    << cfg.num_partitions << "\n"
+              << "total_kmers: " << total_inserted << "\n"
+              << "unique_kmers: " << total_written << "\n";
 
     if (!cfg.hide_progress)
         std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
@@ -355,12 +359,13 @@ void run_callback(const Config& cfg, Callback&& cb)
 //     cmake: -DFIXED_K=<k>
 //
 //   TUNA_CONDA_PROFILE  (for conda binary packaging)
-//     Curated subset: k ∈ {21,31,51,63,127}, ~5 odd m values each (~27 total).
+//     Curated subset: k ∈ {21,31,51,63,127}, 30 selected odd-m pairs.
 //     Same zero-overhead dispatch as the default build, ~10× smaller binary.
 //     cmake: -DTUNA_CONDA_PROFILE=ON
 //
 //   No flags (default build)
-//     Supports k ∈ {11,13,...,127} (odd), m ∈ {9,...,min(k-2,31)} (odd).
+//     Supports odd k ∈ [11,63] plus k=127, with odd
+//     m ∈ [9,min(k-2,31)].
 //     For any other k/m, prints a message telling the user to recompile.
 //
 // dispatch_generic is called by both the CLI and the library API.
@@ -389,21 +394,21 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
 #elif defined(TUNA_CONDA_PROFILE)
     // ── Conda profile: curated k × m subset ──────────────────────────────────
     // k ∈ {21, 31, 51, 63, 127}; odd m values most used in practice.
-    // ~27 instantiations total — roughly 10× smaller binary than the full table.
+    // 30 instantiations total — roughly 10× smaller binary than the full table.
 #define TDG(K, L)  if (k == (K) && m == (L)) { f.template operator()<K, L>(); return 0; }
     TDG(21, 11); TDG(21, 13); TDG(21, 15); TDG(21, 17); TDG(21, 19);
     TDG(31, 15); TDG(31, 17); TDG(31, 19); TDG(31, 21); TDG(31, 23);
-    TDG(51, 17); TDG(51, 19); TDG(51, 21); TDG(51, 23); TDG(51, 25);
-    TDG(63, 19); TDG(63, 21); TDG(63, 23); TDG(63, 25); TDG(63, 27);
-    TDG(127, 19); TDG(127, 21); TDG(127, 23); TDG(127, 25); TDG(127, 27); TDG(127, 29); TDG(127, 31);
+    TDG(51, 15); TDG(51, 17); TDG(51, 19); TDG(51, 21); TDG(51, 23); TDG(51, 25);
+    TDG(63, 15); TDG(63, 19); TDG(63, 21); TDG(63, 23); TDG(63, 25); TDG(63, 27);
+    TDG(127, 15); TDG(127, 19); TDG(127, 21); TDG(127, 23); TDG(127, 25); TDG(127, 27); TDG(127, 29); TDG(127, 31);
 #undef TDG
     std::cerr << "tuna: error: unsupported k=" << k << " m=" << m << " in conda build\n"
               << "  Conda build supports k ∈ {21,31,51,63,127} with odd m:\n"
               << "    k=21  m ∈ {11,13,15,17,19}\n"
               << "    k=31  m ∈ {15,17,19,21,23}\n"
-              << "    k=51  m ∈ {17,19,21,23,25}\n"
-              << "    k=63  m ∈ {19,21,23,25,27}\n"
-              << "    k=127 m ∈ {19,21,23,25,27,29,31}\n"
+              << "    k=51  m ∈ {15,17,19,21,23,25}\n"
+              << "    k=63  m ∈ {15,19,21,23,25,27}\n"
+              << "    k=127 m ∈ {15,19,21,23,25,27,29,31}\n"
               << "  For other k/m recompile with -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
     return 1;
 
@@ -557,7 +562,8 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
 
     // k/m pair not in the built-in table.
     std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
-              << "  Default build supports odd k ∈ [11,127] with odd m ∈ [9,min(k-2,31)].\n"
+              << "  Default build supports odd k in [11,63] plus k=127,"
+                 " with odd m in [9,min(k-2,31)].\n"
               << "  For any other k or m recompile with:\n"
               << "    -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
     return 1;

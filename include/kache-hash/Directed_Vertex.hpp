@@ -55,6 +55,9 @@ public:
     // is assumed to be MSB-aligned.
     void from_super_kmer(const uint64_t* super_kmer, std::size_t word_count);
 
+    // Configures the vertex from k bases packed four per byte, MSB-first.
+    void from_packed_2bit_msb(const uint8_t* packed);
+
     // Returns the observed k-mer for the vertex.
     const Kmer<k>& kmer() const;
 
@@ -137,6 +140,13 @@ template <uint16_t k>
 inline void Directed_Vertex<k>::from_super_kmer(const uint64_t* const super_kmer, const std::size_t word_count)
 {
     kmer_.from_super_kmer(super_kmer, word_count);
+    init();
+}
+
+template <uint16_t k>
+inline void Directed_Vertex<k>::from_packed_2bit_msb(const uint8_t* const packed)
+{
+    kmer_.from_packed_2bit_msb(packed);
     init();
 }
 

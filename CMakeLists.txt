@@ -40,6 +40,15 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
+# ── ankerl::unordered_dense for phase-2 superkmer aggregation ─────────────────
+FetchContent_Declare(
+    unordered_dense
+    GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+    GIT_TAG        v4.4.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(unordered_dense)
+
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
 # no code changes required. Disable with -DTUNA_USE_ZLIB_NG=OFF to fall back
@@ -137,6 +146,9 @@ target_include_directories(tuna_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include/helicase_cpp
+)
+target_include_directories(tuna_lib SYSTEM INTERFACE
+    ${unordered_dense_SOURCE_DIR}/include
 )
 # C++ standard and definitions are propagated so users get the right dialect
 # and tuna's required macros, but compile flags (warnings, optimisations) are

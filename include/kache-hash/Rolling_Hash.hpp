@@ -72,6 +72,9 @@ public:
     // initialized and is assumed to be computed externally.
     void init(const Kmer<k>& kmer);
 
+    // Initializes directly from k bases packed four per byte, MSB-first.
+    void init_packed_2bit_msb(const uint8_t* packed);
+
     // Advances the hasher in its underlying sequence by the nucleobase `b` to
     // the right.
     void advance(DNA::Base b);
@@ -117,6 +120,22 @@ inline void Rolling_Hash<k, canonical>::init(const Kmer<k>& kmer)
     for(std::size_t i = 0; i < k; ++i)
     {
         base[i] = kmer.base_at(k - 1 - i);
+        h_f ^= rotl(s[base[i]], k - 1 - i);
+        if constexpr(canonical)
+            h_r ^= rotl(s[DNA_Utility::complement(DNA::Base(base[i]))], i);
+    }
+}
+
+template <uint16_t k, bool canonical>
+inline void Rolling_Hash<k, canonical>::init_packed_2bit_msb(
+    const uint8_t* const packed)
+{
+    h_f = h_r = 0;
+    off = 0;
+    for(std::size_t i = 0; i < k; ++i)
+    {
+        base[i] = static_cast<uint8_t>(
+            (packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u);
         h_f ^= rotl(s[base[i]], k - 1 - i);
         if constexpr(canonical)
             h_r ^= rotl(s[DNA_Utility::complement(DNA::Base(base[i]))], i);

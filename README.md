@@ -1,7 +1,8 @@
 # tuna
 
 **tuna** is a fast, streaming k-mer counter for FASTA/FASTQ input.
-It partitions k-mers by minimizer into superkmer files, then counts them using a streaming hash table — keeping memory usage low and throughput high.
+It partitions minimizer superkmers, then counts them with a partition-local
+canonical rolling-hash table, keeping memory usage low and throughput high.
 
 It uses [kache-hash](https://github.com/jamshed/kache-hash) as its streaming k-mer hash table.
 Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (SIMD FASTX parser), and minimizer hashing uses a C++ port of [simd-minimizers](https://github.com/rust-seq/simd-minimizers) (canonical ntHash, two-stack sliding window minimum).
@@ -26,9 +27,9 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 
 tuna runs a two-phase pipeline:
 
-1. **Partition (Phase 1)** — streams each input file through a minimizer iterator. Whenever the minimizer changes, the current superkmer is flushed to a per-partition binary file (on disk if unsufficient RAM budget). This groups k-mers that share a minimizer into the same bucket. The number of partitions is auto-tuned from input size (targeting ~2 MB input per partition) or set explicitly with `-n`.
+1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
 
-2. **Count (Phase 2)** — replays each partition, upserting every k-mer into a Kache-hash table with increment semantics. Each partition is processed independently, so the hash table only ever holds one partition's k-mers at a time.
+2. **Count (Phase 2)** — replays each partition, routing canonical rolling k-mer hashes into a Kache-hash table with increment semantics. This is independent of the shorter partition minimizer, avoiding minimizer-induced bucket skew. Each worker holds one partition table at a time.
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
 
@@ -75,9 +76,11 @@ The `tuna` binary will be at `build/tuna`.
 
 ### k range and compile-time specialisation
 
-The default build embeds a dispatch table for **odd k in `[11, 31]`** — you can pass any of those values at runtime with no extra flags.
+The default build embeds a dispatch table for **odd k in `[11, 63]`, plus
+`k=127`**. You can pass any of those values at runtime with no extra flags.
 
-To use **k > 31**, **even k**, or any k up to 256, compile with explicit `-DFIXED_K` and `-DFIXED_M`:
+To use **even k**, an odd k not in that table, or any k up to 256, compile with
+explicit `-DFIXED_K` and `-DFIXED_M`:
 
 ```bash
 cmake .. -DFIXED_K=63  -DFIXED_M=21
@@ -88,18 +91,18 @@ cmake .. -DFIXED_K=256 -DFIXED_M=31
 This produces a single-instantiation binary locked to that (k, m) pair. Those values become the defaults — `-k` and `-m` at runtime must match or the binary exits with an error. Build is faster and the binary is smaller. The same mechanism works for k ≤ 31 if you want a leaner binary:
 
 ```bash
-cmake .. -DFIXED_K=31 -DFIXED_M=21
+cmake .. -DFIXED_K=31 -DFIXED_M=15
 ```
 
 If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
 
 ```bash
-cmake -S . -B build_k31_m21  -DFIXED_K=31  -DFIXED_M=21  && cmake --build build_k31_m21  --target tuna -j$(nproc)
+cmake -S . -B build_k31_m15  -DFIXED_K=31  -DFIXED_M=15  && cmake --build build_k31_m15  --target tuna -j$(nproc)
 cmake -S . -B build_k63_m21  -DFIXED_K=63  -DFIXED_M=21  && cmake --build build_k63_m21  --target tuna -j$(nproc)
 cmake -S . -B build_k127_m25 -DFIXED_K=127 -DFIXED_M=25  && cmake --build build_k127_m25 --target tuna -j$(nproc)
 ```
 
-Each directory contains its own `tuna` binary: `build_k31_m21/tuna`, `build_k63_m21/tuna`, etc.
+Each directory contains its own `tuna` binary: `build_k31_m15/tuna`, `build_k63_m21/tuna`, etc.
 
 <details>
 <summary><strong>Other compile-time options</strong></summary>
@@ -127,9 +130,9 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
-| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 31]` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match compile-time value if set, default is compile-time value if set) |
-| `-m` | `<int>` | `21` | Minimizer length. Any value in `[1, min(k-1, 32)]`. `m=21` is a good default; use `m=23`–`25` for highly repetitive or low-complexity data (e.g. individual human genomes). Must match `-DFIXED_M` if set, default is compile-time value if set |
-| `-t` | `<int>` | `1` | Number of threads. Phase 1 parallelises over input files; Phase 2 over partitions |
+| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
+| `-m` | `<int>` | `15` | Partition minimizer length. Any value in `[1, min(k-1, 32)]`; `15` balances compact superkmers with partition entropy. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
+| `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
 | `-ram` | `<int>` | auto | RAM budget in GB. Controls whether the in-memory or disk pipeline is used, and sizes write buffers accordingly. Set lower than physical RAM to leave headroom for other processes, or higher to force the in-memory pipeline |
@@ -146,7 +149,9 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-n` | `<int>` | auto | Number of partitions. Auto-tuned to ~2 MB input/partition when omitted |
 | `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
 | `-kt` | — | off | Keep temporary partition files after the run |
+| `-co` | — | off | Count only: skip k-mer serialization while still reporting total and distinct k-mer counts |
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
+| `-dedup` | `auto`, `on`, or `off` | `auto` | Aggregate repeated packed superkmers with exact multiplicities before k-mer insertion. Auto samples each partition and falls back to direct counting for low-redundancy or memory-limited partitions. |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
 
 </details>
@@ -177,7 +182,13 @@ Write KFF binary output (auto-detected from extension):
 tuna -k 31 -t 8 @genomes.list counts.kff
 ```
 
-> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; in KFF binary (~12 bytes/k-mer) it is ~6 GB.
+Benchmark counting without serializing k-mers:
+
+```bash
+tuna -k 31 -t 8 -co @genomes.list /dev/null
+```
+
+> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; at k=31, KFF uses 8 sequence bytes plus 1–4 count bytes per k-mer.
 
 ---
 
@@ -195,7 +206,7 @@ TGCATGCATGCATGCATGCATGCATGCATGC	7
 
 ### KFF binary (`-kff` or `.kff` extension)
 
-[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3, MSB-first) with a 4-byte big-endian count. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with a lossless 1–4 byte big-endian count. Tuna changes KFF raw sections as needed so each output batch uses the smallest count width it requires. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
 
 KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
 
@@ -236,7 +247,7 @@ For a full walkthrough: CMake setup, FetchContent, container customisation, thre
 
 ## Benchmarks
 
-Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, m=21, 8 threads, on a cluster node.
+Comparison with [KMC 3.2.4](https://github.com/refresh-bio/KMC), k=31, 8 threads, on a cluster node.
 Each row shows the **median wall time** over per-file runs (100 files for bacteria/metagenomes, 10 for human and Tara).
 
 | dataset | type | tuna median | KMC median | speedup | tuna p1 | tuna p2 |
@@ -249,5 +260,11 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 
 tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
+
+On the 614 GB compressed, 36-file human3 read set at 16 threads, with real
+binary count output enabled, Tuna completes in 822.27 s versus KMC's 1,146.69
+s. It matches KMC exactly at 516,924,379,564 total and 20,868,636,896 distinct
+canonical k-mers while using 13.22 GB peak RSS versus 250.58 GB. Tuna writes a
+212.22 GB portable KFF; KMC writes a 205.00 GB native database.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)

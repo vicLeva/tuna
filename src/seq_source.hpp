@@ -21,6 +21,11 @@
 #include <zlib.h>
 #include <string>
 #include <vector>
+#include <deque>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <stdexcept>
@@ -138,6 +143,214 @@ public:
     const uint8_t* current_block()      const noexcept { return cur_ptr_; }
     size_t         current_block_size() const noexcept { return cur_size_; }
     uint8_t        first_byte()         const noexcept { return first_byte_; }
+};
+
+// ── AsyncGzInput ──────────────────────────────────────────────────────────────
+// Gzip decompression runs on a dedicated thread and fills a small reusable
+// buffer ring. The helicase parser consumes the same 64-byte Block interface,
+// allowing inflate and FASTX lexing to overlap for a single compressed file.
+
+class AsyncGzInput {
+    static constexpr size_t BUF_SIZE = 1u << 20;  // 1 MB
+    static constexpr size_t BUF_COUNT = 4;
+
+    struct Buffer {
+        std::unique_ptr<uint8_t[]> data{new uint8_t[BUF_SIZE]};
+        size_t size = 0;
+    };
+
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<std::unique_ptr<Buffer>> ready;
+        std::deque<std::unique_ptr<Buffer>> free;
+        bool done = false;
+        bool stop = false;
+        std::string error;
+        std::thread worker;
+
+        State()
+        {
+            for (size_t i = 0; i < BUF_COUNT; ++i)
+                free.push_back(std::make_unique<Buffer>());
+        }
+    };
+
+    std::unique_ptr<State> state_;
+    std::unique_ptr<Buffer> current_;
+    size_t current_pos_ = 0;
+    alignas(64) uint8_t block_[64] = {};
+    const uint8_t* cur_ptr_ = nullptr;
+    size_t cur_size_ = 0;
+    uint8_t first_byte_ = 0;
+
+    static void decompress(State* state, const std::string& path) noexcept
+    {
+        gzFile gz = gzopen(path.c_str(), "rb");
+        if (!gz) {
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                state->error = "Cannot open: " + path;
+                state->done = true;
+            }
+            state->cv.notify_all();
+            return;
+        }
+        gzbuffer(gz, 1u << 20);
+
+        bool eof = false;
+        while (!eof) {
+            std::unique_ptr<Buffer> buf;
+            {
+                std::unique_lock<std::mutex> lk(state->mutex);
+                state->cv.wait(lk, [&] {
+                    return state->stop || !state->free.empty();
+                });
+                if (state->stop) break;
+                buf = std::move(state->free.front());
+                state->free.pop_front();
+            }
+
+            buf->size = 0;
+            while (buf->size < BUF_SIZE) {
+                const int n = gzread(
+                    gz, buf->data.get() + buf->size,
+                    static_cast<unsigned>(BUF_SIZE - buf->size));
+                if (n < 0) {
+                    int errnum = 0;
+                    const char* msg = gzerror(gz, &errnum);
+                    {
+                        std::lock_guard<std::mutex> lk(state->mutex);
+                        state->error = msg ? msg : "gzip decompression failed";
+                    }
+                    eof = true;
+                    break;
+                }
+                if (n == 0) {
+                    eof = true;
+                    break;
+                }
+                buf->size += static_cast<size_t>(n);
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(state->mutex);
+                if (buf->size != 0)
+                    state->ready.push_back(std::move(buf));
+                else
+                    state->free.push_back(std::move(buf));
+            }
+            state->cv.notify_all();
+        }
+
+        gzclose(gz);
+        {
+            std::lock_guard<std::mutex> lk(state->mutex);
+            state->done = true;
+        }
+        state->cv.notify_all();
+    }
+
+    bool acquire_buffer() noexcept
+    {
+        if (current_) {
+            std::lock_guard<std::mutex> lk(state_->mutex);
+            state_->free.push_back(std::move(current_));
+            state_->cv.notify_one();
+        }
+
+        std::unique_lock<std::mutex> lk(state_->mutex);
+        state_->cv.wait(lk, [&] {
+            return !state_->ready.empty() || state_->done;
+        });
+        if (state_->ready.empty()) return false;
+        current_ = std::move(state_->ready.front());
+        state_->ready.pop_front();
+        current_pos_ = 0;
+        return true;
+    }
+
+    void shutdown() noexcept
+    {
+        if (!state_) return;
+        {
+            std::lock_guard<std::mutex> lk(state_->mutex);
+            state_->stop = true;
+        }
+        state_->cv.notify_all();
+        if (state_->worker.joinable())
+            state_->worker.join();
+    }
+
+public:
+    static constexpr bool RANDOM_ACCESS = false;
+
+    explicit AsyncGzInput(const std::string& path) : state_(std::make_unique<State>())
+    {
+        State* const state = state_.get();
+        state->worker = std::thread([state, path] { decompress(state, path); });
+        if (!acquire_buffer()) {
+            std::string error;
+            {
+                std::lock_guard<std::mutex> lk(state_->mutex);
+                error = state_->error;
+            }
+            shutdown();
+            throw std::runtime_error(error.empty() ? "Cannot read: " + path : error);
+        }
+        first_byte_ = current_->data[0];
+    }
+
+    ~AsyncGzInput() { shutdown(); }
+    AsyncGzInput(const AsyncGzInput&) = delete;
+    AsyncGzInput& operator=(const AsyncGzInput&) = delete;
+    AsyncGzInput& operator=(AsyncGzInput&&) = delete;
+
+    AsyncGzInput(AsyncGzInput&& other) noexcept
+        : state_(std::move(other.state_))
+        , current_(std::move(other.current_))
+        , current_pos_(other.current_pos_)
+        , cur_ptr_(other.cur_ptr_ == other.block_ ? block_ : other.cur_ptr_)
+        , cur_size_(other.cur_size_)
+        , first_byte_(other.first_byte_)
+    {
+        std::memcpy(block_, other.block_, sizeof(block_));
+        other.cur_ptr_ = nullptr;
+        other.cur_size_ = 0;
+    }
+
+    helicase::Block next()
+    {
+        if (!current_ || current_pos_ == current_->size) {
+            if (!acquire_buffer()) {
+                std::string error;
+                {
+                    std::lock_guard<std::mutex> lk(state_->mutex);
+                    error = state_->error;
+                }
+                if (!error.empty()) throw std::runtime_error(error);
+                return {};
+            }
+        }
+
+        const size_t avail = current_->size - current_pos_;
+        if (avail >= sizeof(block_)) {
+            cur_ptr_ = current_->data.get() + current_pos_;
+            cur_size_ = sizeof(block_);
+            current_pos_ += sizeof(block_);
+        } else {
+            std::memcpy(block_, current_->data.get() + current_pos_, avail);
+            std::memset(block_ + avail, 0, sizeof(block_) - avail);
+            cur_ptr_ = block_;
+            cur_size_ = avail;
+            current_pos_ = current_->size;
+        }
+        return {cur_ptr_, cur_size_};
+    }
+
+    const uint8_t* current_block() const noexcept { return cur_ptr_; }
+    size_t current_block_size() const noexcept { return cur_size_; }
+    uint8_t first_byte() const noexcept { return first_byte_; }
 };
 
 

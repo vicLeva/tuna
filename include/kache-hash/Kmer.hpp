@@ -93,6 +93,10 @@ public:
     // be MSB-aligned.
     void from_super_kmer(const uint64_t* super_kmer, std::size_t word_count);
 
+    // Initializes from k bases packed four per byte, MSB-first
+    // (A=0, C=1, G=2, T=3).
+    void from_packed_2bit_msb(const uint8_t* packed);
+
     // Gets the k-mer that is a prefix of the provided
     // (k + 1)-mer `k_plus_1_mer`.
     void from_prefix(const Kmer<k + 1>& k_plus_1_mer);
@@ -203,8 +207,8 @@ public:
     template <typename T_container_>
     void get_label(T_container_& label) const;
 
-    // Writes the k-mer as packed 2-bit bases into `dst` (MSB-first, 4 bases/byte).
-    // The output layout is suitable for KFF sequence payloads.
+    // Writes the k-mer as a KFF sequence payload (2-bit bases, big-endian,
+    // with an incomplete first byte left-padded with zero bits).
     void write_packed_2bit_msb(uint8_t* dst) const;
 
     // Implicitly converts the k-mer to a `std::string`.
@@ -361,6 +365,31 @@ inline void Kmer<k>::from_super_kmer(const uint64_t* const super_kmer, const std
         kmer_data[i] = (super_kmer[word_off + i] >> (2 * t)) | (super_kmer[word_off + (i + 1)] << (2 * (32 - t)));
 
     kmer_data[NUM_INTS - 1] = super_kmer[word_off + NUM_INTS - 1] >> (2 * t);
+}
+
+template <uint16_t k>
+inline void Kmer<k>::from_packed_2bit_msb(const uint8_t* const packed)
+{
+    if constexpr(k <= 32)
+    {
+        constexpr uint16_t packed_bytes = (k + 3) / 4;
+        constexpr uint16_t padding_bits = packed_bytes * 8 - k * 2;
+        uint64_t value = 0;
+        for(uint16_t i = 0; i < packed_bytes; ++i)
+            value = (value << 8) | packed[i];
+        kmer_data[0] = value >> padding_bits;
+    }
+    else
+    {
+        std::memset(kmer_data, 0, sizeof(kmer_data));
+        for(uint16_t i = 0; i < k; ++i)
+        {
+            const auto b = static_cast<uint64_t>(
+                (packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u);
+            const uint16_t base_idx = k - 1 - i;
+            kmer_data[base_idx >> 5] |= b << (2u * (base_idx & 31u));
+        }
+    }
 }
 
 
@@ -685,10 +714,22 @@ template <uint16_t k>
 inline void Kmer<k>::write_packed_2bit_msb(uint8_t* dst) const
 {
     constexpr std::size_t packed_bytes = (k + 3) / 4;
-    std::memset(dst, 0, packed_bytes);
-    for (uint16_t i = 0; i < k; ++i) {
-        const uint8_t b = static_cast<uint8_t>(base_at(k - 1 - i));
-        dst[i >> 2] |= static_cast<uint8_t>(b << (6u - 2u * (i & 3u)));
+    if constexpr (k <= 32) {
+        const uint64_t word = kmer_data[0];
+        for (std::size_t i = 0; i < packed_bytes; ++i) {
+            const unsigned shift = static_cast<unsigned>(
+                8 * (packed_bytes - 1 - i));
+            dst[i] = static_cast<uint8_t>(word >> shift);
+        }
+    } else {
+        constexpr uint16_t prefix_padding = (4 - (k & 3)) & 3;
+        std::memset(dst, 0, packed_bytes);
+        for (uint16_t i = 0; i < k; ++i) {
+            const uint16_t packed_pos = prefix_padding + i;
+            const uint8_t b = static_cast<uint8_t>(base_at(k - 1 - i));
+            dst[packed_pos >> 2] |= static_cast<uint8_t>(
+                b << (6u - 2u * (packed_pos & 3u)));
+        }
     }
 }
 

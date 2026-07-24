@@ -160,9 +160,13 @@ private:
         Overflow_Map_Val(uint8_t cs, uint8_t min_coord, const T_& val): cs(cs), min_coord(min_coord), val(val) {}
     };
 
-    typedef std::conditional_t<is_set_,
+    using ov_set_t = std::conditional_t<mt_,
         Concurrent_Hash_Table<Kmer<k>, Overflow_Set_Val, Hash<Kmer<k>>>,
-        Concurrent_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>> > ov_t; // The overflow table type.
+        Serial_Hash_Table<Kmer<k>, Overflow_Set_Val, Hash<Kmer<k>>>>;
+    using ov_map_t = std::conditional_t<mt_,
+        Concurrent_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>>,
+        Serial_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>>>;
+    typedef std::conditional_t<is_set_, ov_set_t, ov_map_t> ov_t; // The overflow table type.
 
 
     flat_t* T;  // Flat table of size `cap x B`.
@@ -179,7 +183,7 @@ private:
     approx_sz_t ov_total_inserts_; // Cumulative overflow inserts across all resizes (never reset).
     uint64_t ov_resize_th_;                // Overflow insert count at which to trigger resize.
 
-    // Histogram of overflow inserts by minimizer hash (top 16 bits of nt_h → 65536 bins).
+    // Histogram of overflow inserts by canonical rolling-hash route.
     // Populated by the public upsert when a new k-mer goes to overflow.
     static constexpr std::size_t OV_HIST_BITS = 8;  // 256 bins × 8 B = 2 KB — fully L1-resident, eliminating LLC misses per overflow insert (vs 512 KB at 16 bits).
     static constexpr std::size_t OV_HIST_SIZE = std::size_t(1) << OV_HIST_BITS;
@@ -382,7 +386,7 @@ public:
     uint64_t overflow_insert_count() const { return ov_total_inserts_.load(std::memory_order_relaxed); }
 
     // Returns the top-N (minimizer_bin, overflow_count) pairs sorted descending.
-    // minimizer_bin = top OV_HIST_BITS bits of the canonical ntHash minimizer value.
+    // minimizer_bin = top OV_HIST_BITS bits of the canonical rolling hash.
     std::vector<std::pair<uint32_t, uint64_t>> overflow_top_minimizers(std::size_t n) const
     {
         std::vector<std::pair<uint32_t, uint64_t>> result;
@@ -439,28 +443,20 @@ public:
         // Prefetch the metadata cache line (cs[32] + min_coord[32] = 64 bytes).
         // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
         // touched on a checksum match, which is rare at low load factors.
-        const auto pf_nt_h = w.minimizer_hash();
-        const auto pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        const auto pf_h = w.rh.hash();
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
-    // Issues a non-blocking L1 prefetch using only the l-mer minimizer stored at
-    // offset `min_pos` inside a packed superkmer byte array (kache 2-bit encoding).
-    // O(l) work — cheaper than prefetch(Kmer_Window) which needs a fully
-    // initialised window.  Call this one superkmer ahead to hide the LLC miss
-    // behind the current superkmer's hot loop.
+    // Issues a non-blocking L1 prefetch from packed k-mer data.
     void prefetch_packed(const uint8_t* packed, const uint16_t min_pos) const
     {
+        (void)min_pos;
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
-        char buf_l[l];
-        for (uint16_t i = 0; i < l; ++i) {
-            const uint16_t pos = min_pos + i;
-            buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
-        }
-        nt_hash::Roller<l> roller;
-        roller.init(buf_l);
-        const uint64_t pf_nt_h = roller.canonical();
-        const uint64_t pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
+        Rolling_Hash<k, true> route_hash(buf);
+        const uint64_t pf_h = route_hash.hash();
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
@@ -533,7 +529,6 @@ public:
     {
         v = Directed_Vertex<k>(Kmer<k>(s));
         rh.init(s);
-        nt_min.reset(s);
         use_precomp_ = false;
     }
 
@@ -542,11 +537,9 @@ public:
     // `packed` must contain at least k bases.
     void init_packed(const uint8_t* packed)
     {
-        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
-        char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        init(buf);
+        v.from_packed_2bit_msb(packed);
+        rh.init_packed_2bit_msb(packed);
+        use_precomp_ = false;
     }
 
     // Initializes the k-mer window from ASCII sequence `s` with a precomputed
@@ -615,7 +608,6 @@ public:
     void advance(const DNA::Base b)
     {
         v.roll_forward(b);
-        if (!use_precomp_) nt_min.advance_kache(static_cast<uint8_t>(b));
         rh.advance(b);
     }
 
@@ -625,7 +617,6 @@ public:
         assert(!DNA_Utility::is_placeholder(ch));
         const DNA::Base b = DNA_Utility::map_base(ch);
         v.roll_forward(b);
-        if (!use_precomp_) nt_min.advance_kache(static_cast<uint8_t>(b));
         rh.advance(b);
     }
 
@@ -1020,9 +1011,8 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const K
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.minimizer_nt_hash(m);
-    m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    m = 0;
+    const auto h = w.rh.hash();
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
@@ -1060,9 +1050,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const K
 {
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.minimizer_nt_hash(m);
-    m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    m = 0;
+    const auto h = w.rh.hash();
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
@@ -1101,9 +1090,9 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::upsert(const K
     (void)token;
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
-    const auto nt_h = w.minimizer_nt_hash(m);
-    m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    m = 0;
+    const auto nt_h = w.rh.hash();
+    const auto h = nt_h;
 
     tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
@@ -1228,8 +1217,9 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert_at_resi
     const auto idx_mask = cap_ - 1;
 
     const auto key = this->key(x);
-    const auto nt_h = minimizer_nt_hash_from_key(key);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    Rolling_Hash<k, true> route_hash;
+    route_hash.init(key);
+    const auto h = route_hash.hash();
 
     const auto b = h & idx_mask;
     if(try_insert_at_resize(x, c, m, b))
@@ -1436,8 +1426,7 @@ template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
 {
     const Kmer<k>& key = canonical_ ? w.v.canonical() : w.v.kmer();
-    const auto nt_h = w.minimizer_hash();
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = w.rh.hash();
     const auto idx_mask = cap_ - 1;
 
     const auto b = h & idx_mask;
