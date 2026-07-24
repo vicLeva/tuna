@@ -206,7 +206,7 @@ TGCATGCATGCATGCATGCATGCATGCATGC	7
 
 ### KFF binary (`-kff` or `.kff` extension)
 
-[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with a lossless 1–4 byte big-endian count. Tuna changes KFF raw sections as needed so each output batch uses the smallest count width it requires. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with its smallest lossless 1–4 byte big-endian count. Workers batch records by count width before writing KFF raw sections, avoiding per-record section changes. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
 
 KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
 

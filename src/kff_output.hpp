@@ -26,6 +26,10 @@ public:
     explicit KffOutput(const std::string& path, uint16_t k, bool canonical)
         : file_(path, "w"), k_(k), kbytes_((k + 3) / 4)
     {
+        // Tuna already submits megabyte-scale batches. Keep only the library's
+        // small header buffer so record payloads go directly to the file
+        // stream instead of being copied through a second 1 MB buffer.
+        file_.max_buffer_size = file_.buffer_size;
         file_.write_encoding(0, 1, 2, 3);  // A=0 C=1 G=2 T=3
         file_.set_uniqueness(true);
         file_.set_canonicity(canonical);

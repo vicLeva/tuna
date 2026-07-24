@@ -75,11 +75,9 @@ table.
 11. **Stabilize table sizing.** Calibrated tables use a 64K minimum initial
     size. This removes a first-completed-partition race that changed chicken
     overflow traffic from about 55 thousand to 5.1 million insertions.
-12. **Batch and compact KFF output.** Counting workers build complete KFF raw
-    records and submit megabyte batches, replacing two library calls and two
-    copies per k-mer. Each batch uses the smallest lossless 1–4 byte count
-    width by opening a standards-compliant KFF raw section when the width
-    changes.
+12. **Batch KFF output.** Counting workers build complete KFF raw records and
+    submit megabyte batches, replacing two library calls and two copies per
+    k-mer.
 13. **Avoid duplicate rolling-hash state.** Counting already retains the
     outgoing base in its directed k-mer window. A known-outgoing-base advance
     path now updates ntHash directly instead of also maintaining a 31-byte
@@ -87,15 +85,20 @@ table.
 14. **Prefetch aggregated records.** Exact superkmer replay alternates two
     initialized windows so the next unique record's table bucket is prefetched
     while the current record is inserted.
-15. **Remove KFF per-record vector growth.** KFF workers allocate one fixed
-    batch and reuse it by index. Compile-time 1-, 2-, and 3-byte compaction
-    loops replace runtime-sized moves in the billion-record output path.
+15. **Segregate KFF count widths.** Each worker maintains four bounded batch
+    buffers for 1-, 2-, 3-, and 4-byte counts. Every record gets its minimum
+    lossless width without per-record section changes, and the previous
+    post-encoding compaction pass is eliminated.
 16. **Overlap temporary-file cleanup.** Disk workers unlink each consumed
     partition after closing its mmap, distributing cleanup across Phase 2
     instead of serially unlinking 32,768 files after all workers join.
 17. **Treat empty partitions as valid.** The mmap reader accepts a zero-byte
     partition as an empty stream. This is required for valid sparse minimizer
     distributions and was exposed by the minimizer sweep.
+18. **Bypass redundant KFF buffering.** Tuna already submits megabyte payloads,
+    so the upstream KFF library now retains only its small section-header
+    buffer. Record payloads go directly to the file stream instead of being
+    copied through a second 1 MB buffer.
 
 The shorter partition minimizer and rolling-hash route are a hybrid, not a KMC
 counting clone: KMC sorts records, while Tuna still performs canonical rolling
@@ -189,9 +192,10 @@ s with tracking enabled.
 - Moving rare overflow histogram updates directly into the insertion branch
   made common-path code layout worse (9.798 s candidate mean versus 9.372 s
   checkpoint mean), despite removing thread-local flag accesses.
-- Assigning the minimal count width to every individual KFF record reduced the
-  one-pair file from 38.40 GB to 34.64 GB, but raised Phase 2 from 30.09 s to
-  31.58–31.79 s. Batch-adaptive widths remain the faster policy.
+- Changing KFF sections immediately for every record's minimum count width
+  reduced the one-pair file from 38.40 GB to 34.64 GB, but raised Phase 2 from
+  30.09 s to 31.58–31.79 s. The retained implementation instead groups equal
+  widths into megabyte worker-local batches.
 
 The remaining difference is Phase 1 on the human pair: Tuna's 11.25 billion
 superkmers exceed KMC's 8.41 billion. Future work should target boundary
@@ -316,4 +320,63 @@ Continuation logs are retained under:
 /scratch4/rob/tuna_benchmarking/results/round2_m_count_sweep2_20260724/
 /scratch4/rob/tuna_benchmarking/results/round2_m_output_sweep_20260724/
 /scratch4/rob/tuna_benchmarking/results/round2_final_candidate_20260724/
+```
+
+## KFF bandwidth continuation
+
+Profiling the direct-payload writer on the two-file, 32-thread workload
+measured 62,428 batch submissions. The file writer held its mutex for 8.84
+seconds, while counting workers accumulated 51.66 thread-seconds waiting for
+it. Two independent changes were retained:
+
+1. disable the KFF library's redundant 1 MB payload buffer, since Tuna already
+   submits megabyte batches;
+2. encode records directly into worker-local buffers segregated by their
+   minimum lossless 1-, 2-, 3-, or 4-byte count width.
+
+The direct-payload change was isolated with an alternating A/B:
+
+| Pair candidate | Mean Phase 2 + KFF | Mean wall |
+|---|---:|---:|
+| Buffered KFF payload | 15.98 s | 79.63 s |
+| Direct KFF payload | 13.57 s | 76.11 s |
+
+Direct payloads reduce pair Phase 2 by 15.1 percent and wall time by 4.4
+percent. Width-segregated batches were neutral on pair timing (12.76 versus
+12.75 seconds in a later A/B) but reduced output from 38.48 GB to 34.64 GB.
+
+The full-scale runs occurred under a higher and variable host load than the
+earlier 471.15-second result, so their absolute wall times are not substituted
+for that headline benchmark. A contemporaneous sequence still isolates the
+output changes:
+
+| Full 32-thread output | Phase 1 | Phase 2 + KFF | Wall | Output bytes |
+|---|---:|---:|---:|---:|
+| Buffered control | 275.35 s | 405.20 s | 680.77 s | 212,498,667,605 |
+| Direct payload | 274.96 s | 298.82 s | 574.54 s | 212,498,112,234 |
+| Width batches, run 1 | 271.32 s | 293.34 s | 565.21 s | 187,891,300,009 |
+| Width batches, run 2 | 277.39 s | 294.39 s | 572.21 s | 187,891,300,237 |
+
+The repeated width-batched Phase 2 mean is 293.87 seconds, 27.5 percent below
+the adjacent buffered control and modestly below direct payload writing. The
+file is 11.6 percent smaller than Tuna's adaptive-batch output and 8.3 percent
+smaller than the 204,998,649,924-byte KMC native database.
+
+An independent KFF API scan decoded all 20,868,636,896 records, recovered the
+exact 516,924,379,564 count sum and 54,689,425 maximum count, and completed in
+315.19 seconds versus 325.46 seconds for the preceding 212 GB KFF.
+
+A dedicated asynchronous writer queue was rejected. Existing partition-level
+overlap already hides much of the serialized writer work; its pair Phase 2
+mean was 14.45 seconds versus 14.03 seconds for the simpler direct writer.
+Carrying one adaptive-width partial batch across partitions was also only a
+small, noisy timing gain and slightly increased output size.
+
+Authoritative continuation logs are retained under:
+
+```text
+/scratch4/rob/tuna_benchmarking/results/round2_kff_direct_ab_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_kff_async_ab_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_kff_width_buffers_ab_20260724/
+/scratch4/rob/tuna_benchmarking/results/round2_kff_bandwidth_final_20260724/
 ```

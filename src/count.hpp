@@ -453,83 +453,106 @@ uint64_t write_counts(
 
 // ─── KFF output brick ─────────────────────────────────────────────────────────
 //
-// Encodes each k-mer and its count as a complete KFF raw-section record, then
-// flushes records to KffOutput in batches of ~1 MB.
+// Encodes complete KFF records in four worker-local buffers, one per lossless
+// count width. Batching by width avoids a compaction pass and keeps section
+// changes bounded while giving every record its minimum 1-4 byte count.
 
-template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
-uint64_t write_counts_kff(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
-    const Config& cfg,
-    KffOutput&    kff_out)
+template <uint16_t k>
+class KffBatchWriter
 {
-    constexpr size_t KMER_BYTES  = (k + 3) / 4;
-    constexpr size_t RECORD_SIZE = KMER_BYTES + 4;
-    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / RECORD_SIZE;
+public:
+    static constexpr size_t KMER_BYTES  = (k + 3) / 4;
+    static constexpr size_t BATCH_BYTES = size_t(1) << 20;
 
-    // Keep the backing storage at its full size and reuse it by index. Calling
-    // vector::resize for every emitted k-mer survives as an out-of-line call in
-    // optimized builds and is prohibitively expensive at billion-record scale.
-    std::vector<uint8_t> records(BATCH_KMERS * RECORD_SIZE);
-    size_t buffered = 0;
-    uint32_t max_buffered_count = 0;
-
-    const auto flush = [&]() {
-        if (buffered != 0) {
-            const uint8_t count_bytes =
-                max_buffered_count <= std::numeric_limits<uint8_t>::max()  ? 1 :
-                max_buffered_count <= std::numeric_limits<uint16_t>::max() ? 2 :
-                max_buffered_count <= 0xFFFFFFu ? 3 : 4;
-
-            if (count_bytes != 4) {
-                const auto compact = [&]<size_t COUNT_BYTES>() {
-                    constexpr size_t COMPACT_SIZE = KMER_BYTES + COUNT_BYTES;
-                    for (size_t i = 0; i < buffered; ++i) {
-                        const uint8_t* src = records.data() + i * RECORD_SIZE;
-                        uint8_t* dst = records.data() + i * COMPACT_SIZE;
-                        std::memmove(dst, src, KMER_BYTES);
-                        std::memcpy(
-                            dst + KMER_BYTES,
-                            src + KMER_BYTES + 4 - COUNT_BYTES,
-                            COUNT_BYTES);
-                    }
-                };
-                switch (count_bytes) {
-                    case 1: compact.template operator()<1>(); break;
-                    case 2: compact.template operator()<2>(); break;
-                    case 3: compact.template operator()<3>(); break;
-                    default: break;
-                }
-            }
-            kff_out.write_batch(records.data(), buffered, count_bytes);
-            buffered = 0;
-            max_buffered_count = 0;
+    explicit KffBatchWriter(KffOutput* out)
+        : out_(out)
+    {
+        if (out_) {
+            init_buffer<1>();
+            init_buffer<2>();
+            init_buffer<3>();
+            init_buffer<4>();
         }
+    }
+
+    template <typename Table>
+    uint64_t write(Table& table, const Config& cfg)
+    {
+        uint64_t written = 0;
+        table.for_each([&](const auto& entry) {
+            const uint64_t cnt = entry.second;
+            if (cnt < cfg.ci || cnt > cfg.cx) return;
+
+            const uint32_t c = static_cast<uint32_t>(cnt);
+            if (c <= std::numeric_limits<uint8_t>::max())
+                append<1>(entry.first, c);
+            else if (c <= std::numeric_limits<uint16_t>::max())
+                append<2>(entry.first, c);
+            else if (c <= 0xFFFFFFu)
+                append<3>(entry.first, c);
+            else
+                append<4>(entry.first, c);
+            ++written;
+        });
+        return written;
+    }
+
+    void flush()
+    {
+        flush_buffer<1>();
+        flush_buffer<2>();
+        flush_buffer<3>();
+        flush_buffer<4>();
+    }
+
+private:
+    struct Buffer {
+        std::vector<uint8_t> records;
+        size_t buffered = 0;
     };
 
-    uint64_t written = 0;
+    template <size_t COUNT_BYTES>
+    static constexpr size_t batch_kmers()
+    {
+        return BATCH_BYTES / (KMER_BYTES + COUNT_BYTES);
+    }
 
-    table.for_each([&](const auto& entry) {
-        const uint64_t cnt = entry.second;
-        if (cnt < cfg.ci || cnt > cfg.cx) return;
+    template <size_t COUNT_BYTES>
+    void init_buffer()
+    {
+        auto& buffer = buffers_[COUNT_BYTES - 1];
+        buffer.records.resize(
+            batch_kmers<COUNT_BYTES>() * (KMER_BYTES + COUNT_BYTES));
+    }
 
-        const size_t offset = buffered * RECORD_SIZE;
-        uint8_t* dst = records.data() + offset;
-        entry.first.write_packed_2bit_msb(dst);
-        const uint32_t c = static_cast<uint32_t>(cnt);
-        dst[KMER_BYTES]     = static_cast<uint8_t>(c >> 24);
-        dst[KMER_BYTES + 1] = static_cast<uint8_t>(c >> 16);
-        dst[KMER_BYTES + 2] = static_cast<uint8_t>(c >> 8);
-        dst[KMER_BYTES + 3] = static_cast<uint8_t>(c);
-        max_buffered_count = std::max(max_buffered_count, c);
-        ++buffered;
-        ++written;
+    template <size_t COUNT_BYTES, typename Kmer>
+    void append(const Kmer& kmer, uint32_t count)
+    {
+        constexpr size_t RECORD_SIZE = KMER_BYTES + COUNT_BYTES;
+        auto& buffer = buffers_[COUNT_BYTES - 1];
+        uint8_t* dst = buffer.records.data() + buffer.buffered * RECORD_SIZE;
+        kmer.write_packed_2bit_msb(dst);
+        for (size_t i = 0; i < COUNT_BYTES; ++i) {
+            const size_t shift = 8 * (COUNT_BYTES - 1 - i);
+            dst[KMER_BYTES + i] = static_cast<uint8_t>(count >> shift);
+        }
+        if (++buffer.buffered >= batch_kmers<COUNT_BYTES>())
+            flush_buffer<COUNT_BYTES>();
+    }
 
-        if (buffered >= BATCH_KMERS) flush();
-    });
-    flush();
+    template <size_t COUNT_BYTES>
+    void flush_buffer()
+    {
+        auto& buffer = buffers_[COUNT_BYTES - 1];
+        if (buffer.buffered == 0) return;
+        out_->write_batch(
+            buffer.records.data(), buffer.buffered, COUNT_BYTES);
+        buffer.buffered = 0;
+    }
 
-    return written;
-}
+    KffOutput* out_;
+    std::array<Buffer, 4> buffers_;
+};
 
 template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t count_filtered(
@@ -1036,6 +1059,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
         try {
             typename table_t::Token token;
             std::string chunk;
+            KffBatchWriter<k> kff_writer(kff_out);
 
             while (true) {
                 if (stop.load(std::memory_order_relaxed)) break;
@@ -1096,7 +1120,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 }
 
                 const uint64_t wrt = kff_out
-                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                    ? kff_writer.write(table, cfg)
                     : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
                           : count_filtered<k, m>(table, cfg);
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
@@ -1117,6 +1141,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     }
                 }
             }
+            kff_writer.flush();
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(worker_error_mutex);
@@ -1203,6 +1228,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     auto worker = [&](size_t /*tid*/) {
         typename table_t::Token token;
         std::string chunk;
+        KffBatchWriter<k> kff_writer(kff_out);
 
         while (true) {
             const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
@@ -1259,11 +1285,12 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             }
 
             const uint64_t wrt = kff_out
-                ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                ? kff_writer.write(table, cfg)
                 : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
                       : count_filtered<k, m>(table, cfg);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
+        kff_writer.flush();
     };
 
     std::vector<std::thread> threads;
