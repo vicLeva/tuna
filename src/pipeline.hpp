@@ -156,7 +156,7 @@ int run(const Config& cfg)
         auto do_count_mem = [&](auto canonical_tag) {
             constexpr bool C = decltype(canonical_tag)::value;
             if (cfg.output_kff) {
-                KffOutput kff_out(cfg.output_file, cfg.k);
+                KffOutput kff_out(cfg.output_file, cfg.k, cfg.canonical);
                 auto r = count_and_write_mem<k, m, C>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
                 kff_out.close();
                 return r;
@@ -244,7 +244,7 @@ int run(const Config& cfg)
     auto do_count = [&](auto canonical_tag) {
         constexpr bool C = decltype(canonical_tag)::value;
         if (cfg.output_kff) {
-            KffOutput kff_out(cfg.output_file, cfg.k);
+            KffOutput kff_out(cfg.output_file, cfg.k, cfg.canonical);
             auto r = count_and_write<k, m, C>(cfg, stats.kmers, nullptr, &kff_out);
             kff_out.close();
             return r;

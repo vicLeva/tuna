@@ -12,7 +12,9 @@ A performance result is accepted only when Tuna and KMC agree exactly on:
 
 Small inputs also compare every sorted `(k-mer, count)` row. Large timing runs
 use `benchmark/compare_kmc_counts.sh`; Tuna uses `-co` and KMC uses `-w`, so
-neither tool pays text-output or database-serialization costs.
+neither tool pays text-output or database-serialization costs. Real-output
+runs use `benchmark/compare_kmc_binary.sh`: Tuna writes KFF and KMC writes its
+native binary database.
 
 ## Engineering overview
 
@@ -72,6 +74,11 @@ table.
 11. **Stabilize table sizing.** Calibrated tables use a 64K minimum initial
     size. This removes a first-completed-partition race that changed chicken
     overflow traffic from about 55 thousand to 5.1 million insertions.
+12. **Batch and compact KFF output.** Counting workers build complete KFF raw
+    records and submit megabyte batches, replacing two library calls and two
+    copies per k-mer. Each batch uses the smallest lossless 1–4 byte count
+    width by opening a standards-compliant KFF raw section when the width
+    changes.
 
 The shorter partition minimizer and rolling-hash route are a hybrid, not a KMC
 counting clone: KMC sorts records, while Tuna still performs canonical rolling
@@ -159,6 +166,15 @@ s with tracking enabled.
 - A branchless packed-tail mask was slower than the conditional form.
 - Removing minimizer-position bookkeeping produced worse Phase 1 code on the
   benchmark CPU.
+- Replacing the `k=31` packed k-mer initializer with an unaligned load and
+  byte-swap was not a repeatable Phase 2 win (9.409 s candidate mean versus
+  9.372 s checkpoint mean).
+- Moving rare overflow histogram updates directly into the insertion branch
+  made common-path code layout worse (9.798 s candidate mean versus 9.372 s
+  checkpoint mean), despite removing thread-local flag accesses.
+- Assigning the minimal count width to every individual KFF record reduced the
+  one-pair file from 38.40 GB to 34.64 GB, but raised Phase 2 from 30.09 s to
+  31.58–31.79 s. Batch-adaptive widths remain the faster policy.
 
 The remaining difference is Phase 1 on the human pair: Tuna's 11.25 billion
 superkmers exceed KMC's 8.41 billion. Future work should target boundary
@@ -194,4 +210,33 @@ Authoritative logs are retained under:
 
 ```text
 /scratch4/rob/tuna_benchmarking/results/round2_human3_20260724/
+```
+
+## Human3 binary-output gate
+
+The final apples-to-apples gate repeats the 614 GB, 36-file run with real
+binary counts. Tuna writes standards-compliant adaptive-width KFF; KMC writes
+its native binary database. Neither command uses Tuna `-co` or KMC `-w`.
+
+| Tool/output | Phase 1 | Phase 2 + output | Process wall | Peak RSS | Output bytes |
+|---|---:|---:|---:|---:|---:|
+| Tuna adaptive KFF | 496.70 s | 294.80 s | 822.27 s | 13,222,728 KB | 212,223,183,420 |
+| KMC native DB | 542.07 s | 604.55 s | 1,146.69 s | 250,576,008 KB | 204,998,649,924 |
+
+Tuna is 28.3 percent faster overall, 8.4 percent faster in Phase 1, and 51.2
+percent faster in Phase 2 including output, while using 94.7 percent less peak
+memory. Its portable KFF is 3.5 percent larger than KMC's native database.
+Both report exactly 516,924,379,564 total and 20,868,636,896 distinct k-mers.
+
+An independent full KFF reader pass decoded every record and recovered those
+same totals; the maximum encoded count was 54,689,425. On the one-pair subset,
+Tuna adaptive KFF completed in 91.72 s versus 118.17 s for KMC native output
+and 119.62 s for KMC KFF output. Tuna's 38,395,090,244-byte pair KFF was also
+smaller than both KMC's 38,552,359,760-byte native database and its
+46,181,052,101-byte KFF.
+
+Authoritative real-output logs are retained under:
+
+```text
+/scratch4/rob/tuna_benchmarking/results/round2_output_20260724/
 ```

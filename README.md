@@ -188,7 +188,7 @@ Benchmark counting without serializing k-mers:
 tuna -k 31 -t 8 -co @genomes.list /dev/null
 ```
 
-> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; in KFF binary (~12 bytes/k-mer) it is ~6 GB.
+> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; at k=31, KFF uses 8 sequence bytes plus 1–4 count bytes per k-mer.
 
 ---
 
@@ -206,7 +206,7 @@ TGCATGCATGCATGCATGCATGCATGCATGC	7
 
 ### KFF binary (`-kff` or `.kff` extension)
 
-[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3, MSB-first) with a 4-byte big-endian count. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with a lossless 1–4 byte big-endian count. Tuna changes KFF raw sections as needed so each output batch uses the smallest count width it requires. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
 
 KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
 
@@ -261,9 +261,10 @@ Each row shows the **median wall time** over per-file runs (100 files for bacter
 tuna is consistently faster than KMC across all dataset types.
 Memory usage scales with unique k-mers per partition rather than total input size.
 
-On the 614 GB compressed, 36-file human3 read set at 16 threads, Tuna completes
-in 835.66 s versus KMC's 1,072.36 s. It matches KMC exactly at
-516,924,379,564 total and 20,868,636,896 distinct canonical k-mers while using
-8.75 GB peak RSS versus 249.61 GB.
+On the 614 GB compressed, 36-file human3 read set at 16 threads, with real
+binary count output enabled, Tuna completes in 822.27 s versus KMC's 1,146.69
+s. It matches KMC exactly at 516,924,379,564 total and 20,868,636,896 distinct
+canonical k-mers while using 13.22 GB peak RSS versus 250.58 GB. Tuna writes a
+212.22 GB portable KFF; KMC writes a 205.00 GB native database.
 
 ![Per-file benchmark: wall time distributions, phase breakdown, and speedup across 5 datasets](benchmark/datasets.png)

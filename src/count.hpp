@@ -28,6 +28,7 @@
 #include <exception>
 #include <stdexcept>
 #include <charconv>
+#include <cstring>
 #include <string_view>
 
 #include <ankerl/unordered_dense.h>
@@ -394,8 +395,8 @@ uint64_t write_counts(
 
 // ─── KFF output brick ─────────────────────────────────────────────────────────
 //
-// Encodes each k-mer from the table as 2-bit MSB-first bytes and flushes to
-// a KffOutput in batches of ~1 MB.  Thread-safe via KffOutput::write_batch.
+// Encodes each k-mer and its count as a complete KFF raw-section record, then
+// flushes records to KffOutput in batches of ~1 MB.
 
 template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts_kff(
@@ -403,19 +404,39 @@ uint64_t write_counts_kff(
     const Config& cfg,
     KffOutput&    kff_out)
 {
-    constexpr size_t KMER_BYTES  = (k + 3) / 4;                            // bytes per k-mer (2-bit packed)
-    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / (KMER_BYTES + 4);  // k-mers per KFF write batch
+    constexpr size_t KMER_BYTES  = (k + 3) / 4;
+    constexpr size_t RECORD_SIZE = KMER_BYTES + 4;
+    constexpr size_t BATCH_KMERS = (size_t(1) << 20) / RECORD_SIZE;
 
-    std::vector<uint8_t>  seq_buf;
-    std::vector<uint32_t> cnt_buf;
-    seq_buf.reserve(BATCH_KMERS * KMER_BYTES);
-    cnt_buf.reserve(BATCH_KMERS);
+    std::vector<uint8_t> records;
+    records.reserve(BATCH_KMERS * RECORD_SIZE);
+    size_t buffered = 0;
+    uint32_t max_buffered_count = 0;
 
     const auto flush = [&]() {
-        if (!cnt_buf.empty()) {
-            kff_out.write_batch(seq_buf.data(), cnt_buf.data(), cnt_buf.size());
-            seq_buf.clear();
-            cnt_buf.clear();
+        if (buffered != 0) {
+            const uint8_t count_bytes =
+                max_buffered_count <= std::numeric_limits<uint8_t>::max()  ? 1 :
+                max_buffered_count <= std::numeric_limits<uint16_t>::max() ? 2 :
+                max_buffered_count <= 0xFFFFFFu ? 3 : 4;
+
+            if (count_bytes != 4) {
+                const size_t compact_size = KMER_BYTES + count_bytes;
+                for (size_t i = 0; i < buffered; ++i) {
+                    const uint8_t* src = records.data() + i * RECORD_SIZE;
+                    uint8_t* dst = records.data() + i * compact_size;
+                    std::memmove(dst, src, KMER_BYTES);
+                    std::memmove(
+                        dst + KMER_BYTES,
+                        src + KMER_BYTES + 4 - count_bytes,
+                        count_bytes);
+                }
+                records.resize(buffered * compact_size);
+            }
+            kff_out.write_batch(records.data(), buffered, count_bytes);
+            records.clear();
+            buffered = 0;
+            max_buffered_count = 0;
         }
     };
 
@@ -425,15 +446,20 @@ uint64_t write_counts_kff(
         const uint64_t cnt = entry.second;
         if (cnt < cfg.ci || cnt > cfg.cx) return;
 
-        // Pack label into 2-bit bytes (MSB = first base).
-        seq_buf.resize(seq_buf.size() + KMER_BYTES, 0);
-        uint8_t* dst = seq_buf.data() + seq_buf.size() - KMER_BYTES;
+        const size_t offset = records.size();
+        records.resize(offset + RECORD_SIZE);
+        uint8_t* dst = records.data() + offset;
         entry.first.write_packed_2bit_msb(dst);
-
-        cnt_buf.push_back(static_cast<uint32_t>(cnt));
+        const uint32_t c = static_cast<uint32_t>(cnt);
+        dst[KMER_BYTES]     = static_cast<uint8_t>(c >> 24);
+        dst[KMER_BYTES + 1] = static_cast<uint8_t>(c >> 16);
+        dst[KMER_BYTES + 2] = static_cast<uint8_t>(c >> 8);
+        dst[KMER_BYTES + 3] = static_cast<uint8_t>(c);
+        max_buffered_count = std::max(max_buffered_count, c);
+        ++buffered;
         ++written;
 
-        if (cnt_buf.size() >= BATCH_KMERS) flush();
+        if (buffered >= BATCH_KMERS) flush();
     });
     flush();
 

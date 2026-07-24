@@ -207,8 +207,8 @@ public:
     template <typename T_container_>
     void get_label(T_container_& label) const;
 
-    // Writes the k-mer as packed 2-bit bases into `dst` (MSB-first, 4 bases/byte).
-    // The output layout is suitable for KFF sequence payloads.
+    // Writes the k-mer as a KFF sequence payload (2-bit bases, big-endian,
+    // with an incomplete first byte left-padded with zero bits).
     void write_packed_2bit_msb(uint8_t* dst) const;
 
     // Implicitly converts the k-mer to a `std::string`.
@@ -714,10 +714,22 @@ template <uint16_t k>
 inline void Kmer<k>::write_packed_2bit_msb(uint8_t* dst) const
 {
     constexpr std::size_t packed_bytes = (k + 3) / 4;
-    std::memset(dst, 0, packed_bytes);
-    for (uint16_t i = 0; i < k; ++i) {
-        const uint8_t b = static_cast<uint8_t>(base_at(k - 1 - i));
-        dst[i >> 2] |= static_cast<uint8_t>(b << (6u - 2u * (i & 3u)));
+    if constexpr (k <= 32) {
+        const uint64_t word = kmer_data[0];
+        for (std::size_t i = 0; i < packed_bytes; ++i) {
+            const unsigned shift = static_cast<unsigned>(
+                8 * (packed_bytes - 1 - i));
+            dst[i] = static_cast<uint8_t>(word >> shift);
+        }
+    } else {
+        constexpr uint16_t prefix_padding = (4 - (k & 3)) & 3;
+        std::memset(dst, 0, packed_bytes);
+        for (uint16_t i = 0; i < k; ++i) {
+            const uint16_t packed_pos = prefix_padding + i;
+            const uint8_t b = static_cast<uint8_t>(base_at(k - 1 - i));
+            dst[packed_pos >> 2] |= static_cast<uint8_t>(
+                b << (6u - 2u * (packed_pos & 3u)));
+        }
     }
 }
 
