@@ -8,9 +8,9 @@
 // ACTG-only chunks regardless of file format or compression.
 //
 // Internals:
-//   extract_superkmers_from_actg<k, m, PartitionFn>  — pure ACTG sequence logic,
+//   extract_superkmers_from_actg<k, m, partition_m>  — pure ACTG sequence logic,
 //                                                       no I/O, no threads.
-//   partition_kmers_impl<k, m, PartitionFn>           — parallel harness.
+//   partition_kmers_impl<k, m, partition_m>           — parallel harness.
 
 #include "Config.hpp"
 #include "superkmer_io.hpp"
@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <exception>
+#include <algorithm>
 
 
 // Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
@@ -35,27 +36,65 @@ inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
     return std::max(MIN_FLUSH_BYTES, budget_per_thread / n_parts);
 }
 
+// Reusable contiguous batch for the compressed producer/consumer path.
+// Sequence data is copied once into an arena and boundaries are stored as
+// offsets, avoiding one allocation per parsed ACTG chunk.
+class ActgBatch
+{
+    std::vector<char>   bases_;
+    std::vector<size_t> ends_;
+
+public:
+    void prepare(size_t chunk_capacity)
+    {
+        constexpr size_t EXPECTED_BASES_PER_CHUNK = 256;
+        bases_.clear();
+        ends_.clear();
+        if (ends_.capacity() < chunk_capacity)
+            ends_.reserve(chunk_capacity);
+        const size_t base_capacity = chunk_capacity * EXPECTED_BASES_PER_CHUNK;
+        if (bases_.capacity() < base_capacity)
+            bases_.reserve(base_capacity);
+    }
+
+    void append(const char* data, size_t len)
+    {
+        bases_.insert(bases_.end(), data, data + len);
+        ends_.push_back(bases_.size());
+    }
+
+    bool empty() const noexcept { return ends_.empty(); }
+    size_t size() const noexcept { return ends_.size(); }
+
+    std::pair<const char*, size_t> chunk(size_t i) const noexcept
+    {
+        const size_t begin = i == 0 ? 0 : ends_[i - 1];
+        return {bases_.data() + begin, ends_[i] - begin};
+    }
+};
+
 
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
 //
 // Walk one ACTG-only sequence, detect superkmer boundaries on minimizer hash
 // changes, and append each superkmer to the corresponding writer.
-// Splits on hash change (not partition change) so every superkmer has one minimizer.
-// min_pos comes from MinimizerWindow::min_lmer_pos() — no extra scan needed.
+// Splits on hash change (not partition change) so every superkmer has one
+// partition minimizer.
 //
 // FlushFn: void(std::vector<SuperkmerWriter<k,m>>&, size_t partition_id)
 // Called after each append; O(1) per superkmer.
-template <uint16_t k, uint16_t m, typename PartitionFn, typename FlushFn>
+template <uint16_t k, uint16_t m, uint16_t partition_m,
+          typename PartitionFn, typename FlushFn>
 void extract_superkmers_from_actg(
     const char* const                    seq,
     const size_t                         seq_len,
     PartitionFn&&                        partition_fn,
-    MinimizerWindow<k, m>&               min_it,      // minimizer iterator (sliding window)
+    MinimizerWindow<k, partition_m>&     min_it,      // partition minimizer iterator
     std::vector<SuperkmerWriter<k, m>>&  writers,
     uint64_t&                            kmer_count,
     uint64_t&                            sk_count,
     FlushFn&&                            flush_fn,
-    std::vector<uint8_t>&                kache_buf)   // kache-encoded sequence buffer (A=0,C=1,G=2,T=3)
+    std::vector<uint8_t>&                packed_buf)  // packed sequence plus one sentinel byte
 {
     using hdr_t = sk_hdr_t<k, m>;  // superkmer header type (local alias)
     // Max value of hdr_t: flush guard prevents sk_len from ever overflowing hdr_t.
@@ -64,81 +103,102 @@ void extract_superkmers_from_actg(
 
     if (seq_len < k) return;
 
-    // Pre-encode ASCII→kache once; bases are read multiple times across superkmers.
-    kache_buf.resize(seq_len);
-    for (size_t i = 0; i < seq_len; ++i)
-        kache_buf[i] = ((uint8_t(seq[i]) >> 2) ^ (uint8_t(seq[i]) >> 1)) & 3u;
+    // Pack the sequence once so overlapping superkmers can copy byte slices
+    // instead of repacking the same bases repeatedly.
+    const size_t packed_bytes = (seq_len + 3u) / 4u;
+    packed_buf.resize(packed_bytes + 1);
+    size_t enc = 0;
+    for (; enc + 4 <= seq_len; enc += 4) {
+        const uint8_t b0 = ((uint8_t(seq[enc    ]) >> 2) ^ (uint8_t(seq[enc    ]) >> 1)) & 3u;
+        const uint8_t b1 = ((uint8_t(seq[enc + 1]) >> 2) ^ (uint8_t(seq[enc + 1]) >> 1)) & 3u;
+        const uint8_t b2 = ((uint8_t(seq[enc + 2]) >> 2) ^ (uint8_t(seq[enc + 2]) >> 1)) & 3u;
+        const uint8_t b3 = ((uint8_t(seq[enc + 3]) >> 2) ^ (uint8_t(seq[enc + 3]) >> 1)) & 3u;
+        packed_buf[enc >> 2] = static_cast<uint8_t>(
+            (b0 << 6) | (b1 << 4) | (b2 << 2) | b3);
+    }
+    if (enc < seq_len) {
+        uint8_t tail = 0;
+        for (size_t i = enc; i < seq_len; ++i) {
+            const uint8_t b = ((uint8_t(seq[i]) >> 2) ^ (uint8_t(seq[i]) >> 1)) & 3u;
+            tail |= static_cast<uint8_t>(b << (6u - 2u * (i - enc)));
+        }
+        packed_buf[enc >> 2] = tail;
+    }
+    packed_buf[packed_bytes] = 0;
 
     min_it.reset(seq);   // initialises from ASCII (called once per sequence — cheap)
-    uint64_t prev_hash    = min_it.hash();
-    uint64_t prev_min_pos = min_it.min_lmer_pos(); // absolute pos within seq
+    uint64_t prev_hash = min_it.hash();
     size_t   pid          = partition_fn(prev_hash);  // partition id
     size_t   sk_start     = 0;                        // superkmer start position in current sequence
 
     for (size_t pos = k; pos < seq_len; ++pos) {
-        min_it.advance_kache(kache_buf[pos]);
+        min_it.advance(seq[pos]);
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
-            writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
+            const auto min_pos = sk_no_min<k, m>;
+            writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
             prev_hash    = new_hash;
-            prev_min_pos = min_it.min_lmer_pos();
             pid          = partition_fn(new_hash);
             sk_start     = pos - (k - 1);
         }
     }
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
-    writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
+    const auto min_pos = sk_no_min<k, m>;
+    writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
     ++sk_count;
 }
 
 
-// ─── Producer-consumer harness for a single gz file ──────────────────────────
+// ─── Producer-consumer harness for compressed files ──────────────────────────
 //
-// When there is only one input file and it is gzip-compressed, the standard
-// work-stealing harness wastes all but one thread (min(n_threads,1)=1).
-// This harness instead:
-//   • 1 producer thread: gz decompression + split_actg → batches of ACTG chunks
-//   • n_threads-1 consumer threads: extract_superkmers_from_actg per chunk
+// Each parser producer owns an AsyncGzInput decompression thread and feeds a
+// shared queue. Remaining threads extract and partition superkmers. Capping
+// parser producers at n_threads/4 leaves enough consumers for minimizer work.
 //
 // The queue is bounded (MAX_QUEUE batches) for backpressure.  Consumers flush
 // SuperkmerWriters to the shared bucket files under per-bucket mutexes.
 
-template <uint16_t k, uint16_t m, typename PartitionFn>
-PartitionStats partition_kmers_gz_pc(
+template <uint16_t k, uint16_t m, uint16_t partition_m,
+          typename PartitionFn, typename FlushWriterFn>
+PartitionStats partition_kmers_gz_pc_impl(
     const Config&               cfg,
-    const std::string&          gz_path,
-    std::vector<std::ofstream>& buckets,
+    const std::vector<std::string>& gz_paths,
     PartitionFn                 partition_fn,
+    FlushWriterFn               flush_writer,
     size_t                      n_threads,          // ≥ 2 (1 producer + rest consumers)
     size_t                      write_budget_per_thread)
 {
-    using Batch = std::vector<std::string>;     // ACTG-only chunks pre-split by producer
+    using Batch = ActgBatch;
 
     constexpr size_t MAX_QUEUE  = 32;           // max batches in flight
     constexpr size_t BATCH_SEQS = 512;          // sequences per batch
 
-    const size_t n_parts     = cfg.num_partitions;
-    const size_t n_consumers = n_threads - 1;
+    const size_t n_parts = cfg.num_partitions;
+    const bool async_input = n_threads >= 3;
+    const size_t n_producers = async_input
+        ? std::min(gz_paths.size(), std::max(size_t(1), n_threads / 4))
+        : size_t(1);
+    const size_t n_consumers = n_threads -
+        n_producers * (async_input ? size_t(2) : size_t(1));
 
     std::deque<Batch>       queue;
+    std::deque<Batch>       free_batches;
     std::mutex              q_mutex;
     std::condition_variable q_cv;
-    bool                    producer_done = false;
+    size_t                  producers_done = 0;
+    std::atomic<size_t>     next_gz{0};
     std::exception_ptr      producer_error = nullptr;
     std::atomic<bool>       stop{false};
     std::exception_ptr      consumer_error = nullptr;
     std::mutex              consumer_error_mutex;
 
-    std::vector<std::mutex> bucket_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     // Producer: decompress gz via GzInput, use helicase SIMD parser to deliver
@@ -147,57 +207,86 @@ PartitionStats partition_kmers_gz_pc(
         auto feed = [&](auto& parser) {
             while (true) {
                 Batch batch;
+                {
+                    std::lock_guard<std::mutex> lk(q_mutex);
+                    if (!free_batches.empty()) {
+                        batch = std::move(free_batches.front());
+                        free_batches.pop_front();
+                    }
+                }
+                batch.prepare(BATCH_SEQS);
                 size_t chunk_count = 0;
                 while (!stop.load(std::memory_order_relaxed)
                        && chunk_count < BATCH_SEQS
                        && parser.next()) {
                     auto [ptr, len] = parser.get_dna_raw();
-                    batch.emplace_back(ptr, len);
+                    batch.append(ptr, len);
                     ++chunk_count;
                 }
                 if (stop.load(std::memory_order_relaxed)) break;
                 if (batch.empty()) break;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
-                    q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
+                    q_cv.wait(lk, [&] {
+                        return stop.load(std::memory_order_relaxed) ||
+                               queue.size() < MAX_QUEUE;
+                    });
+                    if (stop.load(std::memory_order_relaxed)) break;
                     queue.push_back(std::move(batch));
                 }
                 q_cv.notify_one();
             }
-            { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
-            q_cv.notify_all();
         };
         try {
-            GzInput inp(gz_path);
-            if (inp.first_byte() == '@') {
-                helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
-                feed(p);
-            } else {
-                helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
-                feed(p);
+            while (!stop.load(std::memory_order_relaxed)) {
+                const size_t file_idx = next_gz.fetch_add(1, std::memory_order_relaxed);
+                if (file_idx >= gz_paths.size()) break;
+                const auto& gz_path = gz_paths[file_idx];
+                if (async_input) {
+                    AsyncGzInput inp(gz_path);
+                    if (inp.first_byte() == '@') {
+                        helicase::FastqParser<HELICASE_ACTG, AsyncGzInput> p(std::move(inp));
+                        feed(p);
+                    } else {
+                        helicase::FastaParser<HELICASE_ACTG, AsyncGzInput> p(std::move(inp));
+                        feed(p);
+                    }
+                } else {
+                    GzInput inp(gz_path);
+                    if (inp.first_byte() == '@') {
+                        helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                        feed(p);
+                    } else {
+                        helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                        feed(p);
+                    }
+                }
             }
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(q_mutex);
-                producer_error = std::current_exception();
-                producer_done = true;
+                if (!producer_error) producer_error = std::current_exception();
             }
             stop.store(true, std::memory_order_relaxed);
-            q_cv.notify_all();
         }
+        {
+            std::lock_guard<std::mutex> lk(q_mutex);
+            ++producers_done;
+        }
+        q_cv.notify_all();
     };
 
     // Consumer: pull batches from the queue and extract superkmers.
     auto consumer_fn = [&]() {
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
-            MinimizerWindow<k, m>               min_it;
+            MinimizerWindow<k, partition_m>     min_it;
             std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-            std::vector<uint8_t>         kache_buf;
+            std::vector<uint8_t>         packed_buf;
             uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
             auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-                if (ws[p].needs_flush()) ws[p].flush_to(buckets[p], bucket_mutexes[p]);
+                if (ws[p].needs_flush()) flush_writer(ws[p], p);
             };
 
             while (true) {
@@ -205,24 +294,33 @@ PartitionStats partition_kmers_gz_pc(
                 Batch batch;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
-                    q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
-                    if (queue.empty()) break;       // producer_done && queue empty → done
+                    q_cv.wait(lk, [&] {
+                        return stop.load(std::memory_order_relaxed) ||
+                               !queue.empty() || producers_done == n_producers;
+                    });
+                    if (stop.load(std::memory_order_relaxed) || queue.empty()) break;
                     batch = std::move(queue.front());
                     queue.pop_front();
                 }
                 q_cv.notify_one();                  // wake producer if it was waiting for space
 
-                for (const auto& chunk : batch) {
+                for (size_t i = 0; i < batch.size(); ++i) {
                     if (stop.load(std::memory_order_relaxed)) break;
-                    extract_superkmers_from_actg<k, m>(
-                        chunk.data(), chunk.size(), partition_fn,
-                        min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    const auto [chunk, chunk_len] = batch.chunk(i);
+                    extract_superkmers_from_actg<k, m, partition_m>(
+                        chunk, chunk_len, partition_fn,
+                        min_it, writers, local_kmers, local_superkmers, flush_fn,
+                        packed_buf);
                     ++local_seqs;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(q_mutex);
+                    free_batches.push_back(std::move(batch));
                 }
             }
 
             for (size_t p = 0; p < n_parts; ++p)
-                writers[p].flush_to(buckets[p], bucket_mutexes[p]);
+                flush_writer(writers[p], p);
 
             total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
             total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
@@ -239,7 +337,8 @@ PartitionStats partition_kmers_gz_pc(
 
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
-    threads.emplace_back(producer_fn);
+    for (size_t t = 0; t < n_producers; ++t)
+        threads.emplace_back(producer_fn);
     for (size_t t = 0; t < n_consumers; ++t)
         threads.emplace_back(consumer_fn);
     for (auto& th : threads) th.join();
@@ -249,6 +348,24 @@ PartitionStats partition_kmers_gz_pc(
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
 
+template <uint16_t k, uint16_t m, uint16_t partition_m, typename PartitionFn>
+PartitionStats partition_kmers_gz_pc(
+    const Config&                  cfg,
+    const std::vector<std::string>& gz_paths,
+    std::vector<std::ofstream>&    buckets,
+    PartitionFn                    partition_fn,
+    size_t                         n_threads,
+    size_t                         write_budget_per_thread)
+{
+    std::vector<std::mutex> bucket_mutexes(cfg.num_partitions);
+    auto flush_writer = [&](SuperkmerWriter<k, m>& writer, size_t p) {
+        writer.flush_to(buckets[p], bucket_mutexes[p]);
+    };
+    return partition_kmers_gz_pc_impl<k, m, partition_m>(
+        cfg, gz_paths, partition_fn, flush_writer,
+        n_threads, write_budget_per_thread);
+}
+
 
 // ─── Parallel harness ─────────────────────────────────────────────────────────
 //
@@ -256,7 +373,7 @@ PartitionStats partition_kmers_gz_pc(
 // helicase + superkmer extraction on its own thread.
 // Load balancing is coarse (file granularity) but negligible for equal-size files.
 
-template <uint16_t k, uint16_t m, typename PartitionFn>
+template <uint16_t k, uint16_t m, uint16_t partition_m, typename PartitionFn>
 PartitionStats partition_kmers_impl(
     const Config&               cfg,
     std::vector<std::ofstream>& buckets,
@@ -266,15 +383,15 @@ PartitionStats partition_kmers_impl(
     const size_t n_files      = cfg.input_files.size();
     const size_t n_threads_req = static_cast<size_t>(cfg.num_threads);
 
-    // Single gz file + multiple requested threads → use producer-consumer.
-    // The standard work-stealing path would cap to min(n_threads,1)=1 thread.
-    if (n_files == 1 && n_threads_req > 1) {
-        const auto& f = cfg.input_files[0];
-        if (f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
-            return partition_kmers_gz_pc<k, m>(cfg, f, buckets,
-                                               partition_fn, n_threads_req,
-                                               write_budget_per_thread);
-    }
+    const bool all_gz = std::all_of(
+        cfg.input_files.begin(), cfg.input_files.end(),
+        [](const std::string& f) {
+            return f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0;
+        });
+    if (n_threads_req > 1 && all_gz)
+        return partition_kmers_gz_pc<k, m, partition_m>(
+            cfg, cfg.input_files, buckets, partition_fn,
+            n_threads_req, write_budget_per_thread);
 
     const size_t n_threads = std::min(n_threads_req, n_files);
     const size_t n_parts   = cfg.num_partitions;
@@ -290,9 +407,9 @@ PartitionStats partition_kmers_impl(
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
             SeqSource            source;
-            MinimizerWindow<k, m>               min_it;
+            MinimizerWindow<k, partition_m>     min_it;
             std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-            std::vector<uint8_t>         kache_buf;
+            std::vector<uint8_t>         packed_buf;
             uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
             auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
@@ -306,8 +423,9 @@ PartitionStats partition_kmers_impl(
 
                 source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                     if (stop.load(std::memory_order_relaxed)) return;
-                    extract_superkmers_from_actg<k, m>(
-                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    extract_superkmers_from_actg<k, m, partition_m>(
+                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers,
+                        flush_fn, packed_buf);
                     ++local_seqs;
                 });
             }
@@ -344,7 +462,7 @@ PartitionStats partition_kmers_impl(
 // per-partition std::string buffers instead of disk files.  Used by the
 // streaming pipeline to avoid the Phase 1 disk write + Phase 2 mmap round-trip.
 
-template <uint16_t k, uint16_t m, typename PartitionFn>
+template <uint16_t k, uint16_t m, uint16_t partition_m, typename PartitionFn>
 PartitionStats partition_kmers_mem_impl(
     const Config&             cfg,
     std::vector<std::string>& bufs,
@@ -361,18 +479,35 @@ PartitionStats partition_kmers_mem_impl(
         ? n_threads_req   // gz single-file: all threads participate
         : std::min(n_threads_req, n_files);
 
+    const bool all_gz = std::all_of(
+        cfg.input_files.begin(), cfg.input_files.end(),
+        [](const std::string& f) {
+            return f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0;
+        });
+    if (n_threads_req > 1 && all_gz) {
+        std::vector<std::mutex> buf_mutexes(n_parts);
+        auto flush_writer = [&](SuperkmerWriter<k, m>& writer, size_t p) {
+            writer.flush_to_mem(bufs[p], buf_mutexes[p]);
+        };
+        return partition_kmers_gz_pc_impl<k, m, partition_m>(
+            cfg, cfg.input_files, partition_fn, flush_writer,
+            n_threads_req, 64u << 20);
+    }
+
     // Single .gz file: producer-consumer variant using in-memory sinks.
     if (n_files == 1 && n_threads_req > 1) {
         const auto& gz_path = cfg.input_files[0];
         const bool is_gz = gz_path.size() > 3 &&
                            gz_path.compare(gz_path.size() - 3, 3, ".gz") == 0;
         if (is_gz) {
-            using Batch = std::vector<std::string>;
+            using Batch = ActgBatch;
             constexpr size_t MAX_QUEUE  = 32;
             constexpr size_t BATCH_SEQS = 512;
-            const size_t n_consumers = n_threads - 1;
+            const bool async_input = n_threads >= 3;
+            const size_t n_consumers = n_threads - (async_input ? 2 : 1);
 
             std::deque<Batch>       queue;
+            std::deque<Batch>       free_batches;
             std::mutex              q_mutex;
             std::condition_variable q_cv;
             bool                    producer_done = false;
@@ -387,32 +522,57 @@ PartitionStats partition_kmers_mem_impl(
                 auto feed = [&](auto& parser) {
                     while (true) {
                         Batch batch;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (!free_batches.empty()) {
+                                batch = std::move(free_batches.front());
+                                free_batches.pop_front();
+                            }
+                        }
+                        batch.prepare(BATCH_SEQS);
                         size_t chunk_count = 0;
                         while (!stop.load(std::memory_order_relaxed)
                                && chunk_count < BATCH_SEQS
                                && parser.next()) {
                             auto [ptr, len] = parser.get_dna_raw();
-                            batch.emplace_back(ptr, len);
+                            batch.append(ptr, len);
                             ++chunk_count;
                         }
                         if (stop.load(std::memory_order_relaxed)) break;
                         if (batch.empty()) break;
-                        { std::unique_lock<std::mutex> lk(q_mutex);
-                          q_cv.wait(lk, [&]{ return queue.size() < MAX_QUEUE; });
-                          queue.push_back(std::move(batch)); }
+                        {
+                            std::unique_lock<std::mutex> lk(q_mutex);
+                            q_cv.wait(lk, [&] {
+                                return stop.load(std::memory_order_relaxed) ||
+                                       queue.size() < MAX_QUEUE;
+                            });
+                            if (stop.load(std::memory_order_relaxed)) break;
+                            queue.push_back(std::move(batch));
+                        }
                         q_cv.notify_one();
                     }
                     { std::lock_guard<std::mutex> lk(q_mutex); producer_done = true; }
                     q_cv.notify_all();
                 };
                 try {
-                    GzInput inp(gz_path);
-                    if (inp.first_byte() == '@') {
-                        helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
-                        feed(p);
+                    if (async_input) {
+                        AsyncGzInput inp(gz_path);
+                        if (inp.first_byte() == '@') {
+                            helicase::FastqParser<HELICASE_ACTG, AsyncGzInput> p(std::move(inp));
+                            feed(p);
+                        } else {
+                            helicase::FastaParser<HELICASE_ACTG, AsyncGzInput> p(std::move(inp));
+                            feed(p);
+                        }
                     } else {
-                        helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
-                        feed(p);
+                        GzInput inp(gz_path);
+                        if (inp.first_byte() == '@') {
+                            helicase::FastqParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                            feed(p);
+                        } else {
+                            helicase::FastaParser<HELICASE_ACTG, GzInput> p(std::move(inp));
+                            feed(p);
+                        }
                     }
                 } catch (...) {
                     {
@@ -428,9 +588,9 @@ PartitionStats partition_kmers_mem_impl(
             auto consumer_fn = [&]() {
                 try {
                     const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
-                    MinimizerWindow<k, m>        min_it;
+                    MinimizerWindow<k, partition_m> min_it;
                     std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-                    std::vector<uint8_t>         kache_buf;
+                    std::vector<uint8_t>         packed_buf;
                     uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
                     auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
                         if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
@@ -438,18 +598,29 @@ PartitionStats partition_kmers_mem_impl(
                     while (true) {
                         if (stop.load(std::memory_order_relaxed)) break;
                         Batch batch;
-                        { std::unique_lock<std::mutex> lk(q_mutex);
-                          q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
-                          if (queue.empty()) break;
-                          batch = std::move(queue.front());
-                          queue.pop_front(); }
+                        {
+                            std::unique_lock<std::mutex> lk(q_mutex);
+                            q_cv.wait(lk, [&] {
+                                return stop.load(std::memory_order_relaxed) ||
+                                       !queue.empty() || producer_done;
+                            });
+                            if (stop.load(std::memory_order_relaxed) || queue.empty()) break;
+                            batch = std::move(queue.front());
+                            queue.pop_front();
+                        }
                         q_cv.notify_one();
-                        for (const auto& chunk : batch) {
+                        for (size_t i = 0; i < batch.size(); ++i) {
                             if (stop.load(std::memory_order_relaxed)) break;
-                            extract_superkmers_from_actg<k, m>(
-                                chunk.data(), chunk.size(), partition_fn,
-                                min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                            const auto [chunk, chunk_len] = batch.chunk(i);
+                            extract_superkmers_from_actg<k, m, partition_m>(
+                                chunk, chunk_len, partition_fn,
+                                min_it, writers, local_kmers, local_superkmers, flush_fn,
+                                packed_buf);
                             ++local_seqs;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            free_batches.push_back(std::move(batch));
                         }
                     }
                     for (size_t p = 0; p < n_parts; ++p)
@@ -491,9 +662,9 @@ PartitionStats partition_kmers_mem_impl(
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
             SeqSource            source;
-            MinimizerWindow<k, m>               min_it;
+            MinimizerWindow<k, partition_m>     min_it;
             std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-            std::vector<uint8_t>         kache_buf;
+            std::vector<uint8_t>         packed_buf;
             uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
             auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
@@ -507,8 +678,9 @@ PartitionStats partition_kmers_mem_impl(
 
                 source.process(cfg.input_files[fi], [&](const char* chunk, size_t len) {
                     if (stop.load(std::memory_order_relaxed)) return;
-                    extract_superkmers_from_actg<k, m>(
-                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                    extract_superkmers_from_actg<k, m, partition_m>(
+                        chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers,
+                        flush_fn, packed_buf);
                     ++local_seqs;
                 });
             }
@@ -548,7 +720,8 @@ PartitionStats partition_kmers(
 {
     const size_t n    = cfg.num_partitions;
     const size_t mask = n - 1; // n is always a power of 2 (enforced in main.cpp)
-    return partition_kmers_impl<k, m>(cfg, buckets,
+    static constexpr uint16_t partition_m = m;
+    return partition_kmers_impl<k, m, partition_m>(cfg, buckets,
         [mask](uint64_t h) -> size_t { return h & mask; },
         write_budget_per_thread);
 }
@@ -560,6 +733,7 @@ PartitionStats partition_kmers_mem(
 {
     const size_t n    = cfg.num_partitions;
     const size_t mask = n - 1; // n is always a power of 2 (enforced in main.cpp)
-    return partition_kmers_mem_impl<k, m>(cfg, bufs,
+    static constexpr uint16_t partition_m = m;
+    return partition_kmers_mem_impl<k, m, partition_m>(cfg, bufs,
         [mask](uint64_t h) -> size_t { return h & mask; });
 }

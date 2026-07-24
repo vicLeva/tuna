@@ -22,26 +22,26 @@ void print_usage(const char* prog)
         "              conda build supports: k ∈ {21, 31, 51, 63, 127}\n"
         "              for other k values: https://github.com/vicLeva/tuna\n"
 #else
-        "              this build accepts: odd values in [11,127]\n"
+        "              this build accepts: odd values in [11,63], plus 127\n"
         "              for other values recompile with -DFIXED_K=<k> -DFIXED_M=<m>\n"
 #endif
-        "  -m  <int>   minimizer length            [default: 21]\n"
+        "  -m  <int>   partition minimizer length  [default: 15]\n"
 #if defined(TUNA_CONDA_PROFILE)
         "              conda build supports odd m per k:\n"
         "                k=21  m ∈ {11,13,15,17,19}\n"
         "                k=31  m ∈ {15,17,19,21,23}\n"
-        "                k=51  m ∈ {17,19,21,23,25}\n"
-        "                k=63  m ∈ {19,21,23,25,27}\n"
-        "                k=127 m ∈ {19,21,23,25,27,29,31}\n"
+        "                k=51  m ∈ {15,17,19,21,23,25}\n"
+        "                k=63  m ∈ {15,19,21,23,25,27}\n"
+        "                k=127 m ∈ {15,19,21,23,25,27,29,31}\n"
         "              for other m values: https://github.com/vicLeva/tuna\n"
 #else
         "              any odd value in [1, min(k-1, 32)]\n"
-        "              m=21 is a good default; use m=23-25 for highly repetitive\n"
-        "              or low-complexity data (e.g. individual human genomes)\n"
+        "              m=15 balances compact superkmers and partition entropy;\n"
+        "              phase 2 routes with a canonical rolling k-mer hash\n"
 #endif
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
         "  -t  <int>   worker threads              [default: 1]\n"
-        "              phase 1: parallel over input files (capped at #files)\n"
+        "              phase 1: pipelined decompression, parsing, and partitioning\n"
         "              phase 2: parallel over partitions  (capped at -n)\n"
         "  -ci <int>   minimum k-mer count         [default: 1]\n"
         "  -cx <int>   maximum k-mer count         [default: max]\n"
@@ -58,6 +58,8 @@ void print_usage(const char* prog)
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -co         count only: skip output writing after counting (for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
+        "  -dedup <mode> aggregate repeated superkmers before k-mer insertion\n"
+        "              modes: auto, on, off                  [default: auto]\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -kff        write output in KFF binary format (auto-detected from .kff extension)\n"
@@ -167,6 +169,17 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.count_only = true;
         } else if (arg == "-tp") {
             cfg.partition_only = true;
+        } else if (arg == "-dedup") {
+            const char* v = next_val("-dedup"); if (!v) return false;
+            const std::string_view mode(v);
+            if (mode == "auto") cfg.dedup_mode = SuperkmerDedupMode::Auto;
+            else if (mode == "on") cfg.dedup_mode = SuperkmerDedupMode::On;
+            else if (mode == "off") cfg.dedup_mode = SuperkmerDedupMode::Off;
+            else {
+                std::cerr << "tuna: error: -dedup expects auto, on, or off; got: "
+                          << mode << "\n";
+                return false;
+            }
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "tuna: error: unknown option: " << arg << "\n";
             return false;

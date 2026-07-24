@@ -1,20 +1,15 @@
 #pragma once
 
 // On-disk / in-memory superkmer format:
-//   [hdr_t len_bases][hdr_t min_pos][ceil(len/4) packed bytes]
+//   [hdr_t len_bases][ceil(len/4) packed bytes]
 //
 // hdr_t is uint8_t when max superkmer length fits in 8 bits (2k-m ≤ 255),
 // uint16_t otherwise.  The type is a compile-time constant deduced from k and m,
 // so the header is as compact as possible without ever truncating a value.
 //
 //   Max superkmer length : 2k − m  (two k-mers sharing the boundary minimizer)
-//   Max min_pos          : 2(k−m)  < 2k−m, so same type covers both fields
-//
-// For k ≤ 138 with m ≥ 21 (the common genomics range), hdr_t = uint8_t → 2-byte
-// header per superkmer.  For larger k, hdr_t = uint16_t → 4-byte header.
-//
-// The sentinel value hdr_t::max() in min_pos means "no precomputed minimizer
-// hash stored" — Phase 2 falls back to a full MinimizerWindow::reset().
+// For k ≤ 135 with m ≥ 15 (the common genomics range), hdr_t = uint8_t.
+// For larger k, hdr_t = uint16_t.
 //
 // Packed encoding: base i is at bits 7-2*(i%4) of byte i/4, MSB-first.
 
@@ -42,12 +37,11 @@ inline std::string partition_path(const std::string& work_dir, size_t p)
 #endif
 
 // Deduce the header integer type for a given (k, m) pair.
-// uint8_t  when 2k − m ≤ 255  (header fits in one byte, 2-byte header total)
-// uint16_t otherwise           (4-byte header, required for k ≥ 139 at m=21)
+// uint8_t when 2k − m ≤ 255, uint16_t otherwise.
 template <uint16_t k, uint16_t m>
 using sk_hdr_t = std::conditional_t<(2u * k - m <= 255u), uint8_t, uint16_t>;
 
-// Sentinel stored in min_pos when no precomputed minimizer hash is available.
+// Compatibility sentinel: rolling-hash routing needs no minimizer coordinate.
 template <uint16_t k, uint16_t m>
 static constexpr sk_hdr_t<k, m> sk_no_min = std::numeric_limits<sk_hdr_t<k, m>>::max();
 
@@ -62,7 +56,7 @@ template <uint16_t k, uint16_t m>
 struct SuperkmerWriter
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);  // header bytes per record
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);
 
     char*  raw_  = nullptr;  // raw buffer pointer
     size_t sz_   = 0;        // used bytes
@@ -126,10 +120,10 @@ struct SuperkmerWriter
     // Serialise one superkmer from ASCII DNA (ACGT, any case).
     void append(const char* data, hdr_t len, hdr_t min_pos)
     {
+        (void)min_pos;
         const size_t packed_bytes = (len + 3u) / 4u;
         char* dst = reserve_inline(HDR_BYTES + packed_bytes);
-        std::memcpy(dst,                &len,     sizeof(hdr_t));
-        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        std::memcpy(dst, &len, sizeof(hdr_t));
         uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         size_t i = 0;
@@ -153,10 +147,10 @@ struct SuperkmerWriter
     // Serialise one superkmer from pre-encoded kache bytes (A=0,C=1,G=2,T=3).
     void append_kache(const uint8_t* kdata, hdr_t len, hdr_t min_pos)
     {
+        (void)min_pos;
         const size_t packed_bytes = (len + 3u) / 4u;
         char* dst = reserve_inline(HDR_BYTES + packed_bytes);
-        std::memcpy(dst,                 &len,     sizeof(hdr_t));
-        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        std::memcpy(dst, &len, sizeof(hdr_t));
         uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         size_t i = 0;
@@ -169,6 +163,50 @@ struct SuperkmerWriter
                 tail |= static_cast<uint8_t>(kdata[j] << (6u - 2u * (j - i)));
             packed[i >> 2] = tail;
         }
+    }
+
+    // Serialise a base-aligned slice from an already packed sequence. `packed`
+    // must have one zero sentinel byte after its final data byte.
+    void append_packed(const uint8_t* packed, size_t base_offset, hdr_t len, hdr_t min_pos)
+    {
+        (void)min_pos;
+        const size_t packed_bytes = (len + 3u) / 4u;
+        char* dst = reserve_inline(HDR_BYTES + packed_bytes);
+        std::memcpy(dst, &len, sizeof(hdr_t));
+        auto* out = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
+
+        const auto* src = packed + (base_offset >> 2);
+        const unsigned shift = static_cast<unsigned>((base_offset & 3u) * 2u);
+        if (shift == 0) {
+            std::memcpy(out, src, packed_bytes);
+        } else {
+            static constexpr uint64_t LOW_MASKS[4] = {
+                0,
+                0x3f3f3f3f3f3f3f3fULL,
+                0x0f0f0f0f0f0f0f0fULL,
+                0x0303030303030303ULL
+            };
+            const uint64_t low_mask = LOW_MASKS[shift >> 1];
+            const uint64_t high_mask = ~low_mask;
+
+            size_t i = 0;
+            for (; i + sizeof(uint64_t) <= packed_bytes; i += sizeof(uint64_t)) {
+                uint64_t lo, hi;
+                std::memcpy(&lo, src + i,     sizeof(lo));
+                std::memcpy(&hi, src + i + 1, sizeof(hi));
+                const uint64_t shifted =
+                    ((lo & low_mask) << shift) |
+                    ((hi & high_mask) >> (8u - shift));
+                std::memcpy(out + i, &shifted, sizeof(shifted));
+            }
+            for (; i < packed_bytes; ++i)
+                out[i] = static_cast<uint8_t>(
+                    (src[i] << shift) | (src[i + 1] >> (8u - shift)));
+        }
+
+        const unsigned tail_bases = static_cast<unsigned>(len & 3u);
+        if (tail_bases != 0)
+            out[packed_bytes - 1] &= static_cast<uint8_t>(0xffu << (8u - 2u * tail_bases));
     }
 
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
@@ -197,7 +235,7 @@ template <uint16_t k, uint16_t m>
 struct SuperkmerReader
 {
     using hdr_t = sk_hdr_t<k, m>;
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);
 
     explicit SuperkmerReader(const std::string& path)
     {
@@ -232,11 +270,10 @@ struct SuperkmerReader
     bool next()
     {
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
-        hdr_t len, mp;
-        std::memcpy(&len, cur_,                sizeof(hdr_t));
-        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        record_ = cur_;
+        hdr_t len;
+        std::memcpy(&len, cur_, sizeof(hdr_t));
         if (len == 0) return false;
-        min_pos_ = mp;
         cur_ += HDR_BYTES;
 
         const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
@@ -245,13 +282,18 @@ struct SuperkmerReader
         ptr_ = reinterpret_cast<const uint8_t*>(cur_);
         len_ = len;
         cur_ += packed_bytes;
+        record_size_ = HDR_BYTES + packed_bytes;
         return true;
     }
 
+    void           reset()       noexcept { cur_ = map_; }
     const uint8_t* packed_data() const { return ptr_; }
+    const char*    record_data() const { return record_; }
+    size_t         record_size() const { return record_size_; }
     size_t         size()        const { return len_; }
-    hdr_t          min_pos()     const { return min_pos_; }
+    hdr_t          min_pos()     const { return sk_no_min<k, m>; }
     size_t         file_size()   const { return size_; }
+    size_t         data_size()   const { return size_; }
     bool           ok()          const { return map_ != nullptr; }
 
 private:
@@ -262,7 +304,8 @@ private:
     const char*    end_     = nullptr; // one past last byte
     const uint8_t* ptr_     = nullptr; // packed data of current superkmer
     size_t         len_     = 0;       // length of current superkmer (bases)
-    hdr_t          min_pos_ = 0;       // minimizer position in current superkmer
+    const char*    record_  = nullptr; // start of current encoded record
+    size_t         record_size_ = 0;   // bytes in current encoded record
 };
 
 
@@ -272,38 +315,46 @@ template <uint16_t k, uint16_t m>
 struct MemoryReader
 {
     using hdr_t = sk_hdr_t<k, m>;
-    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t HDR_BYTES = sizeof(hdr_t);
 
     MemoryReader() = default;
     explicit MemoryReader(const std::string& data) noexcept
-        : cur_(data.data()), end_(data.data() + data.size()) {}
+        : begin_(data.data()), cur_(data.data()), end_(data.data() + data.size()) {}
 
     bool next() noexcept
     {
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
-        hdr_t len, mp;
-        std::memcpy(&len, cur_,                sizeof(hdr_t));
-        std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
+        record_ = cur_;
+        hdr_t len;
+        std::memcpy(&len, cur_, sizeof(hdr_t));
         if (len == 0) return false;
-        min_pos_ = mp;
         cur_ += HDR_BYTES;
         const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
         if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
         ptr_  = reinterpret_cast<const uint8_t*>(cur_);
         len_  = len;
         cur_ += packed_bytes;
+        record_size_ = HDR_BYTES + packed_bytes;
         return true;
     }
 
+    void           reset()       noexcept { cur_ = begin_; }
     const uint8_t* packed_data() const noexcept { return ptr_; }
+    const char*    record_data() const noexcept { return record_; }
+    size_t         record_size() const noexcept { return record_size_; }
     size_t         size()        const noexcept { return len_; }
-    hdr_t          min_pos()     const noexcept { return min_pos_; }
+    hdr_t          min_pos()     const noexcept { return sk_no_min<k, m>; }
     bool           ok()          const noexcept { return cur_ != nullptr; }
+    size_t         data_size()   const noexcept {
+        return static_cast<size_t>(end_ - begin_);
+    }
 
 private:
+    const char*    begin_   = nullptr;
     const char*    cur_     = nullptr;
     const char*    end_     = nullptr;
     const uint8_t* ptr_     = nullptr;
     size_t         len_     = 0;
-    hdr_t          min_pos_ = 0;
+    const char*    record_  = nullptr;
+    size_t         record_size_ = 0;
 };
