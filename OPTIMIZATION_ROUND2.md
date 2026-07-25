@@ -196,6 +196,18 @@ s with tracking enabled.
   reduced the one-pair file from 38.40 GB to 34.64 GB, but raised Phase 2 from
   30.09 s to 31.58–31.79 s. The retained implementation instead groups equal
   widths into megabyte worker-local batches.
+- Replacing the partition-local Kache table with `ankerl::unordered_dense`
+  was tested using transparent heterogeneous lookup that passed Tuna's
+  precomputed canonical rolling hash directly into the map. It therefore did
+  not pay for a second per-k-mer hash. Dense won on a 3.2 GB compressed chicken
+  pair by 13.5 percent at 8 threads and 16.1 percent at 32 threads with KFF
+  generation directed to `/dev/null`. The result reversed on the 30.4 GB
+  compressed human pair: across alternating 32-thread runs, Kache averaged
+  28.89 s for Phase 2 plus KFF versus 31.88 s for dense, making Kache 10.3
+  percent faster at the target scale. Both produced 95,095,613,344 total and
+  7,589,178,026 distinct k-mers. An exact 2,175,246-row smoke comparison was
+  byte-identical. The dense backend was therefore rejected despite using 2.6
+  percent less peak memory in the forced in-memory human runs.
 
 The remaining difference is Phase 1 on the human pair: Tuna's 11.25 billion
 superkmers exceed KMC's 8.41 billion. Future work should target boundary
