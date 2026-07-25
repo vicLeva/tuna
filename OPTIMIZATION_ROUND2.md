@@ -201,13 +201,17 @@ s with tracking enabled.
   precomputed canonical rolling hash directly into the map. It therefore did
   not pay for a second per-k-mer hash. Dense won on a 3.2 GB compressed chicken
   pair by 13.5 percent at 8 threads and 16.1 percent at 32 threads with KFF
-  generation directed to `/dev/null`. The result reversed on the 30.4 GB
-  compressed human pair: across alternating 32-thread runs, Kache averaged
-  28.89 s for Phase 2 plus KFF versus 31.88 s for dense, making Kache 10.3
-  percent faster at the target scale. Both produced 95,095,613,344 total and
-  7,589,178,026 distinct k-mers. An exact 2,175,246-row smoke comparison was
-  byte-identical. The dense backend was therefore rejected despite using 2.6
-  percent less peak memory in the forced in-memory human runs.
+  generation directed to `/dev/null`. An initial human-pair run was invalidated
+  after identifying a concurrent 16-thread workload on the host. After waiting
+  for three consecutive quiet load/CPU/I/O samples, three alternating runs per
+  backend on the 30.4 GB compressed human pair gave Phase 2 plus KFF medians of
+  28.652 s for Kache and 29.162 s for dense; their means were 28.583 s and
+  28.716 s. Kache was therefore only 1.8 percent faster by median and 0.5
+  percent by mean, while dense varied much more (26.697-30.289 s versus
+  28.299-28.798 s) and used 2.5 percent less peak memory. Both produced
+  95,095,613,344 total and 7,589,178,026 distinct k-mers. An exact
+  2,175,246-row smoke comparison was byte-identical. The dense backend was
+  rejected because it was not a clear target-scale win.
 
 The remaining difference is Phase 1 on the human pair: Tuna's 11.25 billion
 superkmers exceed KMC's 8.41 billion. Future work should target boundary
