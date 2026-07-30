@@ -25,6 +25,7 @@
 #include <atomic>
 #include <exception>
 #include <algorithm>
+#include <chrono>
 
 
 // Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
@@ -65,6 +66,7 @@ public:
 
     bool empty() const noexcept { return ends_.empty(); }
     size_t size() const noexcept { return ends_.size(); }
+    size_t bases_size() const noexcept { return bases_.size(); }
 
     std::pair<const char*, size_t> chunk(size_t i) const noexcept
     {
@@ -102,6 +104,7 @@ void extract_superkmers_from_actg(
     static constexpr size_t HDR_MAX = static_cast<size_t>(std::numeric_limits<hdr_t>::max());
 
     if (seq_len < k) return;
+    kmer_count += seq_len - k + 1;
 
     // Pack the sequence once so overlapping superkmers can copy byte slices
     // instead of repacking the same bases repeatedly.
@@ -139,7 +142,6 @@ void extract_superkmers_from_actg(
             const auto min_pos = sk_no_min<k, m>;
             writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
-            kmer_count += sk_len - k + 1;
             ++sk_count;
             prev_hash    = new_hash;
             pid          = partition_fn(new_hash);
@@ -151,16 +153,16 @@ void extract_superkmers_from_actg(
     const auto min_pos = sk_no_min<k, m>;
     writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
-    kmer_count += sk_len - k + 1;
     ++sk_count;
 }
 
 
 // ─── Producer-consumer harness for compressed files ──────────────────────────
 //
-// Each parser producer owns an AsyncGzInput decompression thread and feeds a
-// shared queue. Remaining threads extract and partition superkmers. Capping
-// parser producers at n_threads/4 leaves enough consumers for minimizer work.
+// Parser producers feed a shared queue; remaining threads extract and partition
+// superkmers. Compressed FASTA uses synchronous producers because partitioning
+// dominates CPU. Other compressed formats overlap each parser with an
+// AsyncGzInput decompression thread.
 //
 // The queue is bounded (MAX_QUEUE batches) for backpressure.  Consumers flush
 // SuperkmerWriters to the shared bucket files under per-bucket mutexes.
@@ -177,22 +179,38 @@ PartitionStats partition_kmers_gz_pc_impl(
 {
     using Batch = ActgBatch;
 
-    constexpr size_t MAX_QUEUE  = 32;           // max batches in flight
-    constexpr size_t BATCH_SEQS = 512;          // sequences per batch
+    constexpr size_t MAX_QUEUE   = 32;       // max batches in flight
+    constexpr size_t BATCH_SEQS  = 512;      // sequences per batch
+    constexpr size_t BATCH_BASES = 8u << 20; // keep long FASTA batches parallel
+    constexpr size_t DYNAMIC_JOIN_BASES = 32u << 20;
+    constexpr auto BACKPRESSURE_WAIT = std::chrono::microseconds(50);
 
     const size_t n_parts = cfg.num_partitions;
-    const bool async_input = n_threads >= 3;
-    const size_t n_producers = async_input
-        ? std::min(gz_paths.size(), std::max(size_t(1), n_threads / 4))
-        : size_t(1);
+    const bool all_gz_fasta = std::all_of(
+        gz_paths.begin(), gz_paths.end(),
+        [](const std::string& path) {
+            return path.ends_with(".fa.gz") ||
+                   path.ends_with(".fasta.gz") ||
+                   path.ends_with(".fna.gz");
+        });
+    // Start with up to one input-capable worker per four requested threads.
+    // FASTA inflation stays synchronous because partitioning dominates on
+    // assemblies. Read files overlap each parser with an inflater, then reclaim
+    // that thread-budget slot for counting when its input is exhausted.
+    const bool async_input = n_threads >= 3 && !all_gz_fasta;
+    const size_t n_producers = std::min(
+        gz_paths.size(), std::max(size_t(1), n_threads / 4));
     const size_t n_consumers = n_threads -
         n_producers * (async_input ? size_t(2) : size_t(1));
 
     std::deque<Batch>       queue;
     std::deque<Batch>       free_batches;
+    size_t                  queued_bases = 0;
     std::mutex              q_mutex;
     std::condition_variable q_cv;
     size_t                  producers_done = 0;
+    size_t                  async_slots_released = 0;
+    size_t                  async_helpers_started = 0;
     std::atomic<size_t>     next_gz{0};
     std::exception_ptr      producer_error = nullptr;
     std::atomic<bool>       stop{false};
@@ -201,45 +219,126 @@ PartitionStats partition_kmers_gz_pc_impl(
 
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
-    // Producer: decompress gz via GzInput, use helicase SIMD parser to deliver
-    // ACTG-only chunks, accumulate into batches and push to the queue.
+    struct WorkerState {
+        MinimizerWindow<k, partition_m> min_it;
+        std::vector<SuperkmerWriter<k, m>> writers;
+        std::vector<uint8_t> packed_buf;
+        uint64_t seqs = 0;
+        uint64_t kmers = 0;
+        uint64_t superkmers = 0;
+
+        WorkerState(size_t parts, size_t flush_thresh)
+            : writers(parts, SuperkmerWriter<k, m>(flush_thresh)) {}
+    };
+
+    // Input-capable workers create partitioning state lazily. This avoids tens
+    // of thousands of per-partition writer allocations when a small read tail
+    // cannot amortize recruiting another consumer.
     auto producer_fn = [&]() {
-        auto feed = [&](auto& parser) {
-            while (true) {
+        bool producer_finished = false;
+        std::unique_ptr<WorkerState> worker_state;
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            auto ensure_state = [&]() -> WorkerState& {
+                if (!worker_state)
+                    worker_state = std::make_unique<WorkerState>(n_parts, flush_thresh);
+                return *worker_state;
+            };
+
+            auto process_batch = [&](Batch&& batch) {
+                auto& state = ensure_state();
+                auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                    if (ws[p].needs_flush()) flush_writer(ws[p], p);
+                };
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    if (stop.load(std::memory_order_relaxed)) break;
+                    const auto [chunk, chunk_len] = batch.chunk(i);
+                    extract_superkmers_from_actg<k, m, partition_m>(
+                        chunk, chunk_len, partition_fn,
+                        state.min_it, state.writers, state.kmers, state.superkmers,
+                        flush_fn, state.packed_buf);
+                    ++state.seqs;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(q_mutex);
+                    free_batches.push_back(std::move(batch));
+                }
+                q_cv.notify_one();
+            };
+
+            auto consume_one = [&]() -> bool {
                 Batch batch;
                 {
                     std::lock_guard<std::mutex> lk(q_mutex);
-                    if (!free_batches.empty()) {
-                        batch = std::move(free_batches.front());
-                        free_batches.pop_front();
+                    if (queue.empty()) return false;
+                    queued_bases -= queue.front().bases_size();
+                    batch = std::move(queue.front());
+                    queue.pop_front();
+                }
+                process_batch(std::move(batch));
+                return true;
+            };
+
+            auto feed = [&](auto& parser) {
+                    while (!stop.load(std::memory_order_relaxed)) {
+                        Batch batch;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (!free_batches.empty()) {
+                                batch = std::move(free_batches.front());
+                                free_batches.pop_front();
+                            }
+                        }
+                        batch.prepare(BATCH_SEQS);
+                        size_t chunk_count = 0;
+                        while (!stop.load(std::memory_order_relaxed)
+                               && chunk_count < BATCH_SEQS
+                               && batch.bases_size() < BATCH_BASES
+                               && parser.next()) {
+                            auto [ptr, len] = parser.get_dna_raw();
+                            batch.append(ptr, len);
+                            ++chunk_count;
+                        }
+                        if (stop.load(std::memory_order_relaxed) || batch.empty()) break;
+
+                        while (!stop.load(std::memory_order_relaxed)) {
+                            std::unique_lock<std::mutex> lk(q_mutex);
+                            if (queue.size() < MAX_QUEUE) {
+                                queued_bases += batch.bases_size();
+                                queue.push_back(std::move(batch));
+                                lk.unlock();
+                                q_cv.notify_one();
+                                break;
+                            }
+
+                            // A sole async parser is input-critical for a
+                            // single compressed stream. Keep it dedicated.
+                            if (async_input && n_producers == 1) {
+                                q_cv.wait(lk, [&] {
+                                    return stop.load(std::memory_order_relaxed) ||
+                                           queue.size() < MAX_QUEUE;
+                                });
+                                continue;
+                            }
+
+                            // Ignore transient fullness. Sustained backpressure
+                            // indicates that this worker is more valuable as a
+                            // partition consumer on the current workload.
+                            const bool ready = q_cv.wait_for(
+                                lk, BACKPRESSURE_WAIT, [&] {
+                                    return stop.load(std::memory_order_relaxed) ||
+                                           queue.size() < MAX_QUEUE;
+                                });
+                            if (ready) continue;
+                            lk.unlock();
+                            if (!consume_one()) std::this_thread::yield();
+                        }
                     }
-                }
-                batch.prepare(BATCH_SEQS);
-                size_t chunk_count = 0;
-                while (!stop.load(std::memory_order_relaxed)
-                       && chunk_count < BATCH_SEQS
-                       && parser.next()) {
-                    auto [ptr, len] = parser.get_dna_raw();
-                    batch.append(ptr, len);
-                    ++chunk_count;
-                }
-                if (stop.load(std::memory_order_relaxed)) break;
-                if (batch.empty()) break;
-                {
-                    std::unique_lock<std::mutex> lk(q_mutex);
-                    q_cv.wait(lk, [&] {
-                        return stop.load(std::memory_order_relaxed) ||
-                               queue.size() < MAX_QUEUE;
-                    });
-                    if (stop.load(std::memory_order_relaxed)) break;
-                    queue.push_back(std::move(batch));
-                }
-                q_cv.notify_one();
-            }
-        };
-        try {
+            };
+
             while (!stop.load(std::memory_order_relaxed)) {
-                const size_t file_idx = next_gz.fetch_add(1, std::memory_order_relaxed);
+                const size_t file_idx =
+                    next_gz.fetch_add(1, std::memory_order_relaxed);
                 if (file_idx >= gz_paths.size()) break;
                 const auto& gz_path = gz_paths[file_idx];
                 if (async_input) {
@@ -262,35 +361,84 @@ PartitionStats partition_kmers_gz_pc_impl(
                     }
                 }
             }
-        } catch (...) {
+
             {
                 std::lock_guard<std::mutex> lk(q_mutex);
+                ++producers_done;
+                if (async_input) ++async_slots_released;
+            }
+            producer_finished = true;
+            q_cv.notify_all();
+
+            // Drain until every producer has finished and no queued work remains.
+            bool should_drain = true;
+            if (!worker_state) {
+                std::lock_guard<std::mutex> lk(q_mutex);
+                should_drain = queued_bases >= DYNAMIC_JOIN_BASES;
+            }
+            if (should_drain) {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    Batch batch;
+                    {
+                        std::unique_lock<std::mutex> lk(q_mutex);
+                        q_cv.wait(lk, [&] {
+                            return stop.load(std::memory_order_relaxed) ||
+                                   !queue.empty() || producers_done == n_producers;
+                        });
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        if (queue.empty() && producers_done == n_producers) break;
+                        if (queue.empty()) continue;
+                        queued_bases -= queue.front().bases_size();
+                        batch = std::move(queue.front());
+                        queue.pop_front();
+                    }
+                    process_batch(std::move(batch));
+                }
+            }
+
+            if (worker_state) {
+                for (size_t p = 0; p < n_parts; ++p)
+                    flush_writer(worker_state->writers[p], p);
+                total_seqs.fetch_add(worker_state->seqs, std::memory_order_relaxed);
+                total_kmers.fetch_add(worker_state->kmers, std::memory_order_relaxed);
+                total_superkmers.fetch_add(
+                    worker_state->superkmers, std::memory_order_relaxed);
+            }
+        } catch (...) {
+            if (!producer_finished) {
+                std::lock_guard<std::mutex> lk(q_mutex);
+                ++producers_done;
+                if (async_input) ++async_slots_released;
+                producer_finished = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(consumer_error_mutex);
                 if (!producer_error) producer_error = std::current_exception();
             }
             stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
         }
-        {
-            std::lock_guard<std::mutex> lk(q_mutex);
-            ++producers_done;
-        }
-        q_cv.notify_all();
     };
 
-    // Consumer: pull batches from the queue and extract superkmers.
+    // Ordinary consumers keep their hot state stack-local so the compiler can
+    // retain counters and minimizer state in registers.
     auto consumer_fn = [&]() {
         try {
-            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
-            MinimizerWindow<k, partition_m>     min_it;
-            std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
-            std::vector<uint8_t>         packed_buf;
-            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+            const size_t flush_thresh =
+                writer_flush_threshold(n_parts, write_budget_per_thread);
+            MinimizerWindow<k, partition_m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(
+                n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> packed_buf;
+            uint64_t local_seqs = 0;
+            uint64_t local_kmers = 0;
+            uint64_t local_superkmers = 0;
 
             auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
                 if (ws[p].needs_flush()) flush_writer(ws[p], p);
             };
 
-            while (true) {
-                if (stop.load(std::memory_order_relaxed)) break;
+            while (!stop.load(std::memory_order_relaxed)) {
                 Batch batch;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
@@ -298,11 +446,14 @@ PartitionStats partition_kmers_gz_pc_impl(
                         return stop.load(std::memory_order_relaxed) ||
                                !queue.empty() || producers_done == n_producers;
                     });
-                    if (stop.load(std::memory_order_relaxed) || queue.empty()) break;
+                    if (stop.load(std::memory_order_relaxed)) break;
+                    if (queue.empty() && producers_done == n_producers) break;
+                    if (queue.empty()) continue;
+                    queued_bases -= queue.front().bases_size();
                     batch = std::move(queue.front());
                     queue.pop_front();
                 }
-                q_cv.notify_one();                  // wake producer if it was waiting for space
+                q_cv.notify_one();
 
                 for (size_t i = 0; i < batch.size(); ++i) {
                     if (stop.load(std::memory_order_relaxed)) break;
@@ -321,10 +472,9 @@ PartitionStats partition_kmers_gz_pc_impl(
 
             for (size_t p = 0; p < n_parts; ++p)
                 flush_writer(writers[p], p);
-
-            total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
-            total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
-            total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(consumer_error_mutex);
@@ -341,6 +491,26 @@ PartitionStats partition_kmers_gz_pc_impl(
         threads.emplace_back(producer_fn);
     for (size_t t = 0; t < n_consumers; ++t)
         threads.emplace_back(consumer_fn);
+    // AsyncGzInput consumes one thread-budget slot per producer. Keep its
+    // replacement asleep until that producer has finished all input, then use
+    // the released slot to help drain the remaining partition backlog.
+    if (async_input) {
+        for (size_t t = 0; t < n_producers; ++t) {
+            threads.emplace_back([&] {
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&] {
+                        return stop.load(std::memory_order_relaxed) ||
+                               async_helpers_started < async_slots_released;
+                    });
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    ++async_helpers_started;
+                    if (queued_bases < DYNAMIC_JOIN_BASES) return;
+                }
+                consumer_fn();
+            });
+        }
+    }
     for (auto& th : threads) th.join();
     if (producer_error) std::rethrow_exception(producer_error);
     if (consumer_error) std::rethrow_exception(consumer_error);
@@ -501,8 +671,9 @@ PartitionStats partition_kmers_mem_impl(
                            gz_path.compare(gz_path.size() - 3, 3, ".gz") == 0;
         if (is_gz) {
             using Batch = ActgBatch;
-            constexpr size_t MAX_QUEUE  = 32;
-            constexpr size_t BATCH_SEQS = 512;
+            constexpr size_t MAX_QUEUE   = 32;
+            constexpr size_t BATCH_SEQS  = 512;
+            constexpr size_t BATCH_BASES = 8u << 20;
             const bool async_input = n_threads >= 3;
             const size_t n_consumers = n_threads - (async_input ? 2 : 1);
 
@@ -533,6 +704,7 @@ PartitionStats partition_kmers_mem_impl(
                         size_t chunk_count = 0;
                         while (!stop.load(std::memory_order_relaxed)
                                && chunk_count < BATCH_SEQS
+                               && batch.bases_size() < BATCH_BASES
                                && parser.next()) {
                             auto [ptr, len] = parser.get_dna_raw();
                             batch.append(ptr, len);
