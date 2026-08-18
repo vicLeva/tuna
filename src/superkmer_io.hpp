@@ -57,6 +57,8 @@ struct SuperkmerWriter
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
     static constexpr size_t HDR_BYTES = sizeof(hdr_t);
+    static constexpr size_t MAX_RECORD_BYTES =
+        HDR_BYTES + (static_cast<size_t>(2u * k - m) + 3u) / 4u;
 
     char*  raw_  = nullptr;  // raw buffer pointer
     size_t sz_   = 0;        // used bytes
@@ -68,7 +70,10 @@ struct SuperkmerWriter
     size_t flush_threshold;
 
     explicit SuperkmerWriter(size_t flush_thresh = 512u << 10)
-        : cap_(flush_thresh), flush_threshold(flush_thresh)
+        // flush is checked after append, so retain one full-record of slack.
+        // Otherwise every active writer eventually grows and doubles just
+        // before the caller clears it.
+        : cap_(flush_thresh + MAX_RECORD_BYTES), flush_threshold(flush_thresh)
     {
         raw_ = static_cast<char*>(::operator new(cap_));
     }
@@ -243,8 +248,12 @@ struct SuperkmerReader
         if (fd_ < 0) return;
 
         struct stat sb;
-        if (fstat(fd_, &sb) < 0 || sb.st_size == 0) return;
+        if (fstat(fd_, &sb) < 0) return;
         size_ = static_cast<size_t>(sb.st_size);
+        if (size_ == 0) {
+            ok_ = true;
+            return;
+        }
 
         void* p = mmap(nullptr, size_, PROT_READ,
                        MAP_PRIVATE | MAP_POPULATE, fd_, 0);
@@ -256,6 +265,7 @@ struct SuperkmerReader
 
         cur_ = map_;
         end_ = map_ + size_;
+        ok_ = true;
     }
 
     ~SuperkmerReader()
@@ -269,6 +279,7 @@ struct SuperkmerReader
 
     bool next()
     {
+        if (cur_ == nullptr) return false;
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
         record_ = cur_;
         hdr_t len;
@@ -294,7 +305,7 @@ struct SuperkmerReader
     hdr_t          min_pos()     const { return sk_no_min<k, m>; }
     size_t         file_size()   const { return size_; }
     size_t         data_size()   const { return size_; }
-    bool           ok()          const { return map_ != nullptr; }
+    bool           ok()          const { return ok_; }
 
 private:
     int            fd_      = -1;      // file descriptor
@@ -302,6 +313,7 @@ private:
     const char*    map_     = nullptr; // mmap base pointer
     const char*    cur_     = nullptr; // read cursor
     const char*    end_     = nullptr; // one past last byte
+    bool           ok_      = false;
     const uint8_t* ptr_     = nullptr; // packed data of current superkmer
     size_t         len_     = 0;       // length of current superkmer (bases)
     const char*    record_  = nullptr; // start of current encoded record

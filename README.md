@@ -91,18 +91,18 @@ cmake .. -DFIXED_K=256 -DFIXED_M=31
 This produces a single-instantiation binary locked to that (k, m) pair. Those values become the defaults — `-k` and `-m` at runtime must match or the binary exits with an error. Build is faster and the binary is smaller. The same mechanism works for k ≤ 31 if you want a leaner binary:
 
 ```bash
-cmake .. -DFIXED_K=31 -DFIXED_M=15
+cmake .. -DFIXED_K=31 -DFIXED_M=17
 ```
 
 If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
 
 ```bash
-cmake -S . -B build_k31_m15  -DFIXED_K=31  -DFIXED_M=15  && cmake --build build_k31_m15  --target tuna -j$(nproc)
+cmake -S . -B build_k31_m17  -DFIXED_K=31  -DFIXED_M=17  && cmake --build build_k31_m17  --target tuna -j$(nproc)
 cmake -S . -B build_k63_m21  -DFIXED_K=63  -DFIXED_M=21  && cmake --build build_k63_m21  --target tuna -j$(nproc)
 cmake -S . -B build_k127_m25 -DFIXED_K=127 -DFIXED_M=25  && cmake --build build_k127_m25 --target tuna -j$(nproc)
 ```
 
-Each directory contains its own `tuna` binary: `build_k31_m15/tuna`, `build_k63_m21/tuna`, etc.
+Each directory contains its own `tuna` binary: `build_k31_m17/tuna`, `build_k63_m21/tuna`, etc.
 
 <details>
 <summary><strong>Other compile-time options</strong></summary>
@@ -131,7 +131,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
-| `-m` | `<int>` | `15` | Partition minimizer length. Any value in `[1, min(k-1, 32)]`; `15` balances compact superkmers with partition entropy. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
+| `-m` | `<int>` | `17` | Partition minimizer length. Any value in `[1, min(k-1, 32)]`; `17` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
 | `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
@@ -206,7 +206,7 @@ TGCATGCATGCATGCATGCATGCATGCATGC	7
 
 ### KFF binary (`-kff` or `.kff` extension)
 
-[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with a lossless 1–4 byte big-endian count. Tuna changes KFF raw sections as needed so each output batch uses the smallest count width it requires. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
+[K-mer File Format](https://github.com/Kmer-File-Format/kff-reference) binary output. Each k-mer is stored as a 2-bit packed sequence (A=0, C=1, G=2, T=3) with its smallest lossless 1–4 byte big-endian count. Workers batch records by count width before writing KFF raw sections, avoiding per-record section changes. The file is marked `canonical=true` and `unique=true` (or `canonical=false` when `-b` is used). Roughly 3–4× smaller than TSV for k=31.
 
 KFF files can be read with [kff-cpp-api](https://github.com/Kmer-File-Format/kff-cpp-api) or any other KFF-compatible tool.
 
