@@ -17,7 +17,10 @@ class FastqParser {
     FastqLexer<CONFIG, I> lexer_;
 
     bool finished_ = false;
-    int line_count_ = 0;
+    uint64_t line_count_ = 0;   // must be unsigned+64-bit: a signed int overflows
+                                // at 2^31 lines (536.9M FASTQ records), after which
+                                // line_count_ % 4 goes negative and the switch below
+                                // matches no case -> infinite loop.
     FastqChunk block_{};
     size_t block_counter_ = 0;
     size_t pos_in_block_ = 0;
