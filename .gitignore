@@ -38,3 +38,4 @@ tools/*.png
 
 .claude/
 .codex
+benchmark/legacy/
