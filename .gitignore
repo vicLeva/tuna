@@ -39,3 +39,4 @@ tools/*.png
 .claude/
 .codex
 benchmark/legacy/
+OPTIMIZATION_ROUND2.md
