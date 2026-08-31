@@ -328,14 +328,20 @@ uint64_t count_partition_aggregated(
     uint64_t total_inserted = 0;
     const auto replay_start = std::chrono::steady_clock::now();
 
+    // Record layout is [len][min_pos][packed]; the packed bases start after
+    // BOTH header fields. min_pos is carried out too, so a replayed superkmer
+    // is routed by the same minimizer the direct path would use — otherwise
+    // the same k-mer lands in two buckets and is counted twice.
     auto decode_record = [](const std::string_view record,
                             const uint8_t*& packed,
-                            size_t& len) {
+                            size_t& len,
+                            hdr_t& min_pos) {
         hdr_t encoded_len;
         std::memcpy(&encoded_len, record.data(), sizeof(hdr_t));
+        std::memcpy(&min_pos, record.data() + sizeof(hdr_t), sizeof(hdr_t));
         len = static_cast<size_t>(encoded_len);
         packed = reinterpret_cast<const uint8_t*>(
-            record.data() + sizeof(hdr_t));
+            record.data() + 2 * sizeof(hdr_t));
     };
 
     auto it = multiplicities.begin();
@@ -346,11 +352,13 @@ uint64_t count_partition_aggregated(
 
     const uint8_t* cur_packed = nullptr;
     size_t cur_len = 0;
+    hdr_t cur_min_pos = sk_no_min<k, m>;
     uint32_t cur_multiplicity = 0;
     if (it != end) {
-        decode_record(it->first, cur_packed, cur_len);
+        decode_record(it->first, cur_packed, cur_len, cur_min_pos);
         cur_multiplicity = it->second;
-        win->init_packed_known_out(cur_packed);
+        if (cur_min_pos != sk_no_min<k, m>) win->init_packed_with_min(cur_packed, cur_min_pos);
+        else                                win->init_packed_known_out(cur_packed);
         table.prefetch(*win);
         ++it;
     }
@@ -358,9 +366,11 @@ uint64_t count_partition_aggregated(
     while (it != end) {
         const uint8_t* next_packed = nullptr;
         size_t next_len = 0;
-        decode_record(it->first, next_packed, next_len);
+        hdr_t next_min_pos = sk_no_min<k, m>;
+        decode_record(it->first, next_packed, next_len, next_min_pos);
         const uint32_t next_multiplicity = it->second;
-        next_win->init_packed_known_out(next_packed);
+        if (next_min_pos != sk_no_min<k, m>) next_win->init_packed_with_min(next_packed, next_min_pos);
+        else                                 next_win->init_packed_known_out(next_packed);
         table.prefetch(*next_win);
 
         total_inserted += count_initialized_superkmer_record<k, m, canonical_>(

@@ -45,6 +45,19 @@ namespace kache_hash
 
 template <uint16_t k, uint16_t l> class Kmer_Window;
 
+// Bucket hash for a minimizer's canonical ntHash. ntHash is well distributed
+// but adjacent l-mers share structure, so it is finalised through splitmix64's
+// mixer before being masked down to a bucket index. Used by the insert path
+// (once per superkmer, amortised over every k-mer sharing that minimizer) and
+// by resize, which must reproduce the same bucket from a stored key.
+inline constexpr uint64_t bucket_hash_from_minimizer(uint64_t h) noexcept
+{
+    h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
 
 // Hash table particularly suited for streaming `k`-mer operations. `mt_`
 // denotes whether a concurrent table is desired. If a hash map is required, the
@@ -443,20 +456,33 @@ public:
         // Prefetch the metadata cache line (cs[32] + min_coord[32] = 64 bytes).
         // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
         // touched on a checksum match, which is rare at low load factors.
-        const auto pf_h = w.rh.hash();
+        const auto pf_h = w.has_minimizer() ? w.minimizer_bucket_hash() : w.rh.hash();
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
     // Issues a non-blocking L1 prefetch from packed k-mer data.
     void prefetch_packed(const uint8_t* packed, const uint16_t min_pos) const
     {
-        (void)min_pos;
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
-        char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        Rolling_Hash<k, true> route_hash(buf);
-        const uint64_t pf_h = route_hash.hash();
+        uint64_t pf_h;
+        if (min_pos != std::numeric_limits<uint16_t>::max()) {
+            // Decode only the minimizer's l bases, not the whole k-mer: O(l)
+            // instead of O(k), and it names the same bucket the upsert will hit.
+            char buf_l[l];
+            for (uint16_t i = 0; i < l; ++i) {
+                const uint16_t pos = static_cast<uint16_t>(min_pos + i);
+                buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
+            }
+            nt_hash::Roller<l> roller;
+            roller.init(buf_l);
+            pf_h = bucket_hash_from_minimizer(roller.canonical());
+        } else {
+            char buf[k];
+            for (uint16_t i = 0; i < k; ++i)
+                buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
+            Rolling_Hash<k, true> route_hash(buf);
+            pf_h = route_hash.hash();
+        }
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
@@ -520,9 +546,15 @@ class Kmer_Window
     Rolling_Hash<k, true> rh;
     MinimizerWindow<k, l> nt_min;
     uint64_t              precomp_nt_h_ = 0;
+    uint64_t              precomp_bucket_h_ = 0;
     bool                  use_precomp_  = false;
 
+
 public:
+
+    // Read-only view of the current k-mer. Streaming_Kmer_Hash_Table reaches
+    // `v` directly as a friend; alternative phase-2 tables go through this.
+    const Directed_Vertex<k>& vertex() const noexcept { return v; }
 
     // Initializes the k-mer window at the beginning of the ASCII sequence `s`.
     void init(const char* const s)
@@ -561,6 +593,7 @@ public:
         v = Directed_Vertex<k>(Kmer<k>(s));
         rh.init(s);
         precomp_nt_h_ = nt_h;
+        precomp_bucket_h_ = bucket_hash_from_minimizer(nt_h);
         use_precomp_  = true;
     }
 
@@ -577,6 +610,7 @@ public:
         v = Directed_Vertex<k>(Kmer<k>(buf));
         rh.init(buf);
         precomp_nt_h_ = nt_h;
+        precomp_bucket_h_ = bucket_hash_from_minimizer(nt_h);
         use_precomp_  = true;
     }
 
@@ -587,15 +621,24 @@ public:
     // init_packed_with_hash(packed, mh) — eliminates one full decode pass.
     uint64_t init_packed_with_min(const uint8_t* packed, uint16_t min_pos)
     {
+        // Same packed-native initialisation as init_packed_known_out: decoding
+        // the whole k-mer to ASCII and rebuilding Kmer/Rolling_Hash from a char
+        // buffer costs several times more than the entire rest of the window
+        // setup, and is paid once per superkmer.
+        v.from_packed_2bit_msb(packed);
+        rh.init_packed_2bit_msb_known_out(packed);
+
+        // Only the minimizer's l bases need decoding, for the ntHash roller.
         static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
-        char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        v = Directed_Vertex<k>(Kmer<k>(buf));
-        rh.init(buf);
+        char buf_l[l];
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint16_t pos = static_cast<uint16_t>(min_pos + i);
+            buf_l[i] = B2C[(packed[pos >> 2] >> (6u - 2u * (pos & 3u))) & 3u];
+        }
         nt_hash::Roller<l> roller;
-        roller.init(buf + min_pos);
+        roller.init(buf_l);
         precomp_nt_h_ = roller.canonical();
+        precomp_bucket_h_ = bucket_hash_from_minimizer(precomp_nt_h_);
         use_precomp_  = true;
         return precomp_nt_h_;
     }
@@ -640,6 +683,14 @@ public:
     // Returns the ntHash of the l-minimizer of the current k-mer.
     // Returns precomputed hash if provided at init.
     auto minimizer_hash() const { return use_precomp_ ? precomp_nt_h_ : nt_min.hash(); }
+
+    // Bucket hash for the current superkmer's minimizer. Cached when the
+    // window was initialised with a known minimizer, which is the hot path.
+    uint64_t minimizer_bucket_hash() const
+    { return use_precomp_ ? precomp_bucket_h_ : bucket_hash_from_minimizer(nt_min.hash()); }
+
+    // True when this window carries a minimizer, i.e. can be minimizer-routed.
+    bool has_minimizer() const noexcept { return use_precomp_; }
 
     // Same as minimizer_hash() with min_coord output (used by upsert/insert).
     uint64_t minimizer_nt_hash(uint8_t& m) const
@@ -1029,7 +1080,7 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const K
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     m = 0;
-    const auto h = w.rh.hash();
+    const auto h = w.has_minimizer() ? w.minimizer_bucket_hash() : w.rh.hash();
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
@@ -1068,7 +1119,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert(const K
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     m = 0;
-    const auto h = w.rh.hash();
+    const auto h = w.has_minimizer() ? w.minimizer_bucket_hash() : w.rh.hash();
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
@@ -1108,9 +1159,13 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::upsert(const K
     uint8_t m;
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     m = 0;
-    const auto nt_h = w.rh.hash();
-    const auto h = nt_h;
-
+    // Route by the minimizer, not by the k-mer's own rolling hash: every k-mer
+    // of a superkmer shares one minimizer, so they all land in one bucket and
+    // the whole superkmer costs a single LLC miss instead of one per k-mer.
+    // Falls back to the rolling hash only for superkmers that carry no
+    // minimizer coordinate.
+    const auto nt_h = w.minimizer_hash();
+    const auto h = w.has_minimizer() ? w.minimizer_bucket_hash() : w.rh.hash();
     tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const Kmer<k>& key_ = canonical_ ? w.v.canonical() : w.v.kmer();
@@ -1233,10 +1288,12 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::insert_at_resi
 {
     const auto idx_mask = cap_ - 1;
 
+    // A resize must reproduce exactly the bucket the insert path chose, or the
+    // same k-mer ends up in two buckets and is counted twice. Inserts route by
+    // the superkmer's minimizer, so rehashing derives that same minimizer from
+    // the stored key rather than using the k-mer's own rolling hash.
     const auto key = this->key(x);
-    Rolling_Hash<k, true> route_hash;
-    route_hash.init(key);
-    const auto h = route_hash.hash();
+    const auto h = bucket_hash_from_minimizer(minimizer_nt_hash_from_key(key));
 
     const auto b = h & idx_mask;
     if(try_insert_at_resize(x, c, m, b))
@@ -1443,7 +1500,7 @@ template <uint16_t k, bool mt_, typename T_, uint16_t l, bool canonical_>
 inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l, canonical_>::find(const Kmer_Window<k, l>& w) const -> find_ret_t
 {
     const Kmer<k>& key = canonical_ ? w.v.canonical() : w.v.kmer();
-    const auto h = w.rh.hash();
+    const auto h = w.has_minimizer() ? w.minimizer_bucket_hash() : w.rh.hash();
     const auto idx_mask = cap_ - 1;
 
     const auto b = h & idx_mask;

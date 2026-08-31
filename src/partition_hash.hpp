@@ -133,24 +133,33 @@ void extract_superkmers_from_actg(
     uint64_t prev_hash = min_it.hash();
     size_t   pid          = partition_fn(prev_hash);  // partition id
     size_t   sk_start     = 0;                        // superkmer start position in current sequence
+    // Absolute position of the minimizer the current superkmer is built on.
+    // Phase 2 routes every k-mer of the superkmer to the bucket of this l-mer,
+    // so it must be the very l-mer phase 1 minimised on — hence it is read from
+    // min_it rather than recomputed. min_lmer_pos() is only touched once per
+    // superkmer, at a boundary, not once per base.
+    size_t   cur_min_abs  = min_it.min_lmer_pos();
 
     for (size_t pos = k; pos < seq_len; ++pos) {
         min_it.advance(seq[pos]);
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = sk_no_min<k, m>;
+            const auto min_pos = static_cast<hdr_t>(cur_min_abs - sk_start);
             writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             ++sk_count;
             prev_hash    = new_hash;
             pid          = partition_fn(new_hash);
             sk_start     = pos - (k - 1);
+            // min_it now spans exactly the first k-mer of the new superkmer,
+            // so this is that superkmer's minimizer.
+            cur_min_abs  = min_it.min_lmer_pos();
         }
     }
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = sk_no_min<k, m>;
+    const auto min_pos = static_cast<hdr_t>(cur_min_abs - sk_start);
     writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     ++sk_count;
