@@ -33,7 +33,8 @@ one CSV per experiment.
 Useful overrides: `ROOT`, `DATA_ROOT`, `K`, `M`, `THREADS`, `RAM_GB`,
 `TIMEOUT_S`, `FASTK_TIMEOUT_S`, `THREAD_LIST`, and for side experiments
 `FORCE_M` (one minimizer length everywhere, ignoring the per-dataset values),
-`ONLY_TOOLS` (a subset of `tuna kmc fastk`), `MAX_FILES` (cap per dataset) and
+`ONLY_TOOLS` (a subset of `tuna kmc fastk`), `ONLY_MODES` (a subset of
+`bin ascii`), `MAX_FILES` (cap per dataset) and
 `KEEP_OUTPUT` (see below).
 
 ## k-mer statistics

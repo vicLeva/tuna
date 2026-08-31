@@ -876,6 +876,38 @@ inline void emit_debug_stats(
                   << "dbg_parts_resized: " << n_parts_resized                     << "\n";
     }
 
+    // ── Per-resize CSV: how each partition's table grew ───────────────────────
+    // init_sz is the capacity of the first round; every resize doubles it, so
+    // round r has capacity old_cap and round r+1 has 2*old_cap. The aggregate
+    // report only counts resizes, which hides the size trajectory.
+    {
+        const std::string csv_path = cfg.work_dir + "debug_resize_events.csv";
+        std::ofstream csv(csv_path);
+        if (csv) {
+            csv << "partition_id,round,cap_before,cap_after,trigger,elapsed_s,main_sz,ov_count\n";
+            for (size_t p = 0; p < n_parts; ++p) {
+                const auto& d = part_infos[p];
+                // Round 0 is the initial allocation, before any resize.
+                csv << p << ",0," << d.init_sz << "," << d.init_sz
+                    << ",initial,0,0,0\n";
+                size_t r = 1;
+                for (const auto& ev : d.resize_log) {
+                    csv << p              << ","
+                        << r++            << ","
+                        << ev.old_cap     << ","
+                        << (ev.old_cap * 2) << ","
+                        << (ev.overflow_triggered ? "overflow" : "load") << ","
+                        << std::fixed << std::setprecision(6) << ev.elapsed_s << ","
+                        << ev.main_sz     << ","
+                        << ev.ov_count    << "\n";
+                }
+            }
+            std::cerr << "[debug] resize events CSV: " << csv_path << "\n";
+        } else {
+            std::cerr << "[debug] warning: could not write resize events CSV to " << csv_path << "\n";
+        }
+    }
+
     // ── Per-partition CSV (all partitions) ────────────────────────────────────
     {
         const std::string csv_path = cfg.work_dir + "debug_table_stats.csv";

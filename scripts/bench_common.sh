@@ -87,6 +87,11 @@ export LC_ALL=C LANG=C
 : "${FORCE_M:=}"
 : "${ONLY_TOOLS:=}"
 : "${MAX_FILES:=0}"
+# ONLY_MODES  subset of "bin ascii" to measure. Comparing two counting-table
+#             implementations only needs `bin`: the ascii run repeats the same
+#             counting work and adds TSV formatting, which such a change does
+#             not touch, so it doubles the cost for no signal.
+: "${ONLY_MODES:=}"
 # KEEP_OUTPUT  directory in which to preserve the BINARY output of each run
 #              instead of deleting it (KMC .kmc_pre/.kmc_suf, tuna .kff).
 #              ASCII output is never kept: it is ~40 bytes per distinct k-mer
@@ -159,6 +164,9 @@ se_val()  { grep -m1 "^${1}:" "$2" 2>/dev/null | awk -F: '{v=$2;gsub(/^ +/,"",v)
 kmc_num() { grep -m1 "$1" "$2" 2>/dev/null | awk -F: '{gsub(/^ +/,"",$2);print $2}'; }
 
 row() { echo "$1" >> "$CSV"; }
+
+# Is this output mode part of the run? (ONLY_MODES empty means both)
+mode_enabled() { [[ -z "$ONLY_MODES" || " $ONLY_MODES " == *" $1 "* ]]; }
 
 have_stats() { [[ -f "${SCSV:-}" ]] && awk -F, -v d="$1" -v k="$2" 'NR>1 && $1==d && $2==k {f=1} END{exit !f}' "$SCSV"; }
 
@@ -253,6 +261,7 @@ run_tuna() {
     local ds="$1" key="$2" label="$3" input="$4" mode out tag tf se rc st
     local mm="${FORCE_M:-$M}"
     for mode in bin ascii; do
+        mode_enabled "$mode" || continue
         have_run "$ds" "$key" tuna "$mode" && { echo "    [tuna $mode] already measured"; continue; }
         tag="${ds}_${key}_tuna_${mode}"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"
         [[ $mode == bin ]] && out="$WORK/out.kff" || out="$WORK/out.tsv"
@@ -283,6 +292,8 @@ run_kmc() {
     local need_bin=1 need_ascii=1
     have_run "$ds" "$key" kmc bin   && need_bin=0
     have_run "$ds" "$key" kmc ascii && need_ascii=0
+    mode_enabled ascii || need_ascii=0
+    mode_enabled bin   || need_bin=0
     (( need_bin == 0 && need_ascii == 0 )) && { echo "    [kmc] already measured"; return; }
 
     tag="${ds}_${key}_kmc"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"; dt="$AUX/$tag.dumptime"
@@ -342,6 +353,8 @@ run_fastk() {
     local need_bin=1 need_ascii=1
     have_run "$ds" "$key" fastk bin   && need_bin=0
     have_run "$ds" "$key" fastk ascii && need_ascii=0
+    mode_enabled ascii || need_ascii=0
+    mode_enabled bin   || need_bin=0
     (( need_bin == 0 && need_ascii == 0 )) && { echo "    [fastk] already measured"; return; }
 
     tag="${ds}_${key}_fastk"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"; dt="$AUX/$tag.dumptime"
