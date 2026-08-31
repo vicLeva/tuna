@@ -524,6 +524,10 @@ class Kmer_Window
 
 public:
 
+    // Read-only view of the current k-mer. Streaming_Kmer_Hash_Table reaches
+    // `v` directly as a friend; alternative phase-2 tables go through this.
+    const Directed_Vertex<k>& vertex() const noexcept { return v; }
+
     // Initializes the k-mer window at the beginning of the ASCII sequence `s`.
     void init(const char* const s)
     {
