@@ -40,6 +40,15 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
+# Phase-2 counting table: kache quotienting table (default) or unordered_dense.
+option(TUNA_PHASE2_DENSE "Use ankerl::unordered_dense for the phase-2 counting table" OFF)
+if(TUNA_PHASE2_DENSE)
+    add_compile_definitions(TUNA_PHASE2_DENSE)
+    message(STATUS "phase-2 counting table: ankerl::unordered_dense")
+else()
+    message(STATUS "phase-2 counting table: kache-hash")
+endif()
+
 # ── ankerl::unordered_dense for phase-2 superkmer aggregation ─────────────────
 FetchContent_Declare(
     unordered_dense

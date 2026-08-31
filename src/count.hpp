@@ -35,6 +35,18 @@
 #include <ankerl/unordered_dense.h>
 #include "xxHash/xxhash.h"
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
+#include "dense_kmer_table.hpp"
+
+// Phase-2 counting table. Build with -DTUNA_PHASE2_DENSE to swap the kache
+// quotienting table for an ankerl::unordered_dense map; see
+// include/dense_kmer_table.hpp for what that costs and what it buys.
+#ifdef TUNA_PHASE2_DENSE
+template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
+using phase2_table_t = tuna::Dense_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
+#else
+template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
+using phase2_table_t = kache_hash::Streaming_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
+#endif
 
 
 // Returns the smallest power of two >= v (returns 1 for v == 0).
@@ -77,8 +89,8 @@ struct PartitionDebugInfo {
 template <uint16_t k, uint16_t m, bool canonical_ = true, typename Reader = SuperkmerReader<k, m>>
 uint64_t count_partition(
     Reader&                                                                          reader,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>&        table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
+    phase2_table_t<k, false, uint32_t, m, canonical_>&        table,
+    typename phase2_table_t<k, false, uint32_t, m, canonical_>::Token& token,
     PartitionDebugInfo* dbg = nullptr)
 {
     using hdr_t = sk_hdr_t<k, m>;              // superkmer header type (local alias)
@@ -183,8 +195,8 @@ uint64_t count_initialized_superkmer_record(
     size_t len,
     uint32_t multiplicity,
     kache_hash::Kmer_Window<k, m>& win,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>& table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
+    phase2_table_t<k, false, uint32_t, m, canonical_>& table,
+    typename phase2_table_t<k, false, uint32_t, m, canonical_>::Token& token)
 {
     if (len < k || multiplicity == 0) return 0;
 
@@ -209,8 +221,8 @@ uint64_t count_superkmer_record(
     const uint8_t* packed,
     size_t len,
     uint32_t multiplicity,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>& table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token)
+    phase2_table_t<k, false, uint32_t, m, canonical_>& table,
+    typename phase2_table_t<k, false, uint32_t, m, canonical_>::Token& token)
 {
     if (len < k || multiplicity == 0) return 0;
 
@@ -259,8 +271,8 @@ uint64_t count_partition_aggregated(
     Reader& reader,
     SuperkmerDedupMode mode,
     size_t memory_budget,
-    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>& table,
-    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>::Token& token,
+    phase2_table_t<k, false, uint32_t, m, canonical_>& table,
+    typename phase2_table_t<k, false, uint32_t, m, canonical_>::Token& token,
     PartitionDebugInfo* dbg = nullptr,
     SuperkmerDedupStats* stats = nullptr)
 {
@@ -414,7 +426,7 @@ inline void emit_superkmer_dedup_stats(const SuperkmerDedupStats& stats)
 
 template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t write_counts(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
+    phase2_table_t<k, mt_, uint32_t, m, canonical_>& table,
     const Config&   cfg,
     std::string&    chunk,
     std::ofstream&  out,
@@ -556,7 +568,7 @@ private:
 
 template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true>
 uint64_t count_filtered(
-    const kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
+    const phase2_table_t<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg)
 {
     if (cfg.ci <= 1 && cfg.cx >= std::numeric_limits<uint32_t>::max())
@@ -581,7 +593,7 @@ uint64_t count_filtered(
 
 template <uint16_t k, uint16_t m, bool mt_ = false, bool canonical_ = true, typename Callback>
 uint64_t write_counts_callback(
-    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m, canonical_>& table,
+    phase2_table_t<k, mt_, uint32_t, m, canonical_>& table,
     const Config& cfg,
     Callback& cb)
 {
@@ -621,7 +633,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
     std::vector<std::string>& part_bufs,
     Callback&&                cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;  // hash table type (local alias)
+    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;  // hash table type (local alias)
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -700,7 +712,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
     uint64_t      total_kmers,
     Callback&&    cb)
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
+    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -1063,7 +1075,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
     std::ofstream* out,       // non-null for TSV output
     KffOutput*     kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
+    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
@@ -1240,7 +1252,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     std::ofstream*            out,       // non-null for TSV output
     KffOutput*                kff_out)   // non-null for KFF output
 {
-    using table_t = kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m, canonical_>;
+    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
     const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
