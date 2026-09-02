@@ -53,7 +53,7 @@ endif()
 FetchContent_Declare(
     unordered_dense
     GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
-    GIT_TAG        v4.4.0
+    GIT_TAG        v4.10.0
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(unordered_dense)
