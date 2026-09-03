@@ -1,11 +1,11 @@
 #pragma once
 // Dense_Kmer_Hash_Table — phase-2 counting table backed by ankerl::unordered_dense.
 //
-// Drop-in for the subset of kache_hash::Streaming_Kmer_Hash_Table that
-// src/count.hpp actually uses, so the two can be swapped with a compile flag
-// and benchmarked against each other:
-//
-//     cmake -DTUNA_PHASE2_DENSE=ON ...
+// This is the phase-2 counting table. It implements the subset of
+// kache_hash::Streaming_Kmer_Hash_Table that src/count.hpp uses, which is what
+// let the two be benchmarked against each other; unordered_dense won on every
+// dataset in the paper suite and became the default. The quotienting table is
+// preserved on branch feat/kmer-routing.
 //
 // ---------------------------------------------------------------------------
 // The trade-off this exists to measure

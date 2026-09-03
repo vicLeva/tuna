@@ -37,16 +37,13 @@
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 #include "dense_kmer_table.hpp"
 
-// Phase-2 counting table. Build with -DTUNA_PHASE2_DENSE to swap the kache
-// quotienting table for an ankerl::unordered_dense map; see
-// include/dense_kmer_table.hpp for what that costs and what it buys.
-#ifdef TUNA_PHASE2_DENSE
+// Phase-2 counting table. kache-hash's quotienting table is still included for
+// Kmer, Kmer_Window and ResizeEvent, but no longer counts: measurements across
+// the paper suite put unordered_dense ahead on every dataset (1.3-1.7x on
+// phase 2), at equal peak memory. The quotienting version lives on
+// feat/kmer-routing if it is ever needed again.
 template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
 using phase2_table_t = tuna::Dense_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
-#else
-template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
-using phase2_table_t = kache_hash::Streaming_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
-#endif
 
 
 // Returns the smallest power of two >= v (returns 1 for v == 0).
