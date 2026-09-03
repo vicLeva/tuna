@@ -64,7 +64,7 @@ err=0
 (( err )) && exit 1
 
 [[ -f "$CSV" ]]  || echo "dataset,n,n_parts,wall_s,phase1_s,phase2_s,rss_mb,unique_kmers,total_kmers,status" > "$CSV"
-[[ -f "$PCSV" ]] || echo "dataset,n,n_parts,parts_nonempty,uniq_mean,uniq_median,uniq_min,uniq_max,inserted_mean,init_sz_mean,cap_mean,load_mean,n_resizes_total,parts_resized" > "$PCSV"
+[[ -f "$PCSV" ]] || echo "dataset,n,n_parts,parts_nonempty,uniq_mean,uniq_median,uniq_min,uniq_max,inserted_mean,init_sz_mean,init_cap_mean,cap_mean,load_mean,parts_grown,n_resizes_total,parts_resized" > "$PCSV"
 
 echo "[bench] experiment : nsweep"
 echo "[bench] k=$K m=$M threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s"
@@ -131,31 +131,35 @@ for spec in $DATASETS; do
         out="$DBG/${ds}_n${n}"
         run_once "$ds" "$fof" "$mm" "$n" "-dbg" "$out"
         if [[ $ST != ok || ! -s "$out/debug_table_stats.csv" ]]; then
-            echo "$ds,$n,,,,,,,,,,,," >> "$PCSV"
+            echo "$ds,$n,,,,,,,,,,,,,," >> "$PCSV"
             echo "    [stats] [$ST] n=$n"
             continue
         fi
-        # partition_id,init_sz,table_cap,n_inserted,n_unique,load_factor,n_resizes,resize_s
+        # partition_id,init_sz,init_cap,table_cap,n_inserted,n_unique,load_factor,n_resizes,resize_s
         # median via sort: asort() is a gawk extension and the node may run mawk
-        med=$(awk -F, 'NR>1 && $5>0 {print $5}' "$out/debug_table_stats.csv" | sort -n | \
+        med=$(awk -F, 'NR>1 && $6>0 {print $6}' "$out/debug_table_stats.csv" | sort -n | \
               awk '{a[NR]=$1} END{ if(NR==0) print 0;
                                    else if(NR%2) print a[(NR+1)/2];
                                    else print (a[NR/2]+a[NR/2+1])/2 }')
         awk -F, -v ds="$ds" -v n="$n" -v np="$NP" -v med="$med" '
             NR>1 {
-                parts++; if($5>0) ne++
-                su+=$5; si+=$4; sinit+=$2; scap+=$3; sload+=$6; sres+=$7
-                if($7>0) pres++
-                if(mn=="" || $5<mn) mn=$5
-                if($5>mx) mx=$5
+                parts++; if($6>0) ne++
+                su+=$6; si+=$5; sinit+=$2; sicap+=$3; scap+=$4; sload+=$7; sres+=$8
+                # table_cap > init_cap means the table outgrew the reserve
+                # and rehashed - the only way to see that on a table keeping
+                # no resize log, which is every table except kache-hash.
+                if($4>$3) grew++
+                if($8>0) pres++
+                if(mn=="" || $6<mn) mn=$6
+                if($6>mx) mx=$6
             }
             END{
-                if(ne==0){ print ds","n","np",0,,,,,,,,,"; exit }
-                printf "%s,%s,%s,%d,%.1f,%.1f,%d,%d,%.1f,%.1f,%.1f,%.4f,%d,%d\n",
-                       ds,n,np,ne,su/ne,med,mn,mx,si/ne,sinit/ne,scap/ne,sload/ne,sres,pres+0
+                if(ne==0){ print ds","n","np",0,,,,,,,,,,,"; exit }
+                printf "%s,%s,%s,%d,%.1f,%.1f,%d,%d,%.1f,%.1f,%.1f,%.1f,%.4f,%d,%d,%d\n",
+                       ds,n,np,ne,su/ne,med,mn,mx,si/ne,sinit/ne,sicap/ne,scap/ne,sload/ne,grew+0,sres,pres+0
             }' "$out/debug_table_stats.csv" >> "$PCSV"
         printf "    [stats] n=%-9s %s\n" "$n" \
-            "$(tail -1 "$PCSV" | awk -F, '{printf "parts=%s uniq mean/max=%.0f/%s cap_mean=%.0f resizes=%s",$4,$5,$8,$11,$13}')"
+            "$(tail -1 "$PCSV" | awk -F, '{printf "parts=%s uniq mean/max=%.0f/%s cap_mean=%.0f load=%.3f grew=%s",$4,$5,$8,$12,$13,$14}')"
     done
 done
 

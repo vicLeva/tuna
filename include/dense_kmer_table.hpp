@@ -78,6 +78,7 @@ public:
 
 private:
     map_t map_;
+    std::size_t init_cap_ = 0;   // bucket_count right after reserve(), see below
 
 public:
     // `resize_worker_c` and `lf` are accepted and ignored: unordered_dense
@@ -89,6 +90,7 @@ public:
     {
         (void)resize_worker_c; (void)lf;
         map_.reserve(max_sz);
+        init_cap_ = map_.bucket_count();
     }
 
     Dense_Kmer_Hash_Table(const Dense_Kmer_Hash_Table&) = delete;
@@ -119,6 +121,14 @@ public:
 
     std::size_t size() const { return map_.size(); }
     std::size_t capacity() const { return map_.bucket_count(); }
+
+    // Capacity the constructor's reserve() produced, before a single insert.
+    // unordered_dense grows silently - it keeps no resize log - so this is the
+    // only way to tell afterwards whether the pre-sizing held: if capacity()
+    // still equals this, reserve() was enough and nothing rehashed; if it is
+    // larger, the table outgrew its estimate and log2(cap/init_cap) counts the
+    // doublings it took.
+    std::size_t initial_capacity() const { return init_cap_; }
     std::size_t bucket_count() const { return map_.bucket_count(); }
 
     // There is no overflow table and no resize log; the debug reporting in

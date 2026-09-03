@@ -53,6 +53,33 @@ inline size_t next_pow2(size_t v) noexcept {
     return p;
 }
 
+// Number of ELEMENTS to reserve for one partition's counting table.
+//
+// `cal` is the unique-k-mer count of the first partition to finish, reused to
+// size every partition after it. Until that lands, the only estimate available
+// is the occurrence count per partition, which bounds unique from above.
+//
+// This is an element count, not a capacity. unordered_dense::reserve() takes a
+// number of elements and derives the bucket array itself: it divides by its
+// own 0.8 max load factor and rounds up to a power of two. Inflating the
+// figure here as well - the /0.75 headroom and the next_pow2 the kache-hash
+// quotienting table needed, neither of which unordered_dense wants - compounds
+// with that rounding and left tables sitting at load 0.10-0.20 against a 0.8
+// target, i.e. 3-8x more buckets than elements to put in them.
+//
+// Sizing to the estimate alone lands near 0.5, which is what a power-of-two
+// bucket array at 0.8 max load gives on average. Partitions heavier than `cal`
+// will outgrow it and rehash; that is amortised doubling, and debug_table_stats
+// records init_cap alongside table_cap so the frequency is measurable rather
+// than guessed at.
+inline size_t partition_init_size(uint64_t cal, uint64_t total_kmers, size_t n_parts) noexcept {
+    const size_t est = (cal > 0)
+        ? static_cast<size_t>(cal)
+        : (total_kmers > 0 ? static_cast<size_t>(total_kmers / n_parts)
+                           : size_t(1u << 27) / n_parts);
+    return std::clamp(est, size_t(1u << 12), size_t(1u << 22));
+}
+
 
 // ─── Debug stats ──────────────────────────────────────────────────────────────
 // Populated by count_partition when dbg != nullptr (-dbg flag).
@@ -64,6 +91,7 @@ struct PartitionDebugInfo {
     uint64_t n_unique    = 0;   // unique k-mers stored (table.size() after counting)
     uint64_t n_overflow  = 0;   // insertions that went to overflow table
     uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots, after any resizes)
+    uint64_t init_cap    = 0;   // capacity right after construction, before any insert
     uint64_t n_buckets   = 0;   // table_cap / B
 
     // Resize events recorded during count_partition for this partition.
@@ -651,16 +679,7 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
                 const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
                 if (p >= n_parts) break;
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-                size_t init_sz;
-                if (cal > 0) {
-                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
-                                         size_t(1u << 16), size_t(1u << 22));
-                } else {
-                    const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts) * 2
-                        : size_t(1u << 27) / n_parts;
-                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
-                }
+                const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
                 table_t table(init_sz, 1);
 
                 uint64_t ins;  // k-mers inserted into this partition
@@ -735,16 +754,7 @@ std::pair<uint64_t, uint64_t> count_and_callback(
                     throw std::runtime_error(
                         "tuna: cannot open partition file for reading: " + path);
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-                size_t init_sz;
-                if (cal > 0) {
-                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
-                                         size_t(1u << 16), size_t(1u << 22));
-                } else {
-                    const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts) * 2
-                        : size_t(1u << 27) / n_parts;
-                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
-                }
+                const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
                 table_t table(init_sz, 1);
 
                 const uint64_t ins = count_partition<k, m, canonical_>(reader, table, token);
@@ -912,7 +922,7 @@ inline void emit_debug_stats(
         const std::string csv_path = cfg.work_dir + "debug_table_stats.csv";
         std::ofstream csv(csv_path);
         if (csv) {
-            csv << "partition_id,init_sz,table_cap,n_inserted,n_unique,load_factor,n_resizes,resize_s\n";
+            csv << "partition_id,init_sz,init_cap,table_cap,n_inserted,n_unique,load_factor,n_resizes,resize_s\n";
             for (size_t p = 0; p < n_parts; ++p) {
                 const auto& d = part_infos[p];
                 const double lf = d.table_cap
@@ -921,6 +931,7 @@ inline void emit_debug_stats(
                 for (const auto& ev : d.resize_log) resize_s += ev.elapsed_s;
                 csv << p             << ","
                     << d.init_sz     << ","
+                    << d.init_cap    << ","
                     << d.table_cap   << ","
                     << d.n_inserted  << ","
                     << d.n_unique    << ","
@@ -1108,16 +1119,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 if (p >= n_parts) break;
                 const std::string path = partition_path(cfg.work_dir, p);
                 const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-                size_t init_sz;
-                if (cal > 0) {
-                    init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
-                                         size_t(1u << 16), size_t(1u << 22));
-                } else {
-                    const size_t per_part = (total_kmers > 0)
-                        ? static_cast<size_t>(total_kmers / n_parts) * 2
-                        : size_t(1u << 27) / n_parts;
-                    init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
-                }
+                const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
                 table_t table(init_sz, 1);
 
                 PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
@@ -1156,6 +1158,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     dbg->n_unique    = static_cast<uint64_t>(table.size());
                     dbg->n_overflow  = table.overflow_insert_count();
                     dbg->table_cap   = table.capacity();
+                    dbg->init_cap    = table.initial_capacity();
                     dbg->n_buckets   = table.bucket_count();
                     dbg->resize_log  = table.resize_log();
                 }
@@ -1275,16 +1278,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
             if (p >= n_parts) break;
             const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-            size_t init_sz;
-            if (cal > 0) {
-                init_sz = std::clamp(next_pow2(static_cast<size_t>(cal / 0.75) + 1),
-                                     size_t(1u << 16), size_t(1u << 22));
-            } else {
-                const size_t per_part = (total_kmers > 0)
-                    ? static_cast<size_t>(total_kmers / n_parts) * 2
-                    : size_t(1u << 27) / n_parts;
-                init_sz = std::clamp(per_part, size_t(1u << 15), size_t(1u << 22));
-            }
+            const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
             table_t table(init_sz, 1);
 
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
@@ -1321,6 +1315,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 dbg->n_unique    = static_cast<uint64_t>(table.size());
                 dbg->n_overflow  = table.overflow_insert_count();
                 dbg->table_cap   = table.capacity();
+                dbg->init_cap    = table.initial_capacity();
                 dbg->n_buckets   = table.bucket_count();
                 dbg->resize_log  = table.resize_log();
             }
