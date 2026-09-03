@@ -16,17 +16,19 @@
 # ---------------------------------------------------------------------------
 # Two passes, two CSVs
 # ---------------------------------------------------------------------------
-# pass 1  timing        every n in $NS                    -> $ROOT/nsweep.csv
-# pass 2  table stats   every n in $DBG_NS (subset of $NS) -> $ROOT/nsweep_parts.csv
+# pass 1  timing        every n in $NS      -> $ROOT/nsweep.csv
+# pass 2  table stats   every n in $DBG_NS  -> $ROOT/nsweep_parts.csv
+#
+# $DBG_NS defaults to $NS, so every point is measured both ways and each n
+# costs TWO full runs of the workload. Set DBG_NS to a subset to sample the
+# statistics more coarsely (they move smoothly between points), or to the
+# empty string to skip pass 2 entirely.
 #
 # Pass 2 runs with -dbg, which makes tuna emit two per-run CSVs describing
 # every partition's table (debug_table_stats.csv, debug_resize_events.csv).
 # That bookkeeping perturbs wall time, so pass 2's own timings are NOT
 # comparable to pass 1's - it exists to look inside the tables, not to race
-# them. $DBG_NS defaults to a coarser subset of $NS for that reason: the
-# quantities it captures (partition load, table capacity, resize counts) move
-# smoothly between points, so sampling every n a second time would double an
-# already long sweep for no signal.
+# them, which is why it is a separate run rather than -dbg on the timed one.
 #
 # Table layout differs by branch (kache-hash quotients the key out of the
 # bucket address; unordered_dense and absl::flat_hash_map store it in full),
@@ -36,9 +38,9 @@
 # unordered_dense's resize_log() is a stub), n_resizes is always 0: that is a
 # property of the table, not a measurement failure.
 #
-# Output: $ROOT/nsweep.csv         (key = n)               - pass 1
-#         $ROOT/nsweep_parts.csv   (key = n, DBG_NS only)   - pass 2
-#         $ROOT/dbg/<dataset>_n<n>/                         - pass 2 raw CSVs
+# Output: $ROOT/nsweep.csv         (key = n)              - pass 1
+#         $ROOT/nsweep_parts.csv   (key = n)              - pass 2
+#         $ROOT/dbg/<dataset>_n<n>/                        - pass 2 raw CSVs
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${ROOT:=/WORKS/vlevallois/expes_tuna/nsweep}"
@@ -47,7 +49,7 @@ source "$HERE/bench_common.sh"
 # name : fof : tuna m
 : "${DATASETS:=gallus:$DATA_ROOT/dataset_reads_gallus/fof.list:21 human3:$DATA_ROOT/dataset_reads_human3/fof.list:21}"
 : "${NS:=auto 32 64 128 256 512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288 1048576 2097152}"
-: "${DBG_NS:=auto 64 1024 8192 32768 65536 131072 524288 2097152}"
+: "${DBG_NS:=$NS}"          # every n by default; narrow it to sample fewer points
 
 CSV="$ROOT/nsweep.csv"
 PCSV="$ROOT/nsweep_parts.csv"
@@ -120,7 +122,7 @@ for spec in $DATASETS; do
             fi
         fi
 
-        # ---- pass 2: table stats (subset of n) ----
+        # ---- pass 2: table stats (every n in DBG_NS) ----
         in_dbg_ns "$n" || continue
         if have_stat "$ds" "$n"; then
             echo "    [stats] n=$n already measured"
