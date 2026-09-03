@@ -40,11 +40,19 @@ target_include_directories(kff_io SYSTEM PUBLIC
     ${CMAKE_BINARY_DIR}
 )
 
-# Phase-2 counting table: kache quotienting table (default) or unordered_dense.
+# Phase-2 counting table: kache quotienting table (default), unordered_dense,
+# or abseil's flat_hash_map. The two map options are mutually exclusive.
 option(TUNA_PHASE2_DENSE "Use ankerl::unordered_dense for the phase-2 counting table" OFF)
+option(TUNA_PHASE2_ABSL  "Use absl::flat_hash_map for the phase-2 counting table" OFF)
+if(TUNA_PHASE2_DENSE AND TUNA_PHASE2_ABSL)
+    message(FATAL_ERROR "TUNA_PHASE2_DENSE and TUNA_PHASE2_ABSL are mutually exclusive")
+endif()
 if(TUNA_PHASE2_DENSE)
     add_compile_definitions(TUNA_PHASE2_DENSE)
     message(STATUS "phase-2 counting table: ankerl::unordered_dense")
+elseif(TUNA_PHASE2_ABSL)
+    add_compile_definitions(TUNA_PHASE2_ABSL)
+    message(STATUS "phase-2 counting table: absl::flat_hash_map")
 else()
     message(STATUS "phase-2 counting table: kache-hash")
 endif()
@@ -57,6 +65,22 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(unordered_dense)
+
+# ── abseil: flat_hash_map (SwissTable) ────────────────────────────────────────
+# Not header-only, unlike everything else here: it builds real libraries and
+# must be linked. ABSL_PROPAGATE_CXX_STD makes it inherit our C++20 rather than
+# defaulting to 17, which otherwise produces ODR mismatches at link time.
+# ABSL_ENABLE_INSTALL stays OFF so a build here never pollutes an install tree.
+set(ABSL_PROPAGATE_CXX_STD ON  CACHE BOOL "" FORCE)
+set(ABSL_ENABLE_INSTALL    OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING          OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    absl
+    GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+    GIT_TAG        20260817.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(absl)
 
 # ── zlib: prefer zlib-ng for ~2x faster gz decompression ──────────────────────
 # zlib-ng compat mode is a drop-in replacement: same zlib.h API, same symbols,
@@ -179,7 +203,7 @@ target_compile_definitions(tuna_lib INTERFACE
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
     $<$<BOOL:${TUNA_CONDA_PROFILE}>:TUNA_CONDA_PROFILE>
 )
-target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
+target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io absl::flat_hash_map)
 
 # ── tuna — CLI executable (only when tuna is the top-level project) ────────────
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)

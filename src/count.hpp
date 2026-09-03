@@ -33,16 +33,21 @@
 #include <filesystem>
 
 #include <ankerl/unordered_dense.h>
+#include <absl/container/flat_hash_map.h>
 #include "xxHash/xxhash.h"
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 #include "dense_kmer_table.hpp"
+#include "absl_kmer_table.hpp"
 
-// Phase-2 counting table. Build with -DTUNA_PHASE2_DENSE to swap the kache
-// quotienting table for an ankerl::unordered_dense map; see
-// include/dense_kmer_table.hpp for what that costs and what it buys.
-#ifdef TUNA_PHASE2_DENSE
+// Phase-2 counting table. Build with -DTUNA_PHASE2_DENSE for an
+// ankerl::unordered_dense map or -DTUNA_PHASE2_ABSL for absl::flat_hash_map;
+// see the respective headers for what each costs and buys.
+#if defined(TUNA_PHASE2_DENSE)
 template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
 using phase2_table_t = tuna::Dense_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
+#elif defined(TUNA_PHASE2_ABSL)
+template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
+using phase2_table_t = tuna::Absl_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
 #else
 template <uint16_t k_, bool mt_, typename T_, uint16_t l_, bool canonical_>
 using phase2_table_t = kache_hash::Streaming_Kmer_Hash_Table<k_, mt_, T_, l_, canonical_>;
@@ -277,7 +282,7 @@ uint64_t count_partition_aggregated(
     SuperkmerDedupStats* stats = nullptr)
 {
     using map_t =
-        ankerl::unordered_dense::map<std::string_view, uint32_t, SuperkmerRecordHash>;
+        absl::flat_hash_map<std::string_view, uint32_t, SuperkmerRecordHash>;
     static constexpr size_t ENTRY_ESTIMATE = 32;
     static constexpr size_t AUTO_SAMPLE_RECORDS = 16u << 10;
     static constexpr size_t AUTO_MIN_RECORDS = 4u << 10;
