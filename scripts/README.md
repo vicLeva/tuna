@@ -13,6 +13,7 @@ live in `benchmark/legacy/` and are kept only for reference.
 | `bench_big_data.sh` | the two large read sets, whole (tuna, KMC, FastK) |
 | `bench_thread_sweep.sh` | thread sweep T=1..32, assemblies and reads (tuna, KMC, FastK) |
 | `bench_coverage_sweep.sh` | coverage 1x-100x on one read set (tuna, KMC) — **already run** |
+| `bench_nsweep.sh` | partition count `-n` = 2^5..2^21: timings, plus table stats via `-dbg` at a subset of `n` (tuna only) |
 | `kmer_stats.sh` | count statistics from a kept KMC database |
 
 ## Running
@@ -146,6 +147,53 @@ It also differs in design, for reasons specific to that experiment: one full
 pass per tool rather than per input, and level files built incrementally
 (`mv` + append one source copy), so each level is written once and only one
 level file exists at a time.
+
+## bench_nsweep.sh
+
+Partition-count sweep on the two large read sets (`gallus`, `human3`), tuna
+only. `-n` is rounded up to a power of two by tuna itself, so
+`n = 2^5, 2^6, ..., 2^21` (plus `auto`, the value tuna picks with no `-n`) is
+the entire reachable search space — nothing finer exists between two
+consecutive powers of two.
+
+Unlike every other script here, this takes **one tuna binary per run** with no
+tool comparison: the question is how tuna's own partition count trades off
+against its own table, not tuna vs KMC vs FastK. To compare branches (say
+kache-hash vs unordered_dense), run it once per build with a different `TUNA`
+and `ROOT` each time and diff the CSVs afterwards.
+
+Each `n` gets two passes, writing two different CSVs, because they answer
+different questions:
+
+- **pass 1, timing** — every `n` in `$NS`. Measures wall time, phase1/phase2,
+  and peak RSS. Output is always `.kff` (bin): the sweep is about
+  partitioning and counting cost, not output format. Written to
+  `$ROOT/nsweep.csv`.
+- **pass 2, table stats** — every `n` in `$DBG_NS` (a coarser subset of `$NS`
+  by default), run with `-dbg`. This makes tuna emit `debug_table_stats.csv`
+  (one row per partition: `init_sz`, `table_cap`, `n_inserted`, `n_unique`,
+  `load_factor`, `n_resizes`) and `debug_resize_events.csv` (one row per
+  resize), copied to `$ROOT/dbg/<dataset>_n<n>/` and aggregated into
+  `$ROOT/nsweep_parts.csv` (mean/median/min/max unique k-mers per partition,
+  mean init size and capacity, mean load factor, total resizes). `-dbg`'s
+  bookkeeping perturbs wall time, so **pass 2's own timings are not comparable
+  to pass 1's** — it exists to look inside the tables, not to race them.
+  `$DBG_NS` defaults to a subset of `$NS` because the quantities it captures
+  move smoothly between points, so sampling every `n` a second time would
+  double an already long sweep for no signal.
+
+Table layout is branch-specific — kache-hash quotients the key out of the
+bucket address, unordered_dense and absl::flat_hash_map store it in full — so
+`table_cap` means whatever that branch calls capacity/bucket_count, and
+converting it to bytes per partition needs a branch-aware constant applied at
+analysis time, not inside the script. A branch whose table does not track
+resizes (unordered_dense's `resize_log()` is a stub) will always show
+`n_resizes = 0`: that is a property of the table, not a failed measurement.
+
+Resumable per `(dataset, n)`, independently for each pass, same as everything
+else here. Default grid is 17 points x 2 datasets = 34 timing runs, of which 8
+x 2 = 16 also get a stats run — narrow `NS` or `DBG_NS` for a faster first
+signal; the full run will skip whatever is already in the CSVs.
 
 ## Input regimes in the thread sweep
 
