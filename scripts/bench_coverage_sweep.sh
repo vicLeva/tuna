@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # bench_coverage_sweep.sh - coverage sweep, tuna vs KMC
 #
-# ALREADY RUN. This is the exact script that produced
-# benchmark/results/coverage_sweep/{coverage_sweep,coverage_stats}.csv on
-# 2026-08-28; it is kept here for provenance, not to be re-run. It is
-# deliberately left untouched - it does not share bench_common.sh, and its
-# default ROOT still points at expes_tuna/coverage_sweep rather than
-# expes_paper - because editing it would break the correspondence between
-# these lines and those results.
+# This script produced benchmark/results/coverage_sweep_kh/ on 2026-08-28 at
+# m=17, and coverage_sweep_ud/ afterwards at m=21. The default is now m=21 so
+# the coverage curve is comparable with the rest of the suite; the older CSV
+# records m=17 in its own m column, so the two remain distinguishable.
+#
+# It still does not share bench_common.sh, and its default ROOT still points at
+# expes_tuna/coverage_sweep rather than expes_paper: the rest of its design is
+# specific to this experiment and is left as it was.
 #
 # Source: SRR622461_1.fastq.gz, human reads, measured coverage ~5x.
 #
@@ -71,7 +72,11 @@ export LC_ALL=C LANG=C
 : "${SRC:=/WORKS/vlevallois/data/data_sequencing/SRR622461_1.fastq.gz}"
 SRC_COV=5                                  # coverage of the source file
 K=31
-M=${M:-17}          # m=17: -3.8% time and -15% RSS vs m=21 on these reads
+M=${M:-21}          # m=21 everywhere in the suite, so the coverage curve is
+                    # comparable with the other experiments. m=17 was measured
+                    # -3.8% time and -15% RSS on these reads and was the
+                    # original default here, which is why the first run of this
+                    # sweep (2026-08-28) carries m=17 in its CSV.
 THREADS=${THREADS:-8}
 RAM_GB=${RAM_GB:-256}
 STOP_BYTES=${STOP_BYTES:-$((500 * 1024 * 1024 * 1024))}
