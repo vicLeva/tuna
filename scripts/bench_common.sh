@@ -65,6 +65,7 @@ export LC_ALL=C LANG=C
 : "${KMC_DUMP:=}"            # required
 : "${FASTK:=}"               # required only by experiments that use FastK
 : "${TABEX:=}"
+: "${KMC_TOOLS:=}"           # optional: enables per-input k-mer statistics
 
 : "${ROOT:=/WORKS/vlevallois/expes_tuna/expes_paper}"
 # Root of the input collections. Overridable so the scripts can be exercised
