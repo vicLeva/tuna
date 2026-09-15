@@ -8,7 +8,7 @@ live in `benchmark/legacy/` and are kept only for reference.
 | file | what it measures |
 |---|---|
 | `bench_common.sh` | shared machinery: tool runners, timing, guards. Sourced, not run. |
-| `bench_all_datasets.sh` | one file at a time, across five collections (tuna, KMC) |
+| `bench_all_datasets.sh` | one file at a time, across five collections (tuna, KMC, FastK) |
 | `bench_scaling.sh` | n input files, increasing n (tuna, KMC, FastK) |
 | `bench_big_data.sh` | the two large read sets, whole (tuna, KMC, FastK) |
 | `bench_thread_sweep.sh` | thread sweep T=1..32, assemblies and reads (tuna, KMC, FastK) |
