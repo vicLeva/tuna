@@ -23,6 +23,7 @@ bench_init big_data "tuna kmc fastk"
 
 for spec in "${DATASETS[@]}"; do
     IFS=: read -r ds fof m fmt <<< "$spec"
+    dataset_enabled "$ds" || continue
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; continue; }
     n=$(wc -l < "$fof"); M="$m"
     echo ""

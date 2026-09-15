@@ -82,11 +82,15 @@ export LC_ALL=C LANG=C
 # --- overrides, mainly for side experiments -------------------------------
 # FORCE_M    ignore the per-dataset minimizer length and use this one
 #            everywhere (for choosing m by comparing whole experiments).
+# ONLY_DATASETS space-separated subset of an experiment's datasets to run.
+#            Lets one experiment be split across invocations, for instance to
+#            give each dataset its own timeout.
 # ONLY_TOOLS space-separated subset of "tuna kmc fastk" to actually run.
 # MAX_FILES  cap on how many files a dataset contributes, where the
 #            experiment iterates over files.
 : "${FORCE_M:=}"
 : "${ONLY_TOOLS:=}"
+: "${ONLY_DATASETS:=}"
 : "${MAX_FILES:=0}"
 # ONLY_MODES  subset of "bin ascii" to measure. Comparing two counting-table
 #             implementations only needs `bin`: the ascii run repeats the same
@@ -213,6 +217,9 @@ kmer_stats_line() {
 
 # Is this tool part of the run? (ONLY_TOOLS empty means "all of them")
 tool_enabled() { [[ -z "$ONLY_TOOLS" || " $ONLY_TOOLS " == *" $1 "* ]]; }
+
+# Is this dataset part of the run? (ONLY_DATASETS empty means "all of them")
+dataset_enabled() { [[ -z "$ONLY_DATASETS" || " $ONLY_DATASETS " == *" $1 "* ]]; }
 
 # Resume at measurement granularity: re-running a script only fills the gaps.
 have_run() {
