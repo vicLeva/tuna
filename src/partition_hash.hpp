@@ -96,7 +96,7 @@ void extract_superkmers_from_actg(
     uint64_t&                            kmer_count,
     uint64_t&                            sk_count,
     FlushFn&&                            flush_fn,
-    std::vector<uint8_t>&                packed_buf)  // packed sequence plus one sentinel byte
+    std::vector<uint8_t>&                packed_buf)  // packed sequence plus append_packed's read slack
 {
     using hdr_t = sk_hdr_t<k, m>;  // superkmer header type (local alias)
     // Max value of hdr_t: flush guard prevents sk_len from ever overflowing hdr_t.
@@ -109,7 +109,9 @@ void extract_superkmers_from_actg(
     // Pack the sequence once so overlapping superkmers can copy byte slices
     // instead of repacking the same bases repeatedly.
     const size_t packed_bytes = (seq_len + 3u) / 4u;
-    packed_buf.resize(packed_bytes + 1);
+    // append_packed() reads a fixed two words from the slice start, so the
+    // buffer carries that much readable slack past the last data byte.
+    packed_buf.resize(packed_bytes + SuperkmerWriter<k, m>::OVERWRITE_SLACK + 1);
     size_t enc = 0;
     for (; enc + 4 <= seq_len; enc += 4) {
         const uint8_t b0 = ((uint8_t(seq[enc    ]) >> 2) ^ (uint8_t(seq[enc    ]) >> 1)) & 3u;

@@ -59,6 +59,12 @@ struct SuperkmerWriter
     static constexpr size_t HDR_BYTES = sizeof(hdr_t);
     static constexpr size_t MAX_RECORD_BYTES =
         HDR_BYTES + (static_cast<size_t>(2u * k - m) + 3u) / 4u;
+    // append_packed() writes a fixed two words past the record header rather
+    // than looping over the exact byte count, so the buffer is always allocated
+    // with this much extra room beyond cap_. Bytes past the record are garbage
+    // and are overwritten by the next append or ignored by flush, which only
+    // ever emits sz_ bytes.
+    static constexpr size_t OVERWRITE_SLACK = 2u * sizeof(uint64_t);
 
     char*  raw_  = nullptr;  // raw buffer pointer
     size_t sz_   = 0;        // used bytes
@@ -75,7 +81,7 @@ struct SuperkmerWriter
         // before the caller clears it.
         : cap_(flush_thresh + MAX_RECORD_BYTES), flush_threshold(flush_thresh)
     {
-        raw_ = static_cast<char*>(::operator new(cap_));
+        raw_ = static_cast<char*>(::operator new(cap_ + OVERWRITE_SLACK));
     }
 
     // Copy constructor: used by vector(n, template) — allocates a fresh buffer
@@ -83,7 +89,7 @@ struct SuperkmerWriter
     SuperkmerWriter(const SuperkmerWriter& o)
         : sz_(o.sz_), cap_(o.cap_), flush_threshold(o.flush_threshold)
     {
-        raw_ = static_cast<char*>(::operator new(cap_));
+        raw_ = static_cast<char*>(::operator new(cap_ + OVERWRITE_SLACK));
         if (sz_) std::memcpy(raw_, o.raw_, sz_);
     }
 
@@ -107,7 +113,7 @@ struct SuperkmerWriter
     {
         const size_t need = sz_ + extra;
         cap_ = std::max(need, cap_ * 2);
-        char* n = static_cast<char*>(::operator new(cap_));
+        char* n = static_cast<char*>(::operator new(cap_ + OVERWRITE_SLACK));
         std::memcpy(n, raw_, sz_);
         ::operator delete(raw_);
         raw_ = n;
@@ -171,47 +177,73 @@ struct SuperkmerWriter
     }
 
     // Serialise a base-aligned slice from an already packed sequence. `packed`
-    // must have one zero sentinel byte after its final data byte.
+    // must have OVERWRITE_SLACK + 1 readable bytes after its final data byte.
+    //
+    // Records up to OVERWRITE_SLACK bytes take a branch-free path that writes a
+    // fixed two words and skips the loop and tail pass. Longer records fall back
+    // to the general loop: superkmers are usually at most 2k-m bases, but a
+    // tandem repeat makes consecutive \mmers identical, so the minimizer hash
+    // stops changing and the run grows until the caller's header-saturation
+    // guard cuts it. Those reach 255 bases and are rare but not absent.
+    //
+    // LOW/HIGH_MASKS[0] are set so a byte-aligned slice (shift == 0) takes the
+    // same arithmetic, with the high term masked away rather than branched
+    // around.
     void append_packed(const uint8_t* packed, size_t base_offset, hdr_t len, hdr_t min_pos)
     {
         (void)min_pos;
-        const size_t packed_bytes = (len + 3u) / 4u;
+        static constexpr uint64_t LOW_MASKS[4] = {
+            ~uint64_t(0),
+            0x3f3f3f3f3f3f3f3fULL,
+            0x0f0f0f0f0f0f0f0fULL,
+            0x0303030303030303ULL
+        };
+        static constexpr uint64_t HIGH_MASKS[4] = {
+            0,
+            ~0x3f3f3f3f3f3f3f3fULL,
+            ~0x0f0f0f0f0f0f0f0fULL,
+            ~0x0303030303030303ULL
+        };
+        // Clears the unused low bases of the final byte: index is len % 4.
+        static constexpr uint8_t TAIL_MASKS[4] = {0xff, 0xc0, 0xf0, 0xfc};
+
+        const size_t   packed_bytes = (len + 3u) / 4u;
+        const unsigned q            = static_cast<unsigned>(base_offset & 3u);
+        const unsigned shift        = q * 2u;
+
         char* dst = reserve_inline(HDR_BYTES + packed_bytes);
         std::memcpy(dst, &len, sizeof(hdr_t));
         auto* out = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
 
         const auto* src = packed + (base_offset >> 2);
-        const unsigned shift = static_cast<unsigned>((base_offset & 3u) * 2u);
-        if (shift == 0) {
-            std::memcpy(out, src, packed_bytes);
-        } else {
-            static constexpr uint64_t LOW_MASKS[4] = {
-                0,
-                0x3f3f3f3f3f3f3f3fULL,
-                0x0f0f0f0f0f0f0f0fULL,
-                0x0303030303030303ULL
-            };
-            const uint64_t low_mask = LOW_MASKS[shift >> 1];
-            const uint64_t high_mask = ~low_mask;
+        uint64_t a0, a1, b0, b1;
+        std::memcpy(&a0, src,     sizeof(a0));
+        std::memcpy(&a1, src + 8, sizeof(a1));
+        std::memcpy(&b0, src + 1, sizeof(b0));
+        std::memcpy(&b1, src + 9, sizeof(b1));
 
+        const uint64_t lm = LOW_MASKS[q], hm = HIGH_MASKS[q];
+        if (__builtin_expect(packed_bytes <= OVERWRITE_SLACK, 1)) {
+            const uint64_t o0 = ((a0 & lm) << shift) | ((b0 & hm) >> (8u - shift));
+            const uint64_t o1 = ((a1 & lm) << shift) | ((b1 & hm) >> (8u - shift));
+            std::memcpy(out,     &o0, sizeof(o0));
+            std::memcpy(out + 8, &o1, sizeof(o1));
+        } else {
             size_t i = 0;
             for (; i + sizeof(uint64_t) <= packed_bytes; i += sizeof(uint64_t)) {
                 uint64_t lo, hi;
                 std::memcpy(&lo, src + i,     sizeof(lo));
                 std::memcpy(&hi, src + i + 1, sizeof(hi));
-                const uint64_t shifted =
-                    ((lo & low_mask) << shift) |
-                    ((hi & high_mask) >> (8u - shift));
-                std::memcpy(out + i, &shifted, sizeof(shifted));
+                const uint64_t v = ((lo & lm) << shift) | ((hi & hm) >> (8u - shift));
+                std::memcpy(out + i, &v, sizeof(v));
             }
             for (; i < packed_bytes; ++i)
                 out[i] = static_cast<uint8_t>(
-                    (src[i] << shift) | (src[i + 1] >> (8u - shift)));
+                    (src[i] << shift) | (shift ? (src[i + 1] >> (8u - shift)) : 0u));
         }
 
-        const unsigned tail_bases = static_cast<unsigned>(len & 3u);
-        if (tail_bases != 0)
-            out[packed_bytes - 1] &= static_cast<uint8_t>(0xffu << (8u - 2u * tail_bases));
+        out[packed_bytes - 1] &= TAIL_MASKS[len & 3u];
+
     }
 
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
