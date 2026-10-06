@@ -226,7 +226,12 @@ int run(const Config& cfg)
         // this cap the run survives only by courtesy of overcommit, and fails
         // outright where overcommit is disabled.
         if (est_packed > 0) {
-            uint64_t want = est_packed * 6 / 5;             // ×1.2 slack
+            // est_packed already carries BUFFER_SLACK, so it predicts residency
+            // rather than the logical byte count. Scaling it again over-reserved
+            // by a further fifth, which showed up on the cluster as 20 GB a
+            // 20-genome run reserved and never touched. The slack already in the
+            // estimate covers partition imbalance, which tuna keeps near 1.
+            uint64_t want = est_packed;
             if (spill_limit > 0) want = std::min(want, spill_limit);
             const size_t per_part = static_cast<size_t>(want / cfg.num_partitions);
             if (per_part >= 64) {
@@ -442,7 +447,7 @@ void run_callback(const Config& cfg, Callback&& cb)
     if (use_mem) {
         std::vector<std::string> part_bufs(cfg.num_partitions);
         if (est_packed > 0) {
-            uint64_t want = est_packed * 6 / 5;
+            uint64_t want = est_packed;
             if (spill_limit > 0) want = std::min(want, spill_limit);
             const size_t per_part = static_cast<size_t>(want / cfg.num_partitions);
             if (per_part >= 64)
