@@ -12,8 +12,12 @@
 #include "partition_hash.hpp"
 #include "count.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -41,6 +45,89 @@ inline uint64_t available_ram_bytes()
 // Used to approximate uncompressed size from compressed file size when
 // auto-tuning partition count and deciding between in-memory vs disk pipelines.
 constexpr uint64_t GZ_EXPAND = 6;
+
+
+// ─── Phase-1 memory estimate ──────────────────────────────────────────────────
+//
+// Two independent questions, which a single multiplier per file type used to
+// conflate:
+//
+//   file bytes --[format]--> sequence bases --[k, m]--> superkmer bytes
+//
+// Format. FASTA costs about one byte per base plus a newline every 60 to 80
+// columns. FASTQ costs roughly twice that, carrying a quality string as long as
+// the sequence plus two header lines. Compression divides both, and qualities
+// compress far worse than ACGT, so a gzipped FASTQ holds noticeably fewer bases
+// per byte than a gzipped FASTA of the same size.
+//
+// k and m. With random minimizers a superkmer spans s = (k-m+2)/2 k-mers on
+// average, which matches measurement: 200 E. coli genomes give
+// 1032731395/172199244 = 6.00 at k=31, m=21. Each superkmer stores k+s-1 bases
+// at two bits each plus a one-byte length header, while carrying only s bases of
+// new sequence, so the factor of four from packing is almost entirely spent on
+// the k-1 overlap. At k=31, m=21 that is 10 bytes per 6 bases, about 1.67 bytes
+// per input base rather than the 0.25 that "2-bit packed" suggests.
+//
+// This is only the opening guess: it chooses which pipeline to start in. The
+// spill sink enforces the budget from bytes actually held, so a wrong guess
+// costs a flush rather than a broken run.
+
+inline bool input_is_fastq(const std::string& f)
+{
+    std::string n = f;
+    if (n.size() > 3 && n.compare(n.size() - 3, 3, ".gz") == 0) n.resize(n.size() - 3);
+    const auto ends_with = [&](const char* e) {
+        const size_t le = std::strlen(e);
+        return n.size() >= le && n.compare(n.size() - le, le, e) == 0;
+    };
+    return ends_with(".fq") || ends_with(".fastq");
+}
+
+inline double bases_per_file_byte(bool is_gz, bool is_fastq)
+{
+    if (!is_gz) return is_fastq ? 0.45 : 0.98;
+    return is_fastq ? 1.2 : 3.4;
+}
+
+template <uint16_t k, uint16_t m>
+inline double superkmer_bytes_per_base()
+{
+    const double s        = (double(k) - double(m) + 2.0) / 2.0;
+    const double sk_bases = double(k) + s - 1.0;
+    return (std::ceil(sk_bases / 4.0) + 1.0) / s;   // packed bases + length header
+}
+
+// Testing hook. Lowers the spill watermark so the spill path can be exercised
+// without an input large enough to cross a real memory budget. Unset in normal
+// runs, in which case the watermark comes from the budget alone.
+inline uint64_t spill_limit_override()
+{
+    if (const char* e = std::getenv("TUNA_SPILL_LIMIT_MB")) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(e, &end, 10);
+        if (end != e && v > 0) return static_cast<uint64_t>(v) << 20;
+    }
+    return 0;
+}
+
+template <uint16_t k, uint16_t m>
+inline uint64_t estimate_phase1_bytes(const Config& cfg)
+{
+    const double bpb = superkmer_bytes_per_base<k, m>();
+    // The per-partition std::string buffers grow by doubling, so the live
+    // allocation sits above the bytes written. Measured 1.4 to 1.8 times; the
+    // spill sink covers whatever this misses.
+    constexpr double SLACK = 1.4;
+    double est = 0.0;
+    for (const auto& f : cfg.input_files) {
+        std::error_code ec;
+        const uint64_t fsz = std::filesystem::file_size(f, ec);
+        if (ec) continue;
+        const bool is_gz = f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0;
+        est += double(fsz) * bases_per_file_byte(is_gz, input_is_fastq(f)) * bpb * SLACK;
+    }
+    return static_cast<uint64_t>(est);
+}
 
 // ─── Timing helper ────────────────────────────────────────────────────────────
 
@@ -72,21 +159,16 @@ int run(const Config& cfg)
     // Phase 2 reads via MemoryReader — no disk round-trip.
     // Selected when estimated packed superkmer size < 60% of available RAM.
     //
-    // Estimation: gz → fsz × GZ_EXPAND × 35%; plain → fsz × 2
-    // (superkmers store k-1 overlapping bases per boundary ≈ 2× raw sequence).
-    uint64_t est_packed = 0;
-    for (const auto& f : cfg.input_files) {
-        std::error_code ec;
-        uint64_t fsz = std::filesystem::file_size(f, ec);
-        if (ec) continue;
-        const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-        est_packed += is_gz
-            ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
-            : fsz * 2;
-    }
+    const uint64_t est_packed = estimate_phase1_bytes<k, m>(cfg);
     const uint64_t avail = cfg.ram_budget_bytes > 0
         ? cfg.ram_budget_bytes : available_ram_bytes();
-    const bool use_mem_pipeline = avail > 0 && est_packed < avail * 6 / 10;
+    // Stay in memory while the buffers are *measured* to hold less than this.
+    // The same fraction used to gate a prediction; it is now a watermark the
+    // spill sink enforces, so overshooting the budget is no longer possible.
+    const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
+    const bool use_mem_pipeline = avail > 0 && est_packed < mem_limit;
+    const uint64_t override_limit = spill_limit_override();
+    const uint64_t spill_limit    = override_limit ? override_limit : mem_limit;
 
     // Disk-mode write-buffer budget: up to 30% of RAM across all threads,
     // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes.
@@ -106,23 +188,40 @@ int run(const Config& cfg)
                   << (use_mem_pipeline ? ", in-memory" : "") << ") ...\n";
 
     PartitionStats stats;
+    bool spilled_to_disk = false;
     const auto t_part = std::chrono::steady_clock::now();
 
     if (use_mem_pipeline) {
         // Pre-reserve buffers to estimated size (×1.2 slack).
         // reserve() is demand-zero — pages are faulted in on first write.
         std::vector<std::string> part_bufs(cfg.num_partitions);
-        // Pre-reserve only when per-partition buffers are large enough to matter.
+        // Pre-reserve only when per-partition buffers are large enough to
+        // matter, and never beyond the watermark: reserve() asks the allocator
+        // for the memory up front, so reserving above the watermark would
+        // commit memory the spill is meant to prevent us from taking. Without
+        // this cap the run survives only by courtesy of overcommit, and fails
+        // outright where overcommit is disabled.
         if (est_packed > 0) {
-            const size_t per_part = static_cast<size_t>(
-                est_packed * 6 / 5 / cfg.num_partitions);   // ×1.2 slack
+            uint64_t want = est_packed * 6 / 5;             // ×1.2 slack
+            if (spill_limit > 0) want = std::min(want, spill_limit);
+            const size_t per_part = static_cast<size_t>(want / cfg.num_partitions);
             if (per_part >= 64) {
                 for (size_t p = 0; p < cfg.num_partitions; ++p)
                     part_bufs[p].reserve(per_part);
             }
         }
-        stats = partition_kmers_mem<k, m>(cfg, part_bufs);
+        stats = partition_kmers_mem<k, m>(cfg, part_bufs, spill_limit);
+        if (stats.spill_failed) return 1;
 
+        if (stats.spilled) {
+            // The budget was reached mid-run and every partition is on disk
+            // now. Release the buffers and finish through the disk path below.
+            part_bufs.clear();
+            part_bufs.shrink_to_fit();
+            spilled_to_disk = true;
+            if (!cfg.hide_progress)
+                std::cerr << "      memory budget reached, spilled to disk\n";
+        } else {
         const double t_phase1 = elapsed_s(t_part);
         if (!cfg.hide_progress)
             std::cerr << "      " << stats.seqs << " seqs  "
@@ -130,7 +229,8 @@ int run(const Config& cfg)
 
         if (cfg.partition_only) {
             std::cerr << "phase1: "     << t_phase1        << "s\n"
-                      << "superkmers: " << stats.superkmers << "\n";
+                      << "superkmers: " << stats.superkmers << "\n"
+                      << "spilled: 0\n";
             if (!cfg.hide_progress)
                 std::cerr << "done  (partition only)\n";
             return 0;
@@ -181,32 +281,40 @@ int run(const Config& cfg)
                   << "phase2: "        << t_phase2            << "s\n"
                   << "superkmers: "    << stats.superkmers     << "\n"
                   << "n_parts: "       << cfg.num_partitions   << "\n"
+                  << "spilled: 0\n"
                   << "total_kmers: "   << total_inserted       << "\n"
                   << "unique_kmers: "  << total_written        << "\n";
         if (!cfg.hide_progress)
             std::cerr << "total: " << fmt_s(elapsed_s(t_start)) << "\n";
         return 0;
-    }
-
-    // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
-
-    std::vector<std::ofstream> buckets(cfg.num_partitions);
-    for (size_t p = 0; p < cfg.num_partitions; ++p) {
-        const std::string path = partition_path(cfg.work_dir, p);
-        buckets[p].open(path, std::ios::binary);
-        if (!buckets[p]) {
-            std::cerr << "tuna: error: cannot open partition file for writing: " << path << "\n";
-            return 1;
         }
     }
 
-    stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
-    for (size_t p = 0; p < cfg.num_partitions; ++p) {
-        buckets[p].close();
-        if (!buckets[p]) {
-            std::cerr << "tuna: error: failed while writing partition file: "
-                      << partition_path(cfg.work_dir, p) << "\n";
-            return 1;
+    // ── Disk pipeline ──────────────────────────────────────────────────────
+    //
+    // Entered either because the opening estimate said the buffers would not
+    // fit, or because an in-memory phase 1 spilled. In the second case phase 1
+    // is already done and its partition files are written and closed.
+
+    if (!spilled_to_disk) {
+        std::vector<std::ofstream> buckets(cfg.num_partitions);
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            const std::string path = partition_path(cfg.work_dir, p);
+            buckets[p].open(path, std::ios::binary);
+            if (!buckets[p]) {
+                std::cerr << "tuna: error: cannot open partition file for writing: " << path << "\n";
+                return 1;
+            }
+        }
+
+        stats = partition_kmers<k, m>(cfg, buckets, disk_write_budget);
+        for (size_t p = 0; p < cfg.num_partitions; ++p) {
+            buckets[p].close();
+            if (!buckets[p]) {
+                std::cerr << "tuna: error: failed while writing partition file: "
+                          << partition_path(cfg.work_dir, p) << "\n";
+                return 1;
+            }
         }
     }
 
@@ -216,7 +324,11 @@ int run(const Config& cfg)
                   << stats.kmers << " k-mers  " << fmt_s(t_phase1) << "\n";
 
     if (cfg.partition_only) {
-        std::cerr << "phase1: " << t_phase1 << "s\n";
+        // superkmers is reported here too, so a -tp run gives the same fields
+        // whether it ran in memory, on disk, or spilled from one to the other.
+        std::cerr << "phase1: "     << t_phase1         << "s\n"
+                  << "superkmers: " << stats.superkmers << "\n"
+                  << "spilled: "    << (spilled_to_disk ? 1 : 0) << "\n";
         if (!cfg.hide_progress)
             std::cerr << "done  (partition only)\n";
         return 0;
@@ -270,6 +382,7 @@ int run(const Config& cfg)
               << "phase2: "     << t_phase2        << "s\n"
               << "superkmers: " << stats.superkmers << "\n"
               << "n_parts: "    << cfg.num_partitions << "\n"
+              << "spilled: "    << (spilled_to_disk ? 1 : 0) << "\n"
               << "total_kmers: " << total_inserted << "\n"
               << "unique_kmers: " << total_written << "\n";
 
@@ -290,34 +403,37 @@ template <uint16_t k, uint16_t m, typename Callback>
 void run_callback(const Config& cfg, Callback&& cb)
 {
     // ── Decide pipeline mode (same logic as run<k, m>) ────────────────────
-    uint64_t est_packed = 0;
-    for (const auto& f : cfg.input_files) {
-        std::error_code ec;
-        uint64_t fsz = std::filesystem::file_size(f, ec);
-        if (ec) continue;
-        const bool is_gz = f.size() > 3 && f.compare(f.size()-3, 3, ".gz") == 0;
-        est_packed += is_gz
-            ? static_cast<uint64_t>(fsz * GZ_EXPAND * 35 / 100)
-            : fsz * 2;
-    }
+    const uint64_t est_packed = estimate_phase1_bytes<k, m>(cfg);
     const uint64_t avail   = cfg.ram_budget_bytes > 0
         ? cfg.ram_budget_bytes : available_ram_bytes();
-    const bool     use_mem = avail > 0 && est_packed < avail * 6 / 10;
+    const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
+    const bool     use_mem = avail > 0 && est_packed < mem_limit;
+    const uint64_t override_limit = spill_limit_override();
+    const uint64_t spill_limit    = override_limit ? override_limit : mem_limit;
 
     PartitionStats stats;
 
     if (use_mem) {
         std::vector<std::string> part_bufs(cfg.num_partitions);
         if (est_packed > 0) {
-            const size_t per_part = static_cast<size_t>(
-                est_packed * 6 / 5 / cfg.num_partitions);
+            uint64_t want = est_packed * 6 / 5;
+            if (spill_limit > 0) want = std::min(want, spill_limit);
+            const size_t per_part = static_cast<size_t>(want / cfg.num_partitions);
             if (per_part >= 64)
                 for (size_t p = 0; p < cfg.num_partitions; ++p)
                     part_bufs[p].reserve(per_part);
         }
-        stats = partition_kmers_mem<k, m>(cfg, part_bufs);
-        count_and_callback_mem<k, m>(cfg, stats.kmers, part_bufs,
-                                     std::forward<Callback>(cb));
+        stats = partition_kmers_mem<k, m>(cfg, part_bufs, spill_limit);
+        if (stats.spill_failed)
+            throw std::runtime_error("tuna: spilling partitions to disk failed");
+        if (stats.spilled) {
+            part_bufs.clear();
+            part_bufs.shrink_to_fit();
+            count_and_callback<k, m>(cfg, stats.kmers, std::forward<Callback>(cb));
+        } else {
+            count_and_callback_mem<k, m>(cfg, stats.kmers, part_bufs,
+                                         std::forward<Callback>(cb));
+        }
     } else {
         const size_t disk_write_budget = [&]() -> size_t {
             if (avail == 0) return size_t(64) << 20;

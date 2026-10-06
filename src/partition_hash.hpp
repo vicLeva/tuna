@@ -19,6 +19,9 @@
 
 #include <vector>
 #include <deque>
+#include <fstream>
+#include <iostream>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -36,6 +39,134 @@ inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
     constexpr size_t MIN_FLUSH_BYTES = 4u << 10;  // 4 KB minimum
     return std::max(MIN_FLUSH_BYTES, budget_per_thread / n_parts);
 }
+
+
+// ─── Spill sink ───────────────────────────────────────────────────────────────
+//
+// Phase 1 accumulates superkmers either in per-partition memory buffers or in
+// per-partition files. How much memory the buffers will need cannot be predicted
+// reliably from input file sizes (see the estimate in pipeline.hpp), so rather
+// than trust a prediction this tracks the bytes actually held and, once they
+// cross `limit`, drains every buffer to its partition file and routes all later
+// flushes there.
+//
+// After a spill every partition lives on disk, so phase 2 reads exactly as if
+// the run had started in disk mode. There is deliberately no mixed state: a
+// partition is either wholly in memory or wholly on disk.
+//
+// Thread safety: the routing decision and the write happen together under the
+// partition's own mutex, which is the lock a flush already takes. A writer
+// therefore either appends before its partition is drained, in which case the
+// drain carries its bytes out with it, or it observes the flag and writes to the
+// file. The byte counter is touched once per flush rather than once per
+// superkmer, so it costs one atomic add per flush_threshold bytes written.
+template <uint16_t k, uint16_t m>
+struct SpillSink {
+    std::vector<std::string>&   bufs;
+    std::vector<std::mutex>     mutexes;
+    std::vector<std::ofstream>  files;
+    std::vector<char>           part_spilled;  // char, not bool: always under mutexes[p]
+    std::string                 work_dir;
+    uint64_t                    limit;         // 0 disables spilling entirely
+    std::atomic<uint64_t>       held{0};
+    std::atomic<bool>           any_spilled{false};
+    std::mutex                  spill_mtx;
+    bool                        spill_broken = false;  // under spill_mtx
+    std::mutex                  error_mtx;
+    std::string                 error;
+
+    SpillSink(std::vector<std::string>& b, size_t n_parts,
+              std::string wd, uint64_t lim)
+        : bufs(b), mutexes(n_parts), files(n_parts), part_spilled(n_parts, 0),
+          work_dir(std::move(wd)), limit(lim) {}
+
+    bool spilled() const noexcept
+    { return any_spilled.load(std::memory_order_relaxed); }
+
+    bool failed()
+    { std::lock_guard<std::mutex> lk(error_mtx); return !error.empty(); }
+
+    void fail(std::string msg)
+    {
+        std::lock_guard<std::mutex> lk(error_mtx);
+        if (error.empty()) {
+            error = std::move(msg);
+            std::cerr << "tuna: error: " << error << "\n";
+        }
+    }
+
+    // Close the partition files so phase 2 sees them complete. Called once,
+    // after the phase-1 threads have joined.
+    void close_files()
+    {
+        for (size_t p = 0; p < files.size(); ++p) {
+            if (!files[p].is_open()) continue;
+            files[p].close();
+            if (!files[p])
+                fail("failed while writing partition file: " + partition_path(work_dir, p));
+        }
+    }
+
+    // Drain every in-memory buffer to its partition file and route later
+    // flushes there. Several threads may call this; only the first acts.
+    void spill_all()
+    {
+        std::lock_guard<std::mutex> once(spill_mtx);
+        if (any_spilled.load(std::memory_order_relaxed) || spill_broken) return;
+
+        const size_t n = mutexes.size();
+        // Open every partition file up front. The partition count is already
+        // clamped below the descriptor limit when it is auto-tuned, so this
+        // needs no descriptors the disk pipeline would not have taken anyway.
+        for (size_t p = 0; p < n; ++p) {
+            files[p].open(partition_path(work_dir, p), std::ios::binary);
+            if (!files[p]) {
+                fail("cannot open partition file for spilling: "
+                     + partition_path(work_dir, p));
+                spill_broken = true;   // do not retry on every later flush
+                return;
+            }
+        }
+        for (size_t p = 0; p < n; ++p) {
+            std::lock_guard<std::mutex> lk(mutexes[p]);
+            if (!bufs[p].empty()) {
+                files[p].write(bufs[p].data(),
+                               static_cast<std::streamsize>(bufs[p].size()));
+                if (!files[p])
+                    fail("failed while spilling partition file: "
+                         + partition_path(work_dir, p));
+                bufs[p].clear();
+                bufs[p].shrink_to_fit();   // hand the pages back, not just the size
+            }
+            part_spilled[p] = 1;
+        }
+        held.store(0, std::memory_order_relaxed);
+        any_spilled.store(true, std::memory_order_relaxed);
+    }
+};
+
+// Flush one writer through the sink: into memory while the budget holds, into
+// the partition file once it does not.
+template <uint16_t k, uint16_t m>
+inline void flush_through_sink(SuperkmerWriter<k, m>& w, size_t p, SpillSink<k, m>& sink)
+{
+    const size_t n = w.size();
+    if (n == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(sink.mutexes[p]);
+        if (sink.part_spilled[p]) {
+            w.flush_to_locked(sink.files[p]);
+            return;
+        }
+        w.flush_to_mem_locked(sink.bufs[p]);
+    }
+    if (sink.limit == 0) return;
+    // Checked outside the partition lock: spill_all takes the partition mutexes
+    // itself, so calling it while holding one would deadlock.
+    if (sink.held.fetch_add(n, std::memory_order_relaxed) + n > sink.limit)
+        sink.spill_all();
+}
+
 
 // Reusable contiguous batch for the compressed producer/consumer path.
 // Sequence data is copied once into an arena and boundaries are stored as
@@ -638,11 +769,23 @@ template <uint16_t k, uint16_t m, uint16_t partition_m, typename PartitionFn>
 PartitionStats partition_kmers_mem_impl(
     const Config&             cfg,
     std::vector<std::string>& bufs,
-    PartitionFn               partition_fn)
+    PartitionFn               partition_fn,
+    uint64_t                  spill_limit_bytes)
 {
     const size_t n_files      = cfg.input_files.size();
     const size_t n_threads_req = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts      = cfg.num_partitions;
+
+    SpillSink<k, m> sink(bufs, n_parts, cfg.work_dir, spill_limit_bytes);
+
+    // Close the spilled files and report how phase 1 ended, so the caller knows
+    // whether phase 2 reads memory or disk.
+    auto finish = [&](PartitionStats st) {
+        sink.close_files();
+        st.spilled      = sink.spilled();
+        st.spill_failed = sink.failed();
+        return st;
+    };
 
     // Single gz file + multiple threads → producer-consumer (reuse the
     // same consumers but flush to bufs instead of ofstreams).
@@ -657,13 +800,12 @@ PartitionStats partition_kmers_mem_impl(
             return f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0;
         });
     if (n_threads_req > 1 && all_gz) {
-        std::vector<std::mutex> buf_mutexes(n_parts);
         auto flush_writer = [&](SuperkmerWriter<k, m>& writer, size_t p) {
-            writer.flush_to_mem(bufs[p], buf_mutexes[p]);
+            flush_through_sink(writer, p, sink);
         };
-        return partition_kmers_gz_pc_impl<k, m, partition_m>(
+        return finish(partition_kmers_gz_pc_impl<k, m, partition_m>(
             cfg, cfg.input_files, partition_fn, flush_writer,
-            n_threads_req, 64u << 20);
+            n_threads_req, 64u << 20));
     }
 
     // Single .gz file: producer-consumer variant using in-memory sinks.
@@ -688,7 +830,6 @@ PartitionStats partition_kmers_mem_impl(
             std::atomic<bool>       stop{false};
             std::exception_ptr      consumer_error = nullptr;
             std::mutex              consumer_error_mutex;
-            std::vector<std::mutex> buf_mutexes(n_parts);
             std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
             auto producer_fn = [&]() {
@@ -767,7 +908,7 @@ PartitionStats partition_kmers_mem_impl(
                     std::vector<uint8_t>         packed_buf;
                     uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
                     auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-                        if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                        if (ws[p].needs_flush()) flush_through_sink(ws[p], p, sink);
                     };
                     while (true) {
                         if (stop.load(std::memory_order_relaxed)) break;
@@ -798,7 +939,7 @@ PartitionStats partition_kmers_mem_impl(
                         }
                     }
                     for (size_t p = 0; p < n_parts; ++p)
-                        writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                        flush_through_sink(writers[p], p, sink);
                     total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
                     total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
                     total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
@@ -820,13 +961,12 @@ PartitionStats partition_kmers_mem_impl(
             for (auto& th : threads) th.join();
             if (producer_error) std::rethrow_exception(producer_error);
             if (consumer_error) std::rethrow_exception(consumer_error);
-            return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+            return finish({ total_seqs.load(), total_kmers.load(), total_superkmers.load() });
         }
     }
 
     // Multi-file (or single plain file): file-level work-stealing.
     std::atomic<size_t>     next_file{0};
-    std::vector<std::mutex> buf_mutexes(n_parts);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
     std::atomic<bool>       stop{false};
     std::exception_ptr      worker_error = nullptr;
@@ -842,7 +982,7 @@ PartitionStats partition_kmers_mem_impl(
             uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
 
             auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
-                if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                if (ws[p].needs_flush()) flush_through_sink(ws[p], p, sink);
             };
 
             while (true) {
@@ -860,7 +1000,7 @@ PartitionStats partition_kmers_mem_impl(
             }
 
             for (size_t p = 0; p < n_parts; ++p)
-                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                flush_through_sink(writers[p], p, sink);
 
             total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
             total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
@@ -880,7 +1020,7 @@ PartitionStats partition_kmers_mem_impl(
         threads.emplace_back(worker);
     for (auto& th : threads) th.join();
     if (worker_error) std::rethrow_exception(worker_error);
-    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+    return finish({ total_seqs.load(), total_kmers.load(), total_superkmers.load() });
 }
 
 
@@ -903,11 +1043,12 @@ PartitionStats partition_kmers(
 template <uint16_t k, uint16_t m>
 PartitionStats partition_kmers_mem(
     const Config&             cfg,
-    std::vector<std::string>& bufs)
+    std::vector<std::string>& bufs,
+    uint64_t                  spill_limit_bytes = 0)
 {
     const size_t n    = cfg.num_partitions;
     const size_t mask = n - 1; // n is always a power of 2 (enforced in main.cpp)
     static constexpr uint16_t partition_m = m;
     return partition_kmers_mem_impl<k, m, partition_m>(cfg, bufs,
-        [mask](uint64_t h) -> size_t { return h & mask; });
+        [mask](uint64_t h) -> size_t { return h & mask; }, spill_limit_bytes);
 }

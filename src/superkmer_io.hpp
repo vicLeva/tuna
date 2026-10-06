@@ -263,6 +263,23 @@ struct SuperkmerWriter
         dst.append(raw_, sz_);
         sz_ = 0;
     }
+
+    // Variants for a caller that already holds the partition's mutex. The spill
+    // sink has to decide where a flush goes and perform it under one lock, so it
+    // cannot use the self-locking versions above.
+    void flush_to_locked(std::ofstream& file)
+    {
+        if (sz_ == 0) return;
+        file.write(raw_, static_cast<std::streamsize>(sz_));
+        sz_ = 0;
+    }
+
+    void flush_to_mem_locked(std::string& dst)
+    {
+        if (sz_ == 0) return;
+        dst.append(raw_, sz_);
+        sz_ = 0;
+    }
 };
 
 

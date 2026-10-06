@@ -5,7 +5,15 @@
 #include <cstdint>
 #include <limits>
 
-struct PartitionStats { uint64_t seqs = 0, kmers = 0, superkmers = 0; };
+struct PartitionStats {
+    uint64_t seqs = 0, kmers = 0, superkmers = 0;
+    // Phase 1 started in memory, crossed the memory budget, and drained every
+    // partition to disk. Phase 2 must then read from disk.
+    bool spilled      = false;
+    // A spill was needed but could not be completed (partition files could not
+    // be opened or written). The run has to be reported as failed.
+    bool spill_failed = false;
+};
 
 enum class SuperkmerDedupMode : uint8_t {
     Auto,
