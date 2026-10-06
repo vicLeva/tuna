@@ -104,9 +104,21 @@ inline double superkmer_bytes_per_base()
 }
 
 // Percentage of the budget the in-memory pipeline may occupy, in resident-byte
-// terms. 60 leaves room for the phase-2 tables, which for read sets can hold
-// tens of billions of distinct kmers. Assemblies need far less, so the right
-// value is data-dependent and this exists to measure where it should sit.
+// terms. The remainder is headroom for the phase-2 tables, which on read sets
+// can hold tens of billions of distinct kmers.
+//
+// 80 was measured rather than guessed. On 60 human assemblies at a 256 GB
+// budget, 60% sent a 30-genome collection to disk that memory could hold,
+// costing 19% in wall time, while 80% kept it in memory at 63% of budget. A
+// gallus read set, 2.85 G distinct kmers counted in memory, showed no
+// regression at 80%. Every collection tested stayed well inside the budget.
+//
+// What this is not: none of those datasets stresses the headroom in memory.
+// The one with a very high distinct count, humanthree at 20.9 G, has an input
+// large enough to force the disk pipeline, where phase 2 takes one partition at
+// a time and peaks near 3 GB. A collection that is small enough to stay in
+// memory while holding that many distinct kmers would be the case to re-check,
+// and TUNA_MEM_PCT exists to try other values without a rebuild.
 inline unsigned mem_budget_pct()
 {
     if (const char* e = std::getenv("TUNA_MEM_PCT")) {
@@ -114,7 +126,7 @@ inline unsigned mem_budget_pct()
         const unsigned long v = std::strtoul(e, &end, 10);
         if (end != e && v >= 10 && v <= 95) return static_cast<unsigned>(v);
     }
-    return 60;
+    return 80;
 }
 
 // Testing hook. Lowers the spill watermark so the spill path can be exercised
