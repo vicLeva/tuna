@@ -20,8 +20,12 @@ source "$HERE/bench_common.sh"
 
 ECOLI_FOF="$DATA_ROOT/dataset_genome_ecoli/fof.list"
 HUMAN_FOF="$DATA_ROOT/dataset_genome_human/fof.list"
-ECOLI_NS=(1 2 3 5 10 20 50 100 200 500 1000 1500 2000 2500 3000 3500)
-HUMAN_NS=(1 2 3 4 5 6 7 8 9 10 15 20 25 30 60)
+# File counts to sweep. Overridable from the environment so a run can be
+# retargeted without editing this file, e.g. to sample around the point where a
+# collection outgrows its memory budget:
+#   HUMAN_NS="30 35 40 45 50 60" ONLY_DATASETS=human ONLY_TOOLS=tuna ...
+read -r -a ECOLI_NS <<< "${ECOLI_NS:-1 2 3 5 10 20 50 100 200 500 1000 1500 2000 2500 3000 3500}"
+read -r -a HUMAN_NS <<< "${HUMAN_NS:-1 2 3 4 5 6 7 8 9 10 15 20 25 30 60}"
 
 bench_init scaling "tuna kmc fastk"
 
