@@ -89,6 +89,12 @@ inline double bases_per_file_byte(bool is_gz, bool is_fastq)
     return is_fastq ? 1.2 : 3.4;
 }
 
+// The per-partition std::string buffers grow by doubling, so live allocation
+// runs above the bytes actually written. Measured 1.4 to 1.8 times on real
+// inputs. Both the estimate and the spill watermark have to agree on this, or
+// they end up comparing different quantities against the same threshold.
+constexpr double BUFFER_SLACK = 1.4;
+
 template <uint16_t k, uint16_t m>
 inline double superkmer_bytes_per_base()
 {
@@ -114,17 +120,13 @@ template <uint16_t k, uint16_t m>
 inline uint64_t estimate_phase1_bytes(const Config& cfg)
 {
     const double bpb = superkmer_bytes_per_base<k, m>();
-    // The per-partition std::string buffers grow by doubling, so the live
-    // allocation sits above the bytes written. Measured 1.4 to 1.8 times; the
-    // spill sink covers whatever this misses.
-    constexpr double SLACK = 1.4;
     double est = 0.0;
     for (const auto& f : cfg.input_files) {
         std::error_code ec;
         const uint64_t fsz = std::filesystem::file_size(f, ec);
         if (ec) continue;
         const bool is_gz = f.size() > 3 && f.compare(f.size() - 3, 3, ".gz") == 0;
-        est += double(fsz) * bases_per_file_byte(is_gz, input_is_fastq(f)) * bpb * SLACK;
+        est += double(fsz) * bases_per_file_byte(is_gz, input_is_fastq(f)) * bpb * BUFFER_SLACK;
     }
     return static_cast<uint64_t>(est);
 }
@@ -165,10 +167,18 @@ int run(const Config& cfg)
     // Stay in memory while the buffers are *measured* to hold less than this.
     // The same fraction used to gate a prediction; it is now a watermark the
     // spill sink enforces, so overshooting the budget is no longer possible.
+    // mem_limit is in resident-bytes terms, which is what est_packed predicts.
     const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
     const bool use_mem_pipeline = avail > 0 && est_packed < mem_limit;
+    // The watermark is compared against bytes appended to the buffers, which
+    // carry no allocator slack, so divide by the same factor the estimate
+    // applies. Without this the spill fires at mem_limit of logical bytes,
+    // i.e. around BUFFER_SLACK times that in residency, eating the headroom
+    // the 60% was meant to leave for the phase-2 tables.
+    const uint64_t watermark = avail > 0
+        ? static_cast<uint64_t>(double(mem_limit) / BUFFER_SLACK) : 0;
     const uint64_t override_limit = spill_limit_override();
-    const uint64_t spill_limit    = override_limit ? override_limit : mem_limit;
+    const uint64_t spill_limit    = override_limit ? override_limit : watermark;
 
     // Disk-mode write-buffer budget: up to 30% of RAM across all threads,
     // capped at 512 MB/thread.  Larger buffers → fewer, bigger writes.
@@ -408,8 +418,10 @@ void run_callback(const Config& cfg, Callback&& cb)
         ? cfg.ram_budget_bytes : available_ram_bytes();
     const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
     const bool     use_mem = avail > 0 && est_packed < mem_limit;
+    const uint64_t watermark = avail > 0
+        ? static_cast<uint64_t>(double(mem_limit) / BUFFER_SLACK) : 0;
     const uint64_t override_limit = spill_limit_override();
-    const uint64_t spill_limit    = override_limit ? override_limit : mem_limit;
+    const uint64_t spill_limit    = override_limit ? override_limit : watermark;
 
     PartitionStats stats;
 
