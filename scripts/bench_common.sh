@@ -29,7 +29,11 @@
 # CSV schema (one file per experiment)
 # ---------------------------------------------------------------------------
 #   dataset,key,label,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,
-#   unique_kmers,total_kmers,status
+#   unique_kmers,total_kmers,status,spilled
+#
+#   spilled: 1 when tuna started phase 1 in memory and crossed its budget,
+#   draining the partitions to disk mid-run; 0 when it stayed on one route.
+#   Empty for the other tools, which have no such transition.
 #
 #   key    the experiment's independent variable: file index (all_datasets),
 #          number of input files (scaling, big_data) or thread count
@@ -140,7 +144,7 @@ bench_init() {
     (( err )) && exit 1
 
     mkdir -p "$ROOT" "$WORK" "$AUX" "$LINKS"
-    [[ -f "$CSV" ]] || echo "dataset,key,label,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status" > "$CSV"
+    [[ -f "$CSV" ]] || echo "dataset,key,label,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status,spilled" > "$CSV"
 
     SCSV="$ROOT/${EXPERIMENT}_kmer_stats.csv"
     HIST="$ROOT/hist/$EXPERIMENT"
@@ -284,9 +288,9 @@ run_tuna() {
         fi
         rm -f "$out"; rm -rf "$WORK/t"
         if [[ $st != ok ]]; then
-            row "$ds,$key,$label,tuna,$mode,,,,,,,,$st"; echo "    [$st] tuna $mode"; continue
+            row "$ds,$key,$label,tuna,$mode,,,,,,,,$st,"; echo "    [$st] tuna $mode"; continue
         fi
-        row "$ds,$key,$label,tuna,$mode,$(wall_of "$tf"),$(rss_of "$tf"),$(se_val phase1 "$se"),$(se_val phase2 "$se"),,$(se_val unique_kmers "$se"),$(se_val total_kmers "$se"),ok"
+        row "$ds,$key,$label,tuna,$mode,$(wall_of "$tf"),$(rss_of "$tf"),$(se_val phase1 "$se"),$(se_val phase2 "$se"),,$(se_val unique_kmers "$se"),$(se_val total_kmers "$se"),ok,$(se_val spilled "$se")"
         printf "    [tuna  %-5s] wall=%9ss  p1=%9ss  p2=%9ss  RSS=%8sMB\n" \
             "$mode" "$(wall_of "$tf")" "$(se_val phase1 "$se")" "$(se_val phase2 "$se")" "$(rss_of "$tf")"
     done
@@ -311,15 +315,15 @@ run_kmc() {
         "$input" "$WORK/kmcdb" "$WORK/kmctmp" > "$se" 2>&1
     rc=$?; st=$(status_of "$rc"); rm -rf "$WORK/kmctmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st"
-        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st"
+        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st,"
+        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st,"
         echo "    [$st] kmc"; rm -f "$WORK/kmcdb".kmc_*; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
     p1=$(se_val "1st stage" "$se"); p2=$(se_val "2nd stage" "$se")
     uniq=$(kmc_num "No. of unique k-mers" "$se"); tot=$(kmc_num "Total no. of k-mers" "$se")
     if (( need_bin )); then
-        row "$ds,$key,$label,kmc,bin,$wall,$rss,$p1,$p2,,$uniq,$tot,ok"
+        row "$ds,$key,$label,kmc,bin,$wall,$rss,$p1,$p2,,$uniq,$tot,ok,"
         printf "    [kmc   %-5s] wall=%9ss  p1=%9ss  p2=%9ss  RSS=%8sMB\n" bin "$wall" "$p1" "$p2" "$rss"
     fi
     # ASCII = the same binary DB, plus a separately timed kmc_dump.
@@ -328,10 +332,10 @@ run_kmc() {
             "$KMC_DUMP" "$WORK/kmcdb" "$WORK/out.tsv" >/dev/null 2>>"$se"
         drc=$?; dst=$(status_of "$drc"); rm -f "$WORK/out.tsv"
         if [[ $dst != ok ]]; then
-            row "$ds,$key,$label,kmc,ascii,,,,,,,,$dst"; echo "    [$dst] kmc_dump"
+            row "$ds,$key,$label,kmc,ascii,,,,,,,,$dst,"; echo "    [$dst] kmc_dump"
         else
             dump=$(wall_of "$dt")
-            row "$ds,$key,$label,kmc,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,$p1,$p2,$dump,$uniq,$tot,ok"
+            row "$ds,$key,$label,kmc,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,$p1,$p2,$dump,$uniq,$tot,ok,"
             printf "    [kmc   %-5s] wall=%9ss  (kmc=%ss + dump=%ss)\n" ascii \
                 "$(awk "BEGIN{printf \"%.3f\",$wall+$dump}")" "$wall" "$dump"
         fi
@@ -376,13 +380,13 @@ run_fastk() {
         >/dev/null 2>"$se"
     rc=$?; st=$(status_of "$rc"); rm -rf "$tmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st"
-        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st"
+        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st,"
+        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st,"
         echo "    [$st] fastk"; rm -f "$db"* ".${db##*/}"* 2>/dev/null; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
     if (( need_bin )); then
-        row "$ds,$key,$label,fastk,bin,$wall,$rss,,,,,,ok"
+        row "$ds,$key,$label,fastk,bin,$wall,$rss,,,,,,ok,"
         printf "    [fastk %-5s] wall=%9ss  RSS=%8sMB\n" bin "$wall" "$rss"
     fi
     # Tabex crashes on a good share of FastK tables; when it does, only the
@@ -392,10 +396,10 @@ run_fastk() {
             "$TABEX" -A "$db" > "$WORK/out.tsv" 2>>"$se"
         drc=$?; dst=$(status_of "$drc"); rm -f "$WORK/out.tsv"
         if [[ $dst != ok ]]; then
-            row "$ds,$key,$label,fastk,ascii,,,,,,,,$dst"; echo "    [$dst] Tabex"
+            row "$ds,$key,$label,fastk,ascii,,,,,,,,$dst,"; echo "    [$dst] Tabex"
         else
             dump=$(wall_of "$dt")
-            row "$ds,$key,$label,fastk,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,,,$dump,,,ok"
+            row "$ds,$key,$label,fastk,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,,,$dump,,,ok,"
             printf "    [fastk %-5s] wall=%9ss  (fastk=%ss + tabex=%ss)\n" ascii \
                 "$(awk "BEGIN{printf \"%.3f\",$wall+$dump}")" "$wall" "$dump"
         fi
