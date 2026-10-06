@@ -103,6 +103,20 @@ inline double superkmer_bytes_per_base()
     return (std::ceil(sk_bases / 4.0) + 1.0) / s;   // packed bases + length header
 }
 
+// Percentage of the budget the in-memory pipeline may occupy, in resident-byte
+// terms. 60 leaves room for the phase-2 tables, which for read sets can hold
+// tens of billions of distinct kmers. Assemblies need far less, so the right
+// value is data-dependent and this exists to measure where it should sit.
+inline unsigned mem_budget_pct()
+{
+    if (const char* e = std::getenv("TUNA_MEM_PCT")) {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(e, &end, 10);
+        if (end != e && v >= 10 && v <= 95) return static_cast<unsigned>(v);
+    }
+    return 60;
+}
+
 // Testing hook. Lowers the spill watermark so the spill path can be exercised
 // without an input large enough to cross a real memory budget. Unset in normal
 // runs, in which case the watermark comes from the budget alone.
@@ -168,7 +182,7 @@ int run(const Config& cfg)
     // The same fraction used to gate a prediction; it is now a watermark the
     // spill sink enforces, so overshooting the budget is no longer possible.
     // mem_limit is in resident-bytes terms, which is what est_packed predicts.
-    const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
+    const uint64_t mem_limit = avail > 0 ? avail / 100 * mem_budget_pct() : 0;
     const bool use_mem_pipeline = avail > 0 && est_packed < mem_limit;
     // The watermark is compared against bytes appended to the buffers, which
     // carry no allocator slack, so divide by the same factor the estimate
@@ -416,7 +430,7 @@ void run_callback(const Config& cfg, Callback&& cb)
     const uint64_t est_packed = estimate_phase1_bytes<k, m>(cfg);
     const uint64_t avail   = cfg.ram_budget_bytes > 0
         ? cfg.ram_budget_bytes : available_ram_bytes();
-    const uint64_t mem_limit = avail > 0 ? avail * 6 / 10 : 0;
+    const uint64_t mem_limit = avail > 0 ? avail / 100 * mem_budget_pct() : 0;
     const bool     use_mem = avail > 0 && est_packed < mem_limit;
     const uint64_t watermark = avail > 0
         ? static_cast<uint64_t>(double(mem_limit) / BUFFER_SLACK) : 0;

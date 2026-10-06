@@ -32,6 +32,7 @@ bench_init scaling "tuna kmc fastk"
 sweep() {
     local ds="$1" fof="$2" m="$3"; shift 3
     local ns=("$@") total n sub fkf
+    dataset_enabled "$ds" || return 0
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; return; }
     total=$(wc -l < "$fof")
     M="$m"
