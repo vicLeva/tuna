@@ -260,7 +260,9 @@ int run(const Config& cfg)
             part_bufs.clear();
             part_bufs.shrink_to_fit();
             spilled_to_disk = true;
-            if (!cfg.hide_progress)
+            // Debug-only: spilling is a normal response to the budget, not
+            // something the user has to act on.
+            if (cfg.debug_stats)
                 std::cerr << "      memory budget reached, spilled to disk\n";
         } else {
         const double t_phase1 = elapsed_s(t_part);
@@ -270,8 +272,7 @@ int run(const Config& cfg)
 
         if (cfg.partition_only) {
             std::cerr << "phase1: "     << t_phase1        << "s\n"
-                      << "superkmers: " << stats.superkmers << "\n"
-                      << "spilled: 0\n";
+                      << "superkmers: " << stats.superkmers << "\n";
             if (!cfg.hide_progress)
                 std::cerr << "done  (partition only)\n";
             return 0;
@@ -322,7 +323,6 @@ int run(const Config& cfg)
                   << "phase2: "        << t_phase2            << "s\n"
                   << "superkmers: "    << stats.superkmers     << "\n"
                   << "n_parts: "       << cfg.num_partitions   << "\n"
-                  << "spilled: 0\n"
                   << "total_kmers: "   << total_inserted       << "\n"
                   << "unique_kmers: "  << total_written        << "\n";
         if (!cfg.hide_progress)
@@ -368,8 +368,7 @@ int run(const Config& cfg)
         // superkmers is reported here too, so a -tp run gives the same fields
         // whether it ran in memory, on disk, or spilled from one to the other.
         std::cerr << "phase1: "     << t_phase1         << "s\n"
-                  << "superkmers: " << stats.superkmers << "\n"
-                  << "spilled: "    << (spilled_to_disk ? 1 : 0) << "\n";
+                  << "superkmers: " << stats.superkmers << "\n";
         if (!cfg.hide_progress)
             std::cerr << "done  (partition only)\n";
         return 0;
@@ -423,7 +422,6 @@ int run(const Config& cfg)
               << "phase2: "     << t_phase2        << "s\n"
               << "superkmers: " << stats.superkmers << "\n"
               << "n_parts: "    << cfg.num_partitions << "\n"
-              << "spilled: "    << (spilled_to_disk ? 1 : 0) << "\n"
               << "total_kmers: " << total_inserted << "\n"
               << "unique_kmers: " << total_written << "\n";
 
