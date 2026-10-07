@@ -4,9 +4,21 @@
 //
 // Three independently modifiable bricks:
 //
-//   count_partition<k,m>   — read one partition file, fill a hash table.
-//   write_counts<k,m>      — drain one table to the output stream.
-//   count_and_write<k,m>   — parallel harness (threading / scheduling).
+//   count_partition<k,m>   — read one partition, fill a hash table.
+//   drain one table        — write_counts (TSV), KffBatchWriter (KFF),
+//                            write_counts_callback (user callback), or
+//                            count_filtered (count only, no output).
+//   count_and_write<k,m>   — parallel harness (threading / scheduling), with
+//     count_and_write_mem    one variant reading partition files and one
+//                            reading in-memory buffers.
+//
+// There is one harness per source, not one per output. Picking an output mode
+// changes only which drain runs at the end of a partition, so every caller,
+// CLI or library, gets the same counting: the same deduplication decision, the
+// same table sizing, the same statistics. count_and_callback* are thin
+// wrappers that select the callback drain. They used to be separate copies of
+// the harness and drifted out of step, silently skipping the deduplication the
+// write path performed, which cost roughly a factor of two on redundant input.
 
 #include "Config.hpp"
 #include "kff_output.hpp"
@@ -22,6 +34,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <cassert>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -641,15 +654,29 @@ uint64_t write_counts_callback(
 }
 
 
-// ─── Callback counting harnesses ──────────────────────────────────────────────
+// Output mode for the counting harnesses below. A harness drains each finished
+// table through exactly one of four sinks: a TSV stream, a KFF writer, a user
+// callback, or nothing at all when only the count is wanted. Which one is in
+// play is fixed at compile time by the Callback template parameter and, for the
+// file modes, by which of the two output pointers is non-null.
 //
-// Same structure as count_and_write / count_and_write_mem but drain tables via
-// a user-supplied callback instead of writing to a file.
+// NoCallback is the default: it means "not the callback mode" and is never
+// instantiated. It exists so the common case reads as a named choice rather
+// than as a pointer to std::nullptr_t.
+struct NoCallback {};
+
+// ─── Callback counting entry points ──────────────────────────────────────────
 //
-// Thread safety: cb may be called concurrently from multiple worker threads
-// (one per partition).  Each partition's k-mers are disjoint, so there is no
-// risk of duplicate calls for the same k-mer.  The caller must ensure cb is
-// safe to call from multiple threads if num_threads > 1.
+// These do not reimplement counting. They call the same harness the CLI uses
+// and pass a callback as the output mode, so an API run and a CLI run execute
+// identical code and differ only in where the counted kmers go. An earlier
+// version duplicated the harness here and drifted: it never applied the
+// superkmer deduplication the write path chose, which cost about a factor of
+// two on redundant input.
+//
+// Thread safety: cb may be called concurrently, one table per worker. Each
+// partition's kmers are disjoint, so no kmer is reported twice, but the caller
+// must make cb safe to call from several threads when num_threads > 1.
 
 template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback_mem(
@@ -658,69 +685,13 @@ std::pair<uint64_t, uint64_t> count_and_callback_mem(
     std::vector<std::string>& part_bufs,
     Callback&&                cb)
 {
-    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;  // hash table type (local alias)
-
-    const size_t n_parts   = cfg.num_partitions;
-    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
-    std::atomic<size_t> next_part{0};
-
-    std::atomic<uint64_t> total_inserted{0}, total_written{0};
-    std::atomic<bool> stop{false};
-    std::exception_ptr worker_error = nullptr;
-    std::mutex worker_error_mutex;
-    std::atomic<uint64_t> calibrated_unique{0};
-
-    auto worker = [&](size_t /*tid*/) {
-        try {
-            typename table_t::Token token;
-
-            while (true) {
-                if (stop.load(std::memory_order_relaxed)) break;
-                const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
-                if (p >= n_parts) break;
-                const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-                const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
-                table_t table(init_sz, 1);
-
-                uint64_t ins;  // k-mers inserted into this partition
-                {
-                    MemoryReader<k, m> reader(part_bufs[p]);
-                    ins = count_partition<k, m, canonical_, MemoryReader<k, m>>(reader, table, token);
-                }
-                { std::string tmp; part_bufs[p].swap(tmp); }
-                total_inserted.fetch_add(ins, std::memory_order_relaxed);
-                if (cal == 0) {
-                    const uint64_t unique = static_cast<uint64_t>(table.size());
-                    if (unique > 0) {
-                        uint64_t expected = 0;
-                        calibrated_unique.compare_exchange_strong(
-                            expected, unique,
-                            std::memory_order_relaxed, std::memory_order_relaxed);
-                    }
-                }
-
-                const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);  // k-mers written to output
-                total_written.fetch_add(wrt, std::memory_order_relaxed);
-            }
-        } catch (...) {
-            {
-                std::lock_guard<std::mutex> lk(worker_error_mutex);
-                if (!worker_error) worker_error = std::current_exception();
-            }
-            stop.store(true, std::memory_order_relaxed);
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (size_t t = 0; t < n_threads; ++t)
-        threads.emplace_back(worker, t);
-    for (auto& th : threads) th.join();
-    if (worker_error) std::rethrow_exception(worker_error);
-
-    return { total_inserted.load(), total_written.load() };
+    // cb is a named parameter, so it is an lvalue whatever Callback deduces to
+    // and taking its address is safe. The harness only borrows it: every call
+    // happens before this function returns.
+    using CB = std::remove_reference_t<Callback>;
+    return count_and_write_mem<k, m, canonical_, CB>(
+        cfg, total_kmers, part_bufs, nullptr, nullptr, &cb);
 }
-
 
 template <uint16_t k, uint16_t m, bool canonical_ = true, typename Callback>
 std::pair<uint64_t, uint64_t> count_and_callback(
@@ -728,72 +699,13 @@ std::pair<uint64_t, uint64_t> count_and_callback(
     uint64_t      total_kmers,
     Callback&&    cb)
 {
-    using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
-
-    const size_t n_parts   = cfg.num_partitions;
-    const size_t n_threads = std::min(static_cast<size_t>(cfg.num_threads), n_parts);
-    std::atomic<size_t> next_part{0};
-
-    std::atomic<uint64_t> total_inserted{0}, total_written{0};
-    std::atomic<bool> stop{false};
-    std::exception_ptr worker_error = nullptr;
-    std::mutex worker_error_mutex;
-    std::atomic<uint64_t> calibrated_unique{0};
-
-    auto worker = [&](size_t /*tid*/) {
-        try {
-            typename table_t::Token token;
-
-            while (true) {
-                if (stop.load(std::memory_order_relaxed)) break;
-                const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
-                if (p >= n_parts) break;
-                const std::string path = partition_path(cfg.work_dir, p);
-                SuperkmerReader<k, m> reader(path);
-                if (!reader.ok())
-                    throw std::runtime_error(
-                        "tuna: cannot open partition file for reading: " + path);
-                const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
-                const size_t init_sz = partition_init_size(cal, total_kmers, n_parts);
-                table_t table(init_sz, 1);
-
-                const uint64_t ins = count_partition<k, m, canonical_>(reader, table, token);
-                total_inserted.fetch_add(ins, std::memory_order_relaxed);
-                if (cal == 0) {
-                    const uint64_t unique = static_cast<uint64_t>(table.size());
-                    if (unique > 0) {
-                        uint64_t expected = 0;
-                        calibrated_unique.compare_exchange_strong(
-                            expected, unique,
-                            std::memory_order_relaxed, std::memory_order_relaxed);
-                    }
-                }
-
-                const uint64_t wrt = write_counts_callback<k, m>(table, cfg, cb);
-                total_written.fetch_add(wrt, std::memory_order_relaxed);
-            }
-        } catch (...) {
-            {
-                std::lock_guard<std::mutex> lk(worker_error_mutex);
-                if (!worker_error) worker_error = std::current_exception();
-            }
-            stop.store(true, std::memory_order_relaxed);
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (size_t t = 0; t < n_threads; ++t)
-        threads.emplace_back(worker, t);
-    for (auto& th : threads) th.join();
-    if (worker_error) std::rethrow_exception(worker_error);
-
-    return { total_inserted.load(), total_written.load() };
+    // See count_and_callback_mem on why &cb is safe here.
+    using CB = std::remove_reference_t<Callback>;
+    return count_and_write<k, m, canonical_, CB>(
+        cfg, total_kmers, nullptr, nullptr, &cb);
 }
 
 
-// ─── Debug output helper ──────────────────────────────────────────────────────
-//
 // Called by count_and_write (disk) and count_and_write_mem (in-memory) after
 // all partitions have been processed.  Prints per-partition table stats,
 // aggregate load-factor analysis, resize summary, and minimizer coverage.
@@ -1076,13 +988,22 @@ inline void emit_debug_stats(
 // total_kmers counts all occurrences (with multiplicity), so 2× gives headroom
 // for the unique fraction without oversizing beyond the 4M cap.
 
-template <uint16_t k, uint16_t m, bool canonical_ = true>
+template <uint16_t k, uint16_t m, bool canonical_ = true,
+          typename Callback = NoCallback>
 std::pair<uint64_t, uint64_t> count_and_write(
     const Config&  cfg,
     uint64_t       total_kmers,
     std::ofstream* out,       // non-null for TSV output
-    KffOutput*     kff_out)   // non-null for KFF output
+    KffOutput*     kff_out,   // non-null for KFF output
+    Callback*      cb = nullptr)  // set only in callback mode
 {
+    // Exactly one sink, as in the in-memory harness.
+    if constexpr (!std::is_same_v<Callback, NoCallback>) {
+        assert(cb && !out && !kff_out && "callback mode takes no output file");
+    } else {
+        assert(!(out && kff_out) && "TSV and KFF are mutually exclusive");
+    }
+
     using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
@@ -1163,10 +1084,17 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     dbg->resize_log  = table.resize_log();
                 }
 
-                const uint64_t wrt = kff_out
-                    ? kff_writer.write(table, cfg)
-                    : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
-                          : count_filtered<k, m>(table, cfg);
+                // As in the in-memory harness: the output mode changes only
+                // this drain, never the counting above it.
+                uint64_t wrt;
+                if constexpr (std::is_same_v<Callback, NoCallback>) {
+                    wrt = kff_out
+                        ? kff_writer.write(table, cfg)
+                        : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
+                              : count_filtered<k, m>(table, cfg);
+                } else {
+                    wrt = write_counts_callback<k, m, false, canonical_>(table, cfg, *cb);
+                }
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
 
                 // Collect per-partition overflow stats.
@@ -1244,14 +1172,24 @@ std::pair<uint64_t, uint64_t> count_and_write(
 // Each partition buffer is cleared after processing to release memory
 // incrementally — peak RSS ≈ largest-single-partition buffer, not all at once.
 
-template <uint16_t k, uint16_t m, bool canonical_ = true>
+template <uint16_t k, uint16_t m, bool canonical_ = true,
+          typename Callback = NoCallback>
 std::pair<uint64_t, uint64_t> count_and_write_mem(
     const Config&             cfg,
     uint64_t                  total_kmers,
     std::vector<std::string>& part_bufs,
     std::ofstream*            out,       // non-null for TSV output
-    KffOutput*                kff_out)   // non-null for KFF output
+    KffOutput*                kff_out,   // non-null for KFF output
+    Callback*                 cb = nullptr)  // set only in callback mode
 {
+    // Exactly one sink, always. In callback mode the file pointers are ignored
+    // by the drain below, so a caller passing both would silently lose its
+    // output; catch that here rather than at a user's expense.
+    if constexpr (!std::is_same_v<Callback, NoCallback>) {
+        assert(cb && !out && !kff_out && "callback mode takes no output file");
+    } else {
+        assert(!(out && kff_out) && "TSV and KFF are mutually exclusive");
+    }
     using table_t = phase2_table_t<k, false, uint32_t, m, canonical_>;
 
     const size_t n_parts   = cfg.num_partitions;
@@ -1259,9 +1197,16 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     const size_t dedup_budget = superkmer_dedup_worker_budget(cfg, n_threads);
     std::atomic<size_t> next_part{0};
 
+    // chunk, kff_writer and out_mutex below serve the file sinks only; in
+    // callback mode they are built and left unused, which costs nothing.
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
     std::atomic<uint64_t> ov_total{0};
+    // Matches count_and_write: a throwing worker stops the others and the
+    // exception is rethrown from here rather than terminating the process.
+    std::atomic<bool>     stop{false};
+    std::exception_ptr    worker_error = nullptr;
+    std::mutex            worker_error_mutex;
 
     // Debug statistics (only used when cfg.debug_stats).
     std::vector<PartitionDebugInfo> part_infos;
@@ -1270,11 +1215,13 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     SuperkmerDedupStats dedup_stats;
 
     auto worker = [&](size_t /*tid*/) {
+      try {
         typename table_t::Token token;
         std::string chunk;
         KffBatchWriter<k> kff_writer(kff_out);
 
         while (true) {
+            if (stop.load(std::memory_order_relaxed)) break;
             const size_t p = next_part.fetch_add(1, std::memory_order_relaxed);
             if (p >= n_parts) break;
             const uint64_t cal = calibrated_unique.load(std::memory_order_relaxed);
@@ -1320,13 +1267,27 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = kff_out
-                ? kff_writer.write(table, cfg)
-                : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
-                      : count_filtered<k, m>(table, cfg);
+            // The only thing an output mode changes is this drain. Everything
+            // above it, the dedup decision included, is shared by every caller.
+            uint64_t wrt;
+            if constexpr (std::is_same_v<Callback, NoCallback>) {
+                wrt = kff_out
+                    ? kff_writer.write(table, cfg)
+                    : out ? write_counts<k, m>(table, cfg, chunk, *out, out_mutex)
+                          : count_filtered<k, m>(table, cfg);
+            } else {
+                wrt = write_counts_callback<k, m, false, canonical_>(table, cfg, *cb);
+            }
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
         kff_writer.flush();
+      } catch (...) {
+        {
+            std::lock_guard<std::mutex> lk(worker_error_mutex);
+            if (!worker_error) worker_error = std::current_exception();
+        }
+        stop.store(true, std::memory_order_relaxed);
+      }
     };
 
     std::vector<std::thread> threads;
@@ -1334,6 +1295,7 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     for (size_t t = 0; t < n_threads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
 
     if (ov_total.load() > 0)
         std::cerr << "[overflow] " << ov_total.load() << " k-mers went to overflow\n";
