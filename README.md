@@ -30,7 +30,7 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 
 tuna runs a two-phase pipeline:
 
-1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
+1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. tuna estimates the superkmer size up front and keeps phase 1 in memory when it fits the RAM budget; if the budget is reached while running, the partitions held in memory are spilled to disk and counting continues from there, so a run never exceeds its budget. Running with `-dbg` reports when a spill happens. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
 
 2. **Count (Phase 2)** — replays each partition, routing canonical rolling k-mer hashes into a Kache-hash table with increment semantics. This is independent of the shorter partition minimizer, avoiding minimizer-induced bucket skew. Each worker holds one partition table at a time.
 
@@ -134,11 +134,11 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
-| `-m` | `<int>` | `17` | Partition minimizer length. Any value in `[1, min(k-1, 32)]`; `17` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
+| `-m` | `<int>` | `15` | Partition minimizer length. Any odd value in `[1, min(k-1, 32)]`; `15` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
 | `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
-| `-ram` | `<int>` | auto | RAM budget in GB. Controls whether the in-memory or disk pipeline is used, and sizes write buffers accordingly. Set lower than physical RAM to leave headroom for other processes, or higher to force the in-memory pipeline |
+| `-ram` | `<int>` | auto | RAM budget in GB. Phase 1 starts in memory when the estimated superkmer size fits the budget and goes to disk otherwise; if the budget is reached mid-run, the partitions held in memory are spilled to disk and the run finishes on the disk path. Also sizes write buffers. Set lower than physical RAM to leave headroom for other processes, or higher to keep phase 1 in memory |
 | `-w` | `<dir>` | next to output | Working directory for temporary partition files. |
 | `-kff` | — | off | Write output in [KFF binary format](https://github.com/Kmer-File-Format/kff-reference) instead of TSV. Auto-detected from a `.kff` output extension. |
 | `-b` | — | off | Disable canonical k-mers: count forward and reverse-complement strands independently. By default, a k-mer and its reverse complement are merged into a single count (the canonical, lexicographically smaller form is reported). Use `-b` when strand orientation matters or to match tools that count each strand separately. |
@@ -190,7 +190,7 @@ Benchmark counting without serializing k-mers:
 tuna -k 31 -t 8 -co @genomes.list /dev/null
 ```
 
-> **Large genomes** — counting a human-scale genome (3 Gbp) produces ~500 million unique k-mers. In TSV this reaches ~20–30 GB; at k=31, KFF uses 8 sequence bytes plus 1–4 count bytes per k-mer.
+> **Large genomes** — counting one human assembly (3.0 Gbp) yields about 2.5 billion distinct 31-mers. In TSV that is roughly 85 GB, so prefer KFF, or `/dev/null` with `-co` when benchmarking; at k=31, KFF uses 8 sequence bytes plus 1–4 count bytes per k-mer.
 
 ---
 
@@ -235,7 +235,19 @@ tuna::count<31>({"genome.fa"}, [](std::string_view kmer, uint32_t count) {
 
 // Large k: any value in [2, 256], both k and m are template parameters
 tuna::count<127, 21>({"genome.fa"}, [](std::string_view kmer, uint32_t count) { ... });
+
+// Options mirror the CLI flags; m defaults to 15, as on the command line
+tuna::Options opts;
+opts.threads   = 8;       // -t
+opts.ram_gb    = 64;      // -ram, 0 = auto-detect
+opts.canonical = false;   // -b: count each strand separately
+
+tuna::count<31>({"reads.fq.gz"}, [](std::string_view kmer, uint32_t count) { ... }, opts);
 ```
+
+The callback runs the same counting path as the CLI and differs only in where
+counted k-mers go, so an API run and an equivalent `tuna` invocation produce
+identical counts.
 
 CMake integration:
 ```cmake
@@ -249,9 +261,10 @@ For a full walkthrough: CMake setup, FetchContent, container customisation, thre
 
 ## Benchmarks
 
-All numbers below were measured at `k=31`, `m=21`, 8 threads, with a 256 GB
-memory budget, on a GenOuest node (4x8 Xeon E5-2660 at 2.20 GHz, 1.5 TB RAM,
-CentOS 7), against [KMC 3.2.4](https://github.com/refresh-bio/KMC) and
+All numbers below were measured at `k=31`, `m=21` (the default at the time; the
+default is now `m=15`), 8 threads, with a 256 GB memory budget, on a GenOuest
+node (4x8 Xeon E5-2660 at 2.20 GHz, 1.5 TB RAM, CentOS 7), against
+[KMC 3.2.4](https://github.com/refresh-bio/KMC) and
 [FastK](https://github.com/thegenemyers/FASTK). Every tool was asked to report
 all k-mers from a count of one upwards, so the three produce the same set of
 counts.
