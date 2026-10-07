@@ -14,6 +14,7 @@ live in `benchmark/legacy/` and are kept only for reference.
 | `bench_thread_sweep.sh` | thread sweep T=1..32, assemblies and reads (tuna, KMC, FastK) |
 | `bench_coverage_sweep.sh` | coverage 1x-100x on one read set (tuna, KMC) — **already run** |
 | `bench_nsweep.sh` | partition count `-n` = 2^5..2^21: timings and table stats via `-dbg`, at every `n` (tuna only) |
+| `bench_msweep.sh` | minimizer length `-m` sweep on `human3`, `gallus`, one human file and one E. coli file, to pick a default m (tuna only) — **run last** |
 | `kmer_stats.sh` | count statistics from a kept KMC database |
 
 ## Running
@@ -25,8 +26,16 @@ export FASTK=.../FastK  TABEX=.../Tabex
 
 bash bench_thread_sweep.sh       # each experiment stands alone
 bash bench_scaling.sh
-...
+bash bench_all_datasets.sh
+bash bench_big_data.sh
+bash bench_nsweep.sh
+bash bench_msweep.sh             # last: tuning rather than comparison, and slow
 ```
+
+The scripts do not depend on each other and can run in any order, but
+`bench_msweep.sh` belongs at the end: it is tuna-only tuning rather than a
+cross-tool comparison, and it is expensive. `human3` takes about an hour for a
+single count, so nine m values over it run most of a day on their own.
 
 Results land in `$ROOT`, default `/WORKS/vlevallois/expes_tuna/expes_paper`,
 one CSV per experiment.
@@ -147,6 +156,30 @@ It also differs in design, for reasons specific to that experiment: one full
 pass per tool rather than per input, and level files built incrementally
 (`mv` + append one source copy), so each level is written once and only one
 level file exists at a time.
+
+## bench_msweep.sh
+
+Minimizer-length sweep, tuna only, over `m = 9, 11, ..., 25`. It answers which
+default `m` to ship, so it is tuning rather than comparison, and it runs last.
+
+Four inputs: the two whole read collections (`human3`, `gallus`) and one
+assembled genome at each scale (one human file, one E. coli file). They run
+smallest first so a setup mistake surfaces in seconds rather than hours.
+
+One caveat when reading the results. `m` changes the phase-1 byte cost per
+input base by about a factor of two and a half between `m=9` and `m=25`, which
+feeds tuna's in-memory/disk decision. `human3` does not fit `RAM_GB=256` at any
+`m`, so those rows measure end-to-end cost across the disk pipeline rather than
+a like-for-like comparison with the sets that stay in memory. `unique_kmers` is
+a useful check while it runs: it must not change with `m`, since `m` only
+affects how superkmers are cut, never which k-mers exist.
+
+A build made with `-DFIXED_K=31` alone carries `m` in `{9,11,...,29}`, so the
+whole sweep runs on one binary.
+
+The script refuses to append to a `msweep.csv` whose header does not match the
+one it writes, so an older sweep's CSV has to be moved aside or `ROOT` pointed
+elsewhere. Mixing two schemas under one header has happened before.
 
 ## bench_nsweep.sh
 
