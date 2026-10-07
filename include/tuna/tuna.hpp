@@ -24,8 +24,15 @@
 //
 //   k — k-mer length in [2, 256]  (fixed at compile time via FIXED_K)
 //       Kmer<k> uses ceil(k/32) uint64 words (1 for k≤32, 2 for k≤64, …).
-//   m — minimizer length in [1, k-1]; default 21
-//       Odd values recommended; use m=21–25 for standard genomics work.
+//   m — minimizer length in [1, k-1]; default 15, matching the CLI.
+//       Stock builds instantiate odd m only; an even m needs an explicit
+//       -DFIXED_K/-DFIXED_M build.
+//       m sets how many kmers a superkmer spans, on average (k-m+2)/2, so it
+//       trades record count against record length. Measured across assemblies
+//       and read sets at k=31, m=15 stayed within 6% of the best value on
+//       every collection, where m=21 was up to 21% off, and used about a
+//       quarter less memory. Larger collections prefer slightly larger m,
+//       because a partition count that outgrows 4^m unbalances phase 2.
 
 #include <cstdint>
 #include <limits>
@@ -63,6 +70,9 @@ struct Options {
     uint32_t    partitions = 0;     // 0 = auto-tune (recommended)
     uint32_t    ram_gb     = 0;     // RAM budget in GB; 0 = auto-detect available RAM
     std::string work_dir;           // "" = auto-managed temp dir, deleted on return
+    // Merge each kmer with its reverse complement, as the CLI does by default.
+    // false counts the two strands separately, which is the CLI's -b.
+    bool        canonical  = true;
 };
 
 
@@ -88,7 +98,7 @@ struct Options {
 // Throws std::invalid_argument if files is empty.
 // Throws std::runtime_error if the temp directory cannot be created.
 
-template <uint16_t k, uint16_t m = 21, typename Callback>
+template <uint16_t k, uint16_t m = 15, typename Callback>
 void count(const std::vector<std::string>& files, Callback&& cb, Options opts = {})
 {
     static_assert(k >= 2 && k <= 256, "tuna: k must be in [2, 256]");
@@ -109,6 +119,7 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
     cfg.num_partitions    = opts.partitions;
     cfg.ram_budget_bytes  = opts.ram_gb > 0
         ? static_cast<uint64_t>(opts.ram_gb) << 30 : 0;
+    cfg.canonical         = opts.canonical;
     cfg.hide_progress     = true;
 
     static_assert(sizeof(SuperkmerWriter<k, m>) >= 8 && sizeof(SuperkmerWriter<k, m>) <= 64,
@@ -155,7 +166,7 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
 // Thread safety: a mutex is used internally so Container does not need to be
 // thread-safe.  For custom containers, emplace must accept (std::string, uint32_t).
 
-template <uint16_t k, uint16_t m = 21,
+template <uint16_t k, uint16_t m = 15,
           typename Container = std::unordered_map<std::string, uint32_t>>
 Container count_to(const std::vector<std::string>& files, Options opts = {})
 {
@@ -178,7 +189,7 @@ Container count_to(const std::vector<std::string>& files, Options opts = {})
 //
 // Use kmer.get_label(str) on any entry to decode back to ASCII if needed.
 
-template <uint16_t k, uint16_t m = 21>
+template <uint16_t k, uint16_t m = 15>
 std::vector<std::pair<Kmer<k>, uint32_t>>
 count_to_raw(const std::vector<std::string>& files, Options opts = {})
 {

@@ -58,8 +58,6 @@ void print_usage(const char* prog)
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -co         count only: skip output writing after counting (for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
-        "  -dedup <mode> aggregate repeated superkmers before k-mer insertion\n"
-        "              modes: auto, on, off                  [default: auto]\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -kff        write output in KFF binary format (auto-detected from .kff extension)\n"
@@ -169,17 +167,6 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.count_only = true;
         } else if (arg == "-tp") {
             cfg.partition_only = true;
-        } else if (arg == "-dedup") {
-            const char* v = next_val("-dedup"); if (!v) return false;
-            const std::string_view mode(v);
-            if (mode == "auto") cfg.dedup_mode = SuperkmerDedupMode::Auto;
-            else if (mode == "on") cfg.dedup_mode = SuperkmerDedupMode::On;
-            else if (mode == "off") cfg.dedup_mode = SuperkmerDedupMode::Off;
-            else {
-                std::cerr << "tuna: error: -dedup expects auto, on, or off; got: "
-                          << mode << "\n";
-                return false;
-            }
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "tuna: error: unknown option: " << arg << "\n";
             return false;

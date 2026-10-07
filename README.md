@@ -154,7 +154,6 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-kt` | — | off | Keep temporary partition files after the run |
 | `-co` | — | off | Count only: skip k-mer serialization while still reporting total and distinct k-mer counts |
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
-| `-dedup` | `auto`, `on`, or `off` | `auto` | Aggregate repeated packed superkmers with exact multiplicities before k-mer insertion. Auto samples each partition and falls back to direct counting for low-redundancy or memory-limited partitions. |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
 
 </details>
