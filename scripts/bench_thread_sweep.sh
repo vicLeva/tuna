@@ -28,20 +28,20 @@ source "$HERE/bench_common.sh"
 
 THREAD_LIST=${THREAD_LIST:-"1 2 4 8 16 32"}
 
-# name : input (fof or single file) : tuna m : kmc format flag
+# name : input (fof or single file) : kmc format flag
+# m comes from M (or FORCE_M), not from the spec.
 DATASETS=(
-    "ecoli:$DATA_ROOT/dataset_genome_ecoli/fof_1000.list:21:-fm"
-    "human:$DATA_ROOT/dataset_genome_human/fof_10.list:21:-fm"
-    "ecoli_reads:$DATA_ROOT/data_sequencing/SRR2584863_1.fastq.gz:21:-fq"
-    "human_reads:$DATA_ROOT/data_sequencing/SRR622461_1.fastq.gz:21:-fq"
+    "ecoli:$DATA_ROOT/dataset_genome_ecoli/fof_1000.list:-fm"
+    "human:$DATA_ROOT/dataset_genome_human/fof_10.list:-fm"
+    "ecoli_reads:$DATA_ROOT/data_sequencing/SRR2584863_1.fastq.gz:-fq"
+    "human_reads:$DATA_ROOT/data_sequencing/SRR622461_1.fastq.gz:-fq"
 )
 
 bench_init thread_sweep "tuna kmc fastk"
 
 for spec in "${DATASETS[@]}"; do
-    IFS=: read -r ds input m fmt <<< "$spec"
+    IFS=: read -r ds input fmt <<< "$spec"
     [[ -e "$input" ]] || { echo "  [skip] $ds: no input at $input"; continue; }
-    M="$m"
     # A fof is handed to tuna/KMC with an @ prefix; a plain file is not.
     if [[ "$input" == *.list ]]; then
         tk_in="@$input"

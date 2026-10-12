@@ -25,7 +25,7 @@ void print_usage(const char* prog)
         "              this build accepts: odd values in [11,63], plus 127\n"
         "              for other values recompile with -DFIXED_K=<k> -DFIXED_M=<m>\n"
 #endif
-        "  -m  <int>   partition minimizer length  [default: 15]\n"
+        "  -m  <int>   partition minimizer length  [default: 17]\n"
 #if defined(TUNA_CONDA_PROFILE)
         "              conda build supports odd m per k:\n"
         "                k=21  m ∈ {11,13,15,17,19}\n"
@@ -36,7 +36,7 @@ void print_usage(const char* prog)
         "              for other m values: https://github.com/vicLeva/tuna\n"
 #else
         "              any odd value in [1, min(k-1, 32)]\n"
-        "              m=15 balances compact superkmers and partition entropy;\n"
+        "              m=17 balances compact superkmers and partition entropy;\n"
         "              phase 2 routes with a canonical rolling k-mer hash\n"
 #endif
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"

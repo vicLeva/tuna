@@ -24,15 +24,16 @@
 //
 //   k — k-mer length in [2, 256]  (fixed at compile time via FIXED_K)
 //       Kmer<k> uses ceil(k/32) uint64 words (1 for k≤32, 2 for k≤64, …).
-//   m — minimizer length in [1, k-1]; default 15, matching the CLI.
+//   m — minimizer length in [1, k-1]; default 17, matching the CLI.
 //       Stock builds instantiate odd m only; an even m needs an explicit
 //       -DFIXED_K/-DFIXED_M build.
 //       m sets how many kmers a superkmer spans, on average (k-m+2)/2, so it
-//       trades record count against record length. Measured across assemblies
-//       and read sets at k=31, m=15 stayed within 6% of the best value on
-//       every collection, where m=21 was up to 21% off, and used about a
-//       quarter less memory. Larger collections prefer slightly larger m,
-//       because a partition count that outgrows 4^m unbalances phase 2.
+//       trades record count against record length. Swept at k=31 over one
+//       E. coli assembly, one human assembly and the whole Gallus and Human3
+//       read sets, m=17 stayed within 2.1% of the best value on each of them,
+//       against 20% for m=15 and 7% for m=21. Small m is the costly mistake:
+//       at m=9 every set but the smallest is more than 90% off, because a
+//       partition count that outgrows 4^m unbalances phase 2.
 
 #include <cstdint>
 #include <limits>
@@ -98,7 +99,7 @@ struct Options {
 // Throws std::invalid_argument if files is empty.
 // Throws std::runtime_error if the temp directory cannot be created.
 
-template <uint16_t k, uint16_t m = 15, typename Callback>
+template <uint16_t k, uint16_t m = 17, typename Callback>
 void count(const std::vector<std::string>& files, Callback&& cb, Options opts = {})
 {
     static_assert(k >= 2 && k <= 256, "tuna: k must be in [2, 256]");
@@ -166,7 +167,7 @@ void count(const std::vector<std::string>& files, Callback&& cb, Options opts = 
 // Thread safety: a mutex is used internally so Container does not need to be
 // thread-safe.  For custom containers, emplace must accept (std::string, uint32_t).
 
-template <uint16_t k, uint16_t m = 15,
+template <uint16_t k, uint16_t m = 17,
           typename Container = std::unordered_map<std::string, uint32_t>>
 Container count_to(const std::vector<std::string>& files, Options opts = {})
 {
@@ -189,7 +190,7 @@ Container count_to(const std::vector<std::string>& files, Options opts = {})
 //
 // Use kmer.get_label(str) on any entry to decode back to ASCII if needed.
 
-template <uint16_t k, uint16_t m = 15>
+template <uint16_t k, uint16_t m = 17>
 std::vector<std::pair<Kmer<k>, uint32_t>>
 count_to_raw(const std::vector<std::string>& files, Options opts = {})
 {

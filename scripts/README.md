@@ -7,6 +7,7 @@ live in `benchmark/legacy/` and are kept only for reference.
 
 | file | what it measures |
 |---|---|
+| `run_paper_suite.sh` | **every experiment the paper reports, in one invocation.** Runs the big-data matrix over both k values and both budgets. |
 | `bench_common.sh` | shared machinery: tool runners, timing, guards. Sourced, not run. |
 | `bench_all_datasets.sh` | one file at a time, across five collections (tuna, KMC, FastK) |
 | `bench_scaling.sh` | n input files, increasing n (tuna, KMC, FastK) |
@@ -20,29 +21,90 @@ live in `benchmark/legacy/` and are kept only for reference.
 ## Running
 
 ```bash
-export TUNA=/WORKS/vlevallois/softs/tuna/build/tuna
+export TUNA_K31=/WORKS/vlevallois/softs/tuna/build_k31/tuna
+export TUNA_K27=/WORKS/vlevallois/softs/tuna/build_k27/tuna
 export KMC=.../kmc  KMC_DUMP=.../kmc_dump
 export FASTK=.../FastK  TABEX=.../Tabex
 
-bash bench_thread_sweep.sh       # each experiment stands alone
-bash bench_scaling.sh
-bash bench_all_datasets.sh
-bash bench_big_data.sh
-bash bench_nsweep.sh
-bash bench_msweep.sh             # last: tuning rather than comparison, and slow
+M=17 bash run_paper_suite.sh     # everything the paper needs, tuna only
+
+# to measure the competitors again as well
+M=17 ONLY_TOOLS="tuna kmc fastk" bash run_paper_suite.sh
 ```
 
-The scripts do not depend on each other and can run in any order, but
-`bench_msweep.sh` belongs at the end: it is tuna-only tuning rather than a
-cross-tool comparison, and it is expensive. `human3` takes about an hour for a
-single count, so nine m values over it run most of a day on their own.
+`run_paper_suite.sh` is the entry point. Each `bench_*.sh` measures a single
+configuration, and the paper's big-data table reports four of them (two k
+values against two memory budgets), which is why running the scripts once each
+leaves that table incomplete. The driver runs every experiment over the
+configurations the paper needs, cheapest first, so a run stopped partway has
+finished as many experiments as possible. Measured tuna-only cost of each:
+
+| step | wall time |
+|---|---|
+| `all_datasets` | 0.2 h |
+| `scaling` | 0.5 h |
+| `thread_sweep` | 0.7 h |
+| `coverage_sweep` | 1.6 h, plus building the replicated read files |
+| `big_data` | 4.0 h, four configurations |
+| `msweep` | 11.0 h |
+| `nsweep` | 47.0 h, two passes over 18 partition counts |
+
+Stopping after a day leaves everything up to and including `msweep` done, and
+`nsweep` is worth starting only when the node is free for a while.
+
+It runs **tuna only** by default: KMC and FastK have not changed, so their rows
+are merged in from the previous set rather than measured again.
+It writes `$ROOT/RUN_INFO.txt` recording m, the k values, the binaries and the
+commit, so a set of numbers can be traced back to how it was produced.
+
+`M` is required and deliberately not defaulted: it has to be identical across
+every experiment, and a stale per-script default is what previously left the
+coverage sweep on a different minimizer length than the rest of the paper.
+
+The individual scripts still run standalone and in any order:
+
+```bash
+bash bench_thread_sweep.sh
+bash bench_scaling.sh
+bash bench_all_datasets.sh
+bash bench_big_data.sh           # one (k, budget); the driver covers all four
+bash bench_nsweep.sh
+M=17 bash bench_coverage_sweep.sh
+bash bench_msweep.sh
+```
+
+### One tuna binary per k
+
+A build made with `-DFIXED_K=<k>` exits on any other k, so the big-data matrix
+spanning k=31 and k=27 needs one build each:
+
+```bash
+cmake -S . -B build_k31 -DCMAKE_BUILD_TYPE=Release -DFIXED_K=31
+cmake -S . -B build_k27 -DCMAKE_BUILD_TYPE=Release -DFIXED_K=27
+export TUNA_K31=$PWD/build_k31/tuna TUNA_K27=$PWD/build_k27/tuna
+```
+
+`TUNA_K<k>` takes precedence over `TUNA`, which on its own is enough for a
+default build, since that carries the whole dispatch table. The driver proves
+each binary can actually count at the requested (k, m) on a few hundred bases
+before starting, rather than failing hours in.
+
+### Output modes
+
+Only each tool's native binary output is measured now: the paper no longer
+reports the ASCII totals, and that pass repeats the same counting work with
+TSV formatting on top, roughly doubling the cost of the suite. `ONLY_MODES`
+defaults to `bin`; set `ONLY_MODES="bin ascii"` to measure both again. In
+`bench_coverage_sweep.sh` the equivalent line is the commented-out `PASSES`.
 
 Results land in `$ROOT`, default `/WORKS/vlevallois/expes_tuna/expes_paper`,
 one CSV per experiment.
 
 Useful overrides: `ROOT`, `DATA_ROOT`, `K`, `M`, `THREADS`, `RAM_GB`,
-`TIMEOUT_S`, `FASTK_TIMEOUT_S`, `THREAD_LIST`, and for side experiments
-`FORCE_M` (one minimizer length everywhere, ignoring the per-dataset values),
+`TIMEOUT_S`, `FASTK_TIMEOUT_S`, `THREAD_LIST`, `TUNA_K<k>` (see above), and for
+the driver `ONLY_EXPES`, `BIG_KS`, `BIG_BUDGETS`, `K_MAIN`, `RAM_MAIN`. Also
+`FORCE_M` (one minimizer length everywhere; the per-dataset m fields are gone,
+so `M` alone is normally enough),
 `ONLY_TOOLS` (a subset of `tuna kmc fastk`), `ONLY_MODES` (a subset of
 `bin ascii`), `MAX_FILES` (cap per dataset) and
 `KEEP_OUTPUT` (see below).
@@ -256,6 +318,9 @@ on the thread count — worth remembering when reading the T=1 and T=2 points.
 - **FastK input names**: FastK dispatches on file extension and does not accept
   `.fna`, so inputs are exposed through a symlink farm under `$ROOT/fastk_links`.
   The real data is never touched.
-- **Minimizer length** is `m=21` everywhere. A whole-experiment comparison of
-  m=17 against m=21 on `all_datasets` and `big_data` found the two within noise
-  of each other, so the simpler uniform value was kept.
+- **Minimizer length** is `m=17` everywhere, matching tuna's own default. It
+  comes from `bench_msweep.sh`: swept at k=31 over one E. coli assembly, one
+  human assembly and the whole `gallus` and `human3` read sets, m=17 stayed
+  within 2.1% of the best value on each, against 20% for m=15 and 7% for
+  m=21. The per-dataset m fields in the experiment scripts are gone, so `M`
+  (or `FORCE_M`) sets it in one place for the whole suite.

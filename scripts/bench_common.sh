@@ -73,7 +73,7 @@ export LC_ALL=C LANG=C
 : "${DATA_ROOT:=/WORKS/vlevallois/data}"
 
 : "${K:=31}"
-: "${M:=21}"                 # tuna minimizer length
+: "${M:=17}"                 # tuna minimizer length, matching tuna's default
 : "${THREADS:=8}"
 : "${RAM_GB:=256}"
 
@@ -92,11 +92,12 @@ export LC_ALL=C LANG=C
 : "${ONLY_TOOLS:=}"
 : "${ONLY_DATASETS:=}"
 : "${MAX_FILES:=0}"
-# ONLY_MODES  subset of "bin ascii" to measure. Comparing two counting-table
-#             implementations only needs `bin`: the ascii run repeats the same
-#             counting work and adds TSV formatting, which such a change does
-#             not touch, so it doubles the cost for no signal.
-: "${ONLY_MODES:=}"
+# ONLY_MODES  subset of "bin ascii" to measure. Defaults to bin alone: the
+#             paper no longer reports the ASCII totals, and the ascii run
+#             repeats the same counting work with TSV formatting on top, so it
+#             roughly doubles the cost of the suite for a number nothing reads.
+#             Set ONLY_MODES="bin ascii" to measure both again.
+: "${ONLY_MODES:=bin}"
 # KEEP_OUTPUT  directory in which to preserve the BINARY output of each run
 #              instead of deleting it (KMC .kmc_pre/.kmc_suf, tuna .kff).
 #              ASCII output is never kept: it is ~40 bytes per distinct k-mer
@@ -120,10 +121,11 @@ bench_init() {
     # Only demand the binaries that will actually be used.
     [[ -n "$ONLY_TOOLS" ]] && TOOLS_USED="$ONLY_TOOLS"
 
-    local err=0 v
+    local err=0 v tb
     if [[ "$TOOLS_USED" == *tuna* ]]; then
-        [[ -z "$TUNA" ]] && { echo "[error] TUNA is not set"; err=1; }
-        [[ -n "$TUNA" && ! -x "$TUNA" ]] && { echo "[error] not executable: $TUNA"; err=1; }
+        tb=$(tuna_for_k "$K")
+        [[ -z "$tb" ]] && { echo "[error] TUNA is not set (nor TUNA_K$K)"; err=1; }
+        [[ -n "$tb" && ! -x "$tb" ]] && { echo "[error] not executable: $tb"; err=1; }
     fi
     if [[ "$TOOLS_USED" == *kmc* ]]; then
         for v in KMC KMC_DUMP; do
@@ -155,7 +157,8 @@ bench_init() {
     [[ -n "$FORCE_M" ]] && echo "[bench] FORCE_M=$FORCE_M (per-dataset m ignored)"
     [[ "$MAX_FILES" != 0 ]] && echo "[bench] MAX_FILES=$MAX_FILES"
     echo "[bench] k=$K m=$M threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s (fastk ${FASTK_TIMEOUT_S}s)"
-    echo "[bench] tuna       : $TUNA ($(stat -c %y "$TUNA" 2>/dev/null | cut -d. -f1))"
+    local tbh; tbh=$(tuna_for_k "$K")
+    echo "[bench] tuna       : $tbh ($(stat -c %y "$tbh" 2>/dev/null | cut -d. -f1))"
     echo "[bench] output     : $CSV"
 }
 
@@ -169,6 +172,16 @@ se_val()  { grep -m1 "^${1}:" "$2" 2>/dev/null | awk -F: '{v=$2;gsub(/^ +/,"",v)
 kmc_num() { grep -m1 "$1" "$2" 2>/dev/null | awk -F: '{gsub(/^ +/,"",$2);print $2}'; }
 
 row() { echo "$1" >> "$CSV"; }
+
+# The tuna binary to use for a given k. A build made with -DFIXED_K=<k> exits
+# on any other k, so a suite covering several k values needs one build each:
+# export TUNA_K27 and TUNA_K31 to point at them. TUNA alone is enough for a
+# default build, which carries the whole dispatch table.
+tuna_for_k() {
+    local v="TUNA_K$1"
+    [[ -n "${!v:-}" ]] && { printf '%s\n' "${!v}"; return; }
+    printf '%s\n' "$TUNA"
+}
 
 # Is this output mode part of the run? (ONLY_MODES empty means both)
 mode_enabled() { [[ -z "$ONLY_MODES" || " $ONLY_MODES " == *" $1 "* ]]; }
@@ -268,6 +281,11 @@ run_tuna() {
     tool_enabled tuna || return 0
     local ds="$1" key="$2" label="$3" input="$4" mode out tag tf se rc st
     local mm="${FORCE_M:-$M}"
+    local tb; tb=$(tuna_for_k "$K")
+    if [[ -z "$tb" || ! -x "$tb" ]]; then
+        echo "    [error] no tuna binary for k=$K (set TUNA_K$K or TUNA)"
+        return 1
+    fi
     for mode in bin ascii; do
         mode_enabled "$mode" || continue
         have_run "$ds" "$key" tuna "$mode" && { echo "    [tuna $mode] already measured"; continue; }
@@ -275,7 +293,7 @@ run_tuna() {
         [[ $mode == bin ]] && out="$WORK/out.kff" || out="$WORK/out.tsv"
         rm -rf "$WORK/t"; mkdir -p "$WORK/t"
         /usr/bin/time -v -o "$tf" timeout "$TIMEOUT_S" \
-            "$TUNA" -k "$K" -m "$mm" -t "$THREADS" -ram "$RAM_GB" -hp \
+            "$tb" -k "$K" -m "$mm" -t "$THREADS" -ram "$RAM_GB" -hp \
             -w "$WORK/t/" "$input" "$out" >/dev/null 2>"$se"
         rc=$?; st=$(status_of "$rc")
         if [[ -n "$KEEP_OUTPUT" && $mode == bin && $st == ok ]]; then
@@ -311,8 +329,8 @@ run_kmc() {
         "$input" "$WORK/kmcdb" "$WORK/kmctmp" > "$se" 2>&1
     rc=$?; st=$(status_of "$rc"); rm -rf "$WORK/kmctmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st,"
-        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st,"
+        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st"
+        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st"
         echo "    [$st] kmc"; rm -f "$WORK/kmcdb".kmc_*; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
@@ -376,8 +394,8 @@ run_fastk() {
         >/dev/null 2>"$se"
     rc=$?; st=$(status_of "$rc"); rm -rf "$tmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st,"
-        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st,"
+        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st"
+        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st"
         echo "    [$st] fastk"; rm -f "$db"* ".${db##*/}"* 2>/dev/null; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")

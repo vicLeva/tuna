@@ -14,22 +14,23 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/bench_common.sh"
 
-# name : fof : max files : tuna m : kmc format flag
+# name : fof : max files : kmc format flag
+# m is not per dataset: it comes from M (or FORCE_M) so the whole suite
+# measures one minimizer length.
 DATASETS=(
-    "ecoli:$DATA_ROOT/dataset_genome_ecoli/fof.list:100:21:-fm"
-    "human:$DATA_ROOT/dataset_genome_human/fof.list:10:21:-fm"
-    "salmonella:$DATA_ROOT/dataset_pangenome_salmonella/fof.list:100:21:-fm"
-    "gut:$DATA_ROOT/dataset_metagenome_gut/fof.list:100:21:-fm"
-    "tara:$DATA_ROOT/dataset_metagenome_tara/fof.list:10:21:-fq"
+    "ecoli:$DATA_ROOT/dataset_genome_ecoli/fof.list:100:-fm"
+    "human:$DATA_ROOT/dataset_genome_human/fof.list:10:-fm"
+    "salmonella:$DATA_ROOT/dataset_pangenome_salmonella/fof.list:100:-fm"
+    "gut:$DATA_ROOT/dataset_metagenome_gut/fof.list:100:-fm"
+    "tara:$DATA_ROOT/dataset_metagenome_tara/fof.list:10:-fq"
 )
 
 bench_init all_datasets "tuna kmc fastk"
 
 for spec in "${DATASETS[@]}"; do
-    IFS=: read -r ds fof maxn m fmt <<< "$spec"
+    IFS=: read -r ds fof maxn fmt <<< "$spec"
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; continue; }
-    M="$m"
-    (( MAX_FILES > 0 && MAX_FILES < maxn )) && maxn=$MAX_FILES                                  # per-dataset minimizer length
+    (( MAX_FILES > 0 && MAX_FILES < maxn )) && maxn=$MAX_FILES
     echo ""
     echo "== $ds  (m=$M, $fmt, first $maxn files) =="
     i=0

@@ -134,7 +134,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
-| `-m` | `<int>` | `15` | Partition minimizer length. Any odd value in `[1, min(k-1, 32)]`; `15` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
+| `-m` | `<int>` | `17` | Partition minimizer length. Any odd value in `[1, min(k-1, 32)]`; `17` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
 | `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
@@ -236,7 +236,7 @@ tuna::count<31>({"genome.fa"}, [](std::string_view kmer, uint32_t count) {
 // Large k: any value in [2, 256], both k and m are template parameters
 tuna::count<127, 21>({"genome.fa"}, [](std::string_view kmer, uint32_t count) { ... });
 
-// Options mirror the CLI flags; m defaults to 15, as on the command line
+// Options mirror the CLI flags; m defaults to 17, as on the command line
 tuna::Options opts;
 opts.threads   = 8;       // -t
 opts.ram_gb    = 64;      // -ram, 0 = auto-detect
@@ -262,7 +262,7 @@ For a full walkthrough: CMake setup, FetchContent, container customisation, thre
 ## Benchmarks
 
 All numbers below were measured at `k=31`, `m=21` (the default at the time; the
-default is now `m=15`), 8 threads, with a 256 GB memory budget, on a GenOuest
+default is now `m=17`), 8 threads, with a 256 GB memory budget, on a GenOuest
 node (4x8 Xeon E5-2660 at 2.20 GHz, 1.5 TB RAM, CentOS 7), against
 [KMC 3.2.4](https://github.com/refresh-bio/KMC) and
 [FastK](https://github.com/thegenemyers/FASTK). Every tool was asked to report

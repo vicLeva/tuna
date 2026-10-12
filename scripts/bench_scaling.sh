@@ -30,12 +30,11 @@ read -r -a HUMAN_NS <<< "${HUMAN_NS:-1 2 3 4 5 6 7 8 9 10 15 20 25 30 60}"
 bench_init scaling "tuna kmc fastk"
 
 sweep() {
-    local ds="$1" fof="$2" m="$3"; shift 3
+    local ds="$1" fof="$2"; shift 2
     local ns=("$@") total n sub fkf
     dataset_enabled "$ds" || return 0
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; return; }
     total=$(wc -l < "$fof")
-    M="$m"
     echo ""
     echo "== $ds  (m=$M, $total files available) =="
     for n in "${ns[@]}"; do
@@ -50,7 +49,7 @@ sweep() {
     done
 }
 
-sweep ecoli "$ECOLI_FOF" 21 "${ECOLI_NS[@]}"
-sweep human "$HUMAN_FOF" 21 "${HUMAN_NS[@]}"
+sweep ecoli "$ECOLI_FOF" "${ECOLI_NS[@]}"
+sweep human "$HUMAN_FOF" "${HUMAN_NS[@]}"
 
 bench_done

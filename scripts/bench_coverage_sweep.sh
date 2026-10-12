@@ -2,9 +2,10 @@
 # bench_coverage_sweep.sh - coverage sweep, tuna vs KMC
 #
 # This script produced benchmark/results/coverage_sweep_kh/ on 2026-08-28 at
-# m=17, and coverage_sweep_ud/ afterwards at m=21. The default is now m=21 so
-# the coverage curve is comparable with the rest of the suite; the older CSV
-# records m=17 in its own m column, so the two remain distinguishable.
+# m=17, and coverage_sweep_ud/ afterwards at m=21. Neither matches the current
+# default of m=17 for the suite as a whole, so both predate the numbers the
+# paper now reports. Each CSV records its own m in a dedicated column, so the
+# runs stay distinguishable.
 #
 # It still does not share bench_common.sh, and its default ROOT still points at
 # expes_tuna/coverage_sweep rather than expes_paper: the rest of its design is
@@ -71,12 +72,17 @@ export LC_ALL=C LANG=C
 
 : "${SRC:=/WORKS/vlevallois/data/data_sequencing/SRR622461_1.fastq.gz}"
 SRC_COV=5                                  # coverage of the source file
-K=31
-M=${M:-21}          # m=21 everywhere in the suite, so the coverage curve is
-                    # comparable with the other experiments. m=17 was measured
-                    # -3.8% time and -15% RSS on these reads and was the
-                    # original default here, which is why the first run of this
-                    # sweep (2026-08-28) carries m=17 in its CSV.
+K=${K:-31}
+# m is deliberately NOT defaulted. This script does not source bench_common.sh
+# and so never saw FORCE_M, which is how its CSV ended up at m=21 while the
+# rest of the suite moved on, leaving one experiment on a different minimizer
+# length than every other number in the paper. Pass it explicitly.
+# (The 2026-08-28 run carries m=17, the 2026-09-03 run m=21.)
+if [[ -z "${M:-}" ]]; then
+    echo "[error] M is not set. Pass the same m as the rest of the suite, e.g."
+    echo "        M=17 bash bench_coverage_sweep.sh"
+    exit 1
+fi
 THREADS=${THREADS:-8}
 RAM_GB=${RAM_GB:-256}
 STOP_BYTES=${STOP_BYTES:-$((500 * 1024 * 1024 * 1024))}
@@ -88,7 +94,26 @@ else
     COVERAGES=(1 2 3 4 5 6 7 8 9 10 $(seq 15 5 100))
 fi
 # Tool passes, in order. Each entry is "<tool> <mode>".
-PASSES=("tuna bin" "tuna ascii" "kmc bin")
+# The ASCII totals are no longer reported, so that pass is commented out
+# rather than deleted: restore the middle entry to measure it again.
+PASSES=("tuna bin" "kmc bin")
+# PASSES=("tuna bin" "tuna ascii" "kmc bin")
+
+# ONLY_TOOLS, as in bench_common.sh, which this script does not source. Empty
+# means every pass above. A tuna-only re-run keeps the competitor rows from an
+# earlier set, so there is no reason to pay for KMC again.
+: "${ONLY_TOOLS:=}"
+if [[ -n "$ONLY_TOOLS" ]]; then
+    kept=()
+    for pass in "${PASSES[@]}"; do
+        [[ " $ONLY_TOOLS " == *" ${pass%% *} "* ]] && kept+=("$pass")
+    done
+    PASSES=("${kept[@]+"${kept[@]}"}")
+    if (( ${#PASSES[@]} == 0 )); then
+        echo "[error] ONLY_TOOLS='$ONLY_TOOLS' leaves no pass to run"
+        exit 1
+    fi
+fi
 
 WORK="$ROOT/work"; AUX="$ROOT/aux"; DATA="$ROOT/data"; STATS="$ROOT/stats"
 CSV="$ROOT/coverage_sweep.csv"
@@ -96,7 +121,14 @@ SCSV="$ROOT/coverage_stats.csv"
 CHUNK_DIR="$DATA"          # fractional blocks chunk_{1..4}_5.fastq.gz
 
 err=0
-for v in TUNA KMC KMC_DUMP; do
+needed=()
+for pass in "${PASSES[@]}"; do
+    case "${pass%% *}" in
+        tuna) needed+=(TUNA) ;;
+        kmc)  needed+=(KMC KMC_DUMP) ;;
+    esac
+done
+for v in $(printf '%s\n' "${needed[@]}" | sort -u); do
     [[ -z "${!v}" ]]              && { echo "[error] $v is not set"; err=1; }
     [[ -n "${!v}" && ! -x "${!v}" ]] && { echo "[error] not executable: ${!v}"; err=1; }
 done
