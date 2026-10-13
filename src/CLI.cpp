@@ -25,7 +25,7 @@ void print_usage(const char* prog)
         "              this build accepts: odd values in [11,63], plus 127\n"
         "              for other values recompile with -DFIXED_K=<k> -DFIXED_M=<m>\n"
 #endif
-        "  -m  <int>   partition minimizer length  [default: 17]\n"
+        "  -m  <int>   partition minimizer length  [default: chosen from k]\n"
 #if defined(TUNA_CONDA_PROFILE)
         "              conda build supports odd m per k:\n"
         "                k=21  m ∈ {11,13,15,17,19}\n"
@@ -35,9 +35,11 @@ void print_usage(const char* prog)
         "                k=127 m ∈ {15,19,21,23,25,27,29,31}\n"
         "              for other m values: https://github.com/vicLeva/tuna\n"
 #else
-        "              any odd value in [1, min(k-1, 32)]\n"
-        "              m=17 balances compact superkmers and partition entropy;\n"
-        "              phase 2 routes with a canonical rolling k-mer hash\n"
+        "              left out, tuna picks it from k: 13 below k=31, 17 at or\n"
+        "              above, which measured within 3.1% of the best m at every k\n"
+        "              tested. This build carries that one m per k; to choose m\n"
+        "              freely rebuild with -DTUNA_ALL_M=ON, or pin one pair with\n"
+        "              -DFIXED_K=<k> -DFIXED_M=<m>\n"
 #endif
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
         "  -t  <int>   worker threads              [default: 1]\n"
@@ -222,6 +224,10 @@ bool parse_args(int argc, char* argv[], Config& cfg)
                   << ") must be in [2, 256]\n";
         return false;
     }
+
+    // -m not given: pick it from k. Done here, after k is parsed, so the
+    // order of the flags on the command line does not matter.
+    if (cfg.l == 0) cfg.l = auto_m(cfg.k);
 
     if (cfg.l < 1 || cfg.l > 32) {
         std::cerr << "tuna: error: minimizer length (-m " << cfg.l

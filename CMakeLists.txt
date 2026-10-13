@@ -163,12 +163,21 @@ target_compile_options(tuna_lib INTERFACE ${TUNA_SIMD_FLAGS})
 # Usage: cmake .. -DTUNA_CONDA_PROFILE=ON
 option(TUNA_CONDA_PROFILE "Build with curated k/m subset for conda packaging" OFF)
 
+# By default tuna carries one minimizer length per k, the one auto_m(k) picks,
+# which is 28 template instantiations instead of 270 and most of the build
+# time. -m then only accepts that value. Turn this on to carry every m for
+# every k, which is what sweeping m (scripts/bench_msweep.sh, the paper's m
+# experiment) needs.
+# Usage: cmake .. -DTUNA_ALL_M=ON
+option(TUNA_ALL_M "Instantiate every m for every k, so -m can be set freely" OFF)
+
 target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
     $<$<BOOL:${TUNA_CONDA_PROFILE}>:TUNA_CONDA_PROFILE>
+    $<$<BOOL:${TUNA_ALL_M}>:TUNA_ALL_M>
 )
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)
 

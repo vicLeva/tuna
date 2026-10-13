@@ -77,6 +77,30 @@ make -j$(nproc)
 
 The `tuna` binary will be at `build/tuna`.
 
+### Choosing m
+
+You do not. Left out, `-m` is derived from `k`: **13 below `k=31`, 17 at or
+above**, clamped to `k-2` so small k stay valid. Measured across four data
+regimes (bacterial assemblies, a human assembly, a read set, a metagenome) at
+nine values of k, that rule lands within **3.1%** of the best m at every k and
+**0.6%** on average. The per-k optima are flat — at `k=63` every m from 15 to
+25 is within 1% — so a two-step rule beats fitting each k.
+
+A build therefore instantiates one m per k, 28 pairs instead of 270, which is
+most of the build time. `-m` then only accepts the value that k uses. To pick m
+freely, for an m sweep or an experiment:
+
+```bash
+cmake .. -DTUNA_ALL_M=ON      # every odd m for every k
+```
+
+Expect that to be slow and memory-hungry: the whole table lands in one
+translation unit, so it is 270 instantiations against 28. Measured here, the
+default build takes 113 s while the full one was still going after 24 minutes
+at 8.7 GB resident. Build it on a machine with room, and only to sweep m.
+
+The sweep behind the rule is `scripts/bench_autom.sh`.
+
 ### k range and compile-time specialisation
 
 The default build embeds a dispatch table for **odd k in `[11, 63]`, plus
@@ -95,6 +119,14 @@ This produces a single-instantiation binary locked to that (k, m) pair. Those va
 
 ```bash
 cmake .. -DFIXED_K=31 -DFIXED_M=17
+```
+
+`-DFIXED_K` and `-DTUNA_ALL_M` are orthogonal: the first narrows which k the
+table carries, the second whether it carries every m or just `auto_m(k)`. An m
+sweep at one k therefore wants both, which is 11 pairs rather than 270:
+
+```bash
+cmake .. -DFIXED_K=31 -DTUNA_ALL_M=ON
 ```
 
 If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
@@ -134,7 +166,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
 | `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
-| `-m` | `<int>` | `17` | Partition minimizer length. Any odd value in `[1, min(k-1, 32)]`; `17` balances compact superkmers with partition entropy for the default `k=31`. Phase-2 hash routing is independent of this value. Must match `-DFIXED_M` in a specialized build. |
+| `-m` | `<int>` | from `k` | Partition minimizer length. Left out, tuna picks it from `k`: **13 below `k=31`, 17 at or above** (clamped to `k-2`). A build carries only that one m per k, so setting `-m` to anything else needs `-DTUNA_ALL_M=ON` or an explicit `-DFIXED_M`. Odd values only. Phase-2 hash routing is independent of this value. |
 | `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |

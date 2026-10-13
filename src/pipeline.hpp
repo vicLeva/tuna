@@ -505,25 +505,32 @@ void run_callback(const Config& cfg, Callback&& cb)
 
 // ─── Runtime dispatch (k × m) ────────────────────────────────────────────────
 //
-// Four dispatch modes, selected at compile time:
+// Which (k, m) pairs a build carries is set at compile time. Two switches,
+// orthogonal: FIXED_K picks which k, TUNA_ALL_M picks whether every m is
+// carried or only auto_m(k).
 //
-//   FIXED_K + FIXED_M  (recommended for any non-standard k/m pair)
-//     Single template instantiation.  Any k ∈ [1,256], any m ∈ [1,k-1].
+//   No flags (default build)
+//     Odd k ∈ [11,63] plus k=127, one m each: auto_m(k). 28 instantiations.
+//     -m then only accepts that value.
+//
+//   TUNA_ALL_M
+//     The same k, but every odd m ∈ [9,min(k-2,31)]. 270 instantiations and
+//     most of the build time, so it is for sweeping m, not for shipping.
+//     cmake: -DTUNA_ALL_M=ON
+//
+//   FIXED_K  (optionally with TUNA_ALL_M)
+//     Narrows the table to one k. Alone that is a single pair; with
+//     TUNA_ALL_M it is that k with every m, which is what an m sweep at one
+//     k wants.
+//     cmake: -DFIXED_K=<k> [-DTUNA_ALL_M=ON]
+//
+//   FIXED_K + FIXED_M  (any non-standard pair)
+//     Single instantiation. Any k ∈ [1,256], any m ∈ [1,k-1].
 //     cmake: -DFIXED_K=<k> -DFIXED_M=<m>
-//
-//   FIXED_K only
-//     Instantiates one k with m ∈ {9,11,...,min(k-2,31)} (odd).
-//     cmake: -DFIXED_K=<k>
 //
 //   TUNA_CONDA_PROFILE  (for conda binary packaging)
 //     Curated subset: k ∈ {21,31,51,63,127}, 30 selected odd-m pairs.
-//     Same zero-overhead dispatch as the default build, ~10× smaller binary.
 //     cmake: -DTUNA_CONDA_PROFILE=ON
-//
-//   No flags (default build)
-//     Supports odd k ∈ [11,63] plus k=127, with odd
-//     m ∈ [9,min(k-2,31)].
-//     For any other k/m, prints a message telling the user to recompile.
 //
 // dispatch_generic is called by both the CLI and the library API.
 // It invokes f.template operator()<K, L>() for the matching (K, L) pair.
@@ -582,6 +589,13 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
         return 1;
     }
 #endif
+// One m per k (the default), or every m (-DTUNA_ALL_M=ON).
+//
+// Shipping one m per k cuts the table from 270 template instantiations to 28,
+// which is most of the build time. The m is auto_m(k) from Config.hpp, so a
+// run that does not pass -m always finds its pair here. Sweeping m, as
+// scripts/bench_msweep.sh does, needs the full table.
+#if defined(TUNA_ALL_M)
 #if !defined(FIXED_K) || FIXED_K == 11
     TDG(11,  9);
 #endif
@@ -715,14 +729,109 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
     TDG(127, 17); TDG(127, 19); TDG(127, 21); TDG(127, 23);
     TDG(127, 25); TDG(127, 27); TDG(127, 29); TDG(127, 31);
 #endif
+#else
+#if !defined(FIXED_K) || FIXED_K == 11
+    TDG( 11,  9);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 13
+    TDG( 13, 11);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 15
+    TDG( 15, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 17
+    TDG( 17, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 19
+    TDG( 19, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 21
+    TDG( 21, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 23
+    TDG( 23, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 25
+    TDG( 25, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 27
+    TDG( 27, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 29
+    TDG( 29, 13);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 31
+    TDG( 31, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 33
+    TDG( 33, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 35
+    TDG( 35, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 37
+    TDG( 37, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 39
+    TDG( 39, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 41
+    TDG( 41, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 43
+    TDG( 43, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 45
+    TDG( 45, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 47
+    TDG( 47, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 49
+    TDG( 49, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 51
+    TDG( 51, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 53
+    TDG( 53, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 55
+    TDG( 55, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 57
+    TDG( 57, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 59
+    TDG( 59, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 61
+    TDG( 61, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 63
+    TDG( 63, 17);
+#endif
+#if !defined(FIXED_K) || FIXED_K == 127
+    TDG(127, 17);
+#endif
+#endif  // TUNA_ALL_M
 #undef TDG
 
     // k/m pair not in the built-in table.
+#if defined(TUNA_ALL_M)
     std::cerr << "tuna: error: unsupported combination k=" << k << " m=" << m << "\n"
-              << "  Default build supports odd k in [11,63] plus k=127,"
+              << "  This build supports odd k in [11,63] plus k=127,"
                  " with odd m in [9,min(k-2,31)].\n"
               << "  For any other k or m recompile with:\n"
               << "    -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
+#else
+    std::cerr << "tuna: error: this build carries one m per k, and k=" << k
+              << " uses m=" << auto_m(k) << "; received m=" << m << "\n"
+              << "  Leave -m out to get it, or rebuild to choose m freely:\n"
+              << "    -DTUNA_ALL_M=ON              every m for every k\n"
+              << "    -DFIXED_K=" << k << " -DFIXED_M=" << m
+              << "   just this pair\n";
+#endif
     return 1;
 #endif  // FIXED_K && FIXED_M / TUNA_CONDA_PROFILE / default
 }

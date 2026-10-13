@@ -15,6 +15,26 @@ struct PartitionStats {
     bool spill_failed = false;
 };
 
+// The minimizer length tuna uses when -m is not given.
+//
+// Measured by scripts/bench_autom.sh over four regimes (500 bacterial
+// assemblies, one human assembly, a read set and a metagenome) at nine values
+// of k. Summed wall time picks 13 below k=31 and 17 at or above it; that rule
+// is within 3.1% of the best m at every k measured and 0.6% on average. The
+// per-k optima are flatter than they look -- at k=63 everything from m=15 to
+// m=25 is within 1% -- so a two-step rule beats fitting each k, which would be
+// fitting noise.
+//
+// Clamped to k-2 so small k stay valid: k=11 gives 9, k=13 gives 11.
+constexpr uint16_t auto_m(uint16_t k) noexcept
+{
+    uint16_t m = (k < 31) ? uint16_t(13) : uint16_t(17);
+    const uint16_t hi = (k > 2) ? uint16_t(k - 2) : uint16_t(1);
+    if (m > hi) m = hi;
+    if ((m & 1u) == 0u) --m;            // the dispatch table carries odd m only
+    return m;
+}
+
 enum class SuperkmerDedupMode : uint8_t {
     Auto,
     On,
@@ -26,7 +46,7 @@ struct Config {
     std::string  output_file;
     std::string  work_dir;            // directory for temp partition files
     uint16_t     k              = 31;
-    uint16_t     l              = 17;
+    uint16_t     l              = 0;  // 0 = auto: resolved to auto_m(k) by the CLI
     uint32_t     num_partitions = 0;    // 0 = auto-tune from input size (set in main)
     uint32_t     num_threads    = 1;  // worker threads: phase 1 over files, phase 2 over partitions
     uint32_t     ci             = 1;  // minimum count to report

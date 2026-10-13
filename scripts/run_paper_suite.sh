@@ -111,9 +111,11 @@ if (( wants_tuna )); then
         elif [[ ! -x "$tb" ]]; then
             echo "[error] not executable: $tb (k=$k)"; err=1
         else
-            # A -DFIXED_K (or -DFIXED_M) build exits on any other k or m.
-            # Prove this binary accepts this (k, M) on a few hundred bases now,
-            # rather than discovering it after the cheap experiments have run.
+            # A -DFIXED_K (or -DFIXED_M) build exits on any other k or m, and
+            # a default build now carries only auto_m(k), so it rejects any
+            # other -m unless it was made with -DTUNA_ALL_M=ON. Prove this
+            # binary accepts this (k, M) on a few hundred bases now, rather
+            # than discovering it after the cheap experiments have run.
             probe=$(mktemp -d)
             { echo ">probe"
               for _ in $(seq 1 40); do printf 'ACGTTGCAGGTCATAC'; done
