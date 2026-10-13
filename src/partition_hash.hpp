@@ -1036,7 +1036,7 @@ PartitionStats partition_kmers(
     const size_t mask = n - 1; // n is always a power of 2 (enforced in main.cpp)
     static constexpr uint16_t partition_m = m;
     return partition_kmers_impl<k, m, partition_m>(cfg, buckets,
-        [mask](uint64_t h) -> size_t { return h & mask; },
+        [mask](uint64_t h) -> size_t { return minimizer_mix(h) & mask; },
         write_budget_per_thread);
 }
 
@@ -1050,5 +1050,5 @@ PartitionStats partition_kmers_mem(
     const size_t mask = n - 1; // n is always a power of 2 (enforced in main.cpp)
     static constexpr uint16_t partition_m = m;
     return partition_kmers_mem_impl<k, m, partition_m>(cfg, bufs,
-        [mask](uint64_t h) -> size_t { return h & mask; }, spill_limit_bytes);
+        [mask](uint64_t h) -> size_t { return minimizer_mix(h) & mask; }, spill_limit_bytes);
 }
