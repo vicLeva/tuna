@@ -24,8 +24,14 @@ jobs:
           # Generate a small FASTA (>31 bp so at least one k-mer is produced)
           printf ">seq1\nACGTACGTACGTACGTACGTACGTACGTACGTACGT\n>seq2\nTGCATGCATGCATGCATGCATGCATGCATGCATGCA\n" > /tmp/test.fa
 
-          # Run tuna with default k=31
-          ./build/tuna -k 31 -m 21 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
+          # No -m: tuna derives it from k. This build carries one m per k.
+          ./build/tuna -k 31 -n 4 -t 1 /tmp/test.fa /tmp/out.tsv
+
+          # ...and rejects any other m, rather than silently counting with
+          # the one it has.
+          if ./build/tuna -k 31 -m 21 -n 4 -t 1 /tmp/test.fa /tmp/bad.tsv 2>/dev/null; then
+            echo "Expected -m 21 to be rejected on a one-m-per-k build"; exit 1
+          fi
 
           # Output must be non-empty
           [ -s /tmp/out.tsv ] || { echo "Output is empty"; exit 1; }
