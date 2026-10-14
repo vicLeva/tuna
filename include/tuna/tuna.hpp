@@ -27,8 +27,7 @@
 //   m — minimizer length; defaults to auto_m(k), the same value the CLI picks
 //       when -m is left out: 13 below k=31 and 17 at or above, clamped to k-2.
 //       Measured over four data regimes at nine values of k, that rule lands
-//       within 3.1% of the best m everywhere and 0.6% on average; see
-//       scripts/bench_autom.sh.
+//       within 3.1% of the best m everywhere and 0.6% on average.
 //       m sets how many kmers a superkmer spans, on average (k-m+2)/2, so it
 //       trades record count against record length. Small m is the costly
 //       mistake: a partition count that outgrows 4^m unbalances phase 2, and

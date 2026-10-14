@@ -825,12 +825,23 @@ inline int dispatch_generic(uint16_t k, uint16_t m, F&& f)
               << "  For any other k or m recompile with:\n"
               << "    -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
 #else
-    std::cerr << "tuna: error: this build carries one m per k, and k=" << k
-              << " uses m=" << auto_m(k) << "; received m=" << m << "\n"
-              << "  Leave -m out to get it, or rebuild to choose m freely:\n"
-              << "    -DTUNA_ALL_M=ON              every m for every k\n"
-              << "    -DFIXED_K=" << k << " -DFIXED_M=" << m
-              << "   just this pair\n";
+    // Two ways to land here: k is not in the table at all, or k is but this
+    // build carries only auto_m(k) and a different m was asked for. Saying
+    // "expected 17, got 17" when it is really the k that is missing helps
+    // nobody, so separate them.
+    if (m != auto_m(k)) {
+        std::cerr << "tuna: error: this build carries one m per k, and k=" << k
+                  << " uses m=" << auto_m(k) << "; received m=" << m << "\n"
+                  << "  Leave -m out to get it, or rebuild to choose m freely:\n"
+                  << "    -DTUNA_ALL_M=ON              every m for every k\n"
+                  << "    -DFIXED_K=" << k << " -DFIXED_M=" << m
+                  << "   just this pair\n";
+    } else {
+        std::cerr << "tuna: error: k=" << k << " is not in this build\n"
+                  << "  It carries odd k in [11,63] plus k=127.\n"
+                  << "  For any other k, including even k and k up to 256:\n"
+                  << "    -DFIXED_K=" << k << " -DFIXED_M=" << m << "\n";
+    }
 #endif
     return 1;
 #endif  // FIXED_K && FIXED_M / TUNA_CONDA_PROFILE / default

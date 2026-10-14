@@ -73,19 +73,20 @@ M=17 bash bench_coverage_sweep.sh
 bash bench_msweep.sh
 ```
 
-### Builds must carry the m the scripts ask for
-
-tuna now picks m from k on its own (13 below k=31, 17 at or above) and a build
-carries only that one m per k. Every script here passes `-m` explicitly, so a
-default build rejects any value other than `auto_m(k)`. Build the benchmark
-binaries with `-DTUNA_ALL_M=ON`:
+### Use a plain build
 
 ```bash
-cmake -S . -B build_bench -DCMAKE_BUILD_TYPE=Release -DTUNA_ALL_M=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target tuna -j$(nproc)
 ```
 
-`-DFIXED_K` and `-DTUNA_ALL_M` are orthogonal: the first picks which k, the
-second whether every m is available. An m sweep at one k wants both.
+No `-DTUNA_ALL_M`, no `-DFIXED_K`. The scripts pass no `-m`, so tuna derives it
+from k exactly as it does for a user, and that is what the paper reports. At
+k=31 that is m=17, at k=27 m=13.
+
+Two exceptions, both needing `-DTUNA_ALL_M=ON` because they set `-m`
+themselves: `bench_msweep.sh`, and anything run with `FORCE_M`. For an m sweep
+at a single k, add `-DFIXED_K` as well — the two are orthogonal, the first
+picks which k, the second whether every m is available.
 
 ### One tuna binary per k
 
@@ -332,9 +333,7 @@ on the thread count — worth remembering when reading the T=1 and T=2 points.
 - **FastK input names**: FastK dispatches on file extension and does not accept
   `.fna`, so inputs are exposed through a symlink farm under `$ROOT/fastk_links`.
   The real data is never touched.
-- **Minimizer length** is `m=17` everywhere, which is also what tuna picks on
-  its own at k=31. The per-dataset m fields in the experiment scripts are
-  gone, so `M` (or `FORCE_M`) sets it in one place for the whole suite. Note
-  the suite also runs k=27, where tuna's own default is 13, so forcing 17
-  there is deliberate: it keeps one m across the whole table. That needs a
-  `-DTUNA_ALL_M=ON` build (see above).
+- **Minimizer length** is never passed: tuna derives it from k. The big-data
+  table therefore spans two values, m=17 at k=31 and m=13 at k=27, which is
+  what a user of those k actually gets. `FORCE_M` overrides it for a one-off,
+  against a `-DTUNA_ALL_M=ON` build.

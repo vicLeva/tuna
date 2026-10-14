@@ -59,7 +59,7 @@
 #   follows from it. Statistics are therefore produced during the KMC pass.
 #
 # Output: $ROOT/coverage_sweep.csv
-#   coverage,m,file_bytes,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status
+#   coverage,m,file_bytes,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status,peak_disk_mb
 
 set -uo pipefail
 export LC_ALL=C LANG=C
@@ -73,16 +73,13 @@ export LC_ALL=C LANG=C
 : "${SRC:=/WORKS/vlevallois/data/data_sequencing/SRR622461_1.fastq.gz}"
 SRC_COV=5                                  # coverage of the source file
 K=${K:-31}
-# m is deliberately NOT defaulted. This script does not source bench_common.sh
-# and so never saw FORCE_M, which is how its CSV ended up at m=21 while the
-# rest of the suite moved on, leaving one experiment on a different minimizer
-# length than every other number in the paper. Pass it explicitly.
-# (The 2026-08-28 run carries m=17, the 2026-09-03 run m=21.)
-if [[ -z "${M:-}" ]]; then
-    echo "[error] M is not set. Pass the same m as the rest of the suite, e.g."
-    echo "        M=17 bash bench_coverage_sweep.sh"
-    exit 1
-fi
+# No -m: tuna derives it from k, as everywhere else in the suite. FORCE_M
+# overrides, but only against a -DTUNA_ALL_M=ON build.
+# (Historical note: the 2026-08-28 run carries m=17, the 2026-09-03 run m=21,
+# both from when m was passed explicitly.)
+: "${FORCE_M:=}"
+MFLAG=()
+[[ -n "$FORCE_M" ]] && MFLAG=(-m "$FORCE_M")
 THREADS=${THREADS:-8}
 RAM_GB=${RAM_GB:-256}
 STOP_BYTES=${STOP_BYTES:-$((500 * 1024 * 1024 * 1024))}
@@ -98,6 +95,10 @@ fi
 # rather than deleted: restore the middle entry to measure it again.
 PASSES=("tuna bin" "kmc bin")
 # PASSES=("tuna bin" "tuna ascii" "kmc bin")
+
+# True when any ascii work is wanted. Restoring the commented PASSES above is
+# what turns the ASCII side of this experiment back on, kmc_dump included.
+ascii_wanted() { [[ " ${PASSES[*]} " == *" ascii"* ]]; }
 
 # ONLY_TOOLS, as in bench_common.sh, which this script does not source. Empty
 # means every pass above. A tuna-only re-run keeps the competitor rows from an
@@ -116,6 +117,36 @@ if [[ -n "$ONLY_TOOLS" ]]; then
 fi
 
 WORK="$ROOT/work"; AUX="$ROOT/aux"; DATA="$ROOT/data"; STATS="$ROOT/stats"
+
+# Peak scratch usage, sampled while a tool runs. Mirrors bench_common.sh; this
+# script deliberately does not source it. Off by default because the sampler
+# walks the scratch tree every DU_INTERVAL seconds, which is real I/O.
+: "${MEASURE_DISK:=}"
+: "${DU_INTERVAL:=5}"
+PEAK_DISK_PID=""; PEAK_DISK_FILE=""
+
+peak_disk_start() {
+    [[ -z "$MEASURE_DISK" ]] && return 0
+    local dir="$1"
+    PEAK_DISK_FILE="$(mktemp)"; echo 0 > "$PEAK_DISK_FILE"
+    ( local mx=0 v
+      while :; do
+          if [[ -d "$dir" ]]; then
+              v=$(du -s --block-size=1 "$dir" 2>/dev/null | cut -f1)
+              if [[ -n "$v" ]] && (( v > mx )); then mx=$v; echo "$mx" > "$PEAK_DISK_FILE"; fi
+          fi
+          sleep "$DU_INTERVAL"
+      done ) &
+    PEAK_DISK_PID=$!
+}
+
+peak_disk_stop() {
+    [[ -z "$MEASURE_DISK" || -z "$PEAK_DISK_PID" ]] && { PEAK_DISK_PID=""; return 0; }
+    kill "$PEAK_DISK_PID" 2>/dev/null; wait "$PEAK_DISK_PID" 2>/dev/null; PEAK_DISK_PID=""
+    local b; b=$(cat "$PEAK_DISK_FILE" 2>/dev/null)
+    rm -f "$PEAK_DISK_FILE"; PEAK_DISK_FILE=""
+    [[ -n "$b" ]] && awk -v x="$b" 'BEGIN{printf "%.0f", x/1048576}'
+}
 CSV="$ROOT/coverage_sweep.csv"
 SCSV="$ROOT/coverage_stats.csv"
 CHUNK_DIR="$DATA"          # fractional blocks chunk_{1..4}_5.fastq.gz
@@ -125,7 +156,7 @@ needed=()
 for pass in "${PASSES[@]}"; do
     case "${pass%% *}" in
         tuna) needed+=(TUNA) ;;
-        kmc)  needed+=(KMC KMC_DUMP) ;;
+        kmc)  needed+=(KMC); ascii_wanted && needed+=(KMC_DUMP) ;;
     esac
 done
 for v in $(printf '%s\n' "${needed[@]}" | sort -u); do
@@ -136,10 +167,22 @@ done
 [[ $err -eq 1 ]] && exit 1
 
 mkdir -p "$WORK" "$AUX" "$DATA" "$STATS"
-[[ -f "$CSV" ]] || echo "coverage,m,file_bytes,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status" > "$CSV"
+CSV_HDR="coverage,m,file_bytes,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status,peak_disk_mb"
+if [[ -f "$CSV" ]]; then
+    got=$(head -1 "$CSV")
+    if [[ "$got" != "$CSV_HDR" ]]; then
+        echo "[error] $CSV was written with a different schema."
+        echo "        expected: $CSV_HDR"
+        echo "        found:    $got"
+        echo "        Move it aside, or point ROOT somewhere else."
+        exit 1
+    fi
+else
+    echo "$CSV_HDR" > "$CSV"
+fi
 [[ -f "$SCSV" ]] || echo "coverage,m,file_bytes,distinct_kmers,total_kmers,singletons,pct_singletons,mean_count,median_count,p99_count,max_count,cov_peak,top1pct_mass_pct,gini" > "$SCSV"
 
-echo "[bench] coverage sweep - k=$K m=$M t=$THREADS ram=${RAM_GB}GB"
+echo "[bench] coverage sweep - k=$K m=${FORCE_M:-auto} t=$THREADS ram=${RAM_GB}GB"
 echo "[bench] source : $SRC ($(du -h "$SRC" | cut -f1), ~${SRC_COV}x)"
 echo "[bench] tuna   : $TUNA  ($(stat -c %y "$TUNA" 2>/dev/null | cut -d. -f1))"
 echo "[bench] kmc    : $KMC"
@@ -175,7 +218,7 @@ kmer_stats() {
     local hist="$STATS/hist_cov${cov}x.tsv"
     "$KMC_TOOLS" transform "$db" histogram "$hist" -ci1 -cx1000000 >/dev/null 2>&1 \
         || { echo "    [stats] histogram unavailable"; return; }
-    awk -v cov="$cov" -v mm="$M" -v fb="$fb" '
+    awk -v cov="$cov" -v mm="${FORCE_M:-auto}" -v fb="$fb" '
         { c=$1+0; n=$2+0; if(n==0) next
           cnt[++m]=c; num[m]=n; d+=n; t+=c*n; if(c==1) s1=n; if(c>mx) mx=c
           if(c>1 && n>peakn){peakn=n; peak=c} }
@@ -276,7 +319,7 @@ run_one() {
     local fb; fb=$(stat -c%s "$f" 2>/dev/null || echo 0)
     local tag="cov${cov}_${tool}_${mode}"
     local tf="$AUX/$tag.time" se="$AUX/$tag.stderr" dt="$AUX/$tag.dumptime"
-    local wall rss p1 p2 dump uniq tot rc
+    local wall rss p1 p2 dump uniq tot rc pdisk=""
     # KMC leaves a huge RSS that evicts the page cache: without this read the
     # first tuna run would read cold and the second warm, skewing the bin/ascii
     # gap. So warm up before every measurement.
@@ -285,26 +328,34 @@ run_one() {
     case "$tool:$mode" in
       kmc:bin)
         mkdir -p "$WORK/tmp"
+        peak_disk_start "$WORK/tmp"
         /usr/bin/time -v -o "$tf" "$KMC" -k$K -ci1 -cs4294967295 -fq -m${RAM_GB} -hp -t${THREADS} \
             "$f" "$WORK/out" "$WORK/tmp" > "$se" 2>&1
-        rc=$?; rm -rf "$WORK/tmp"
-        if [[ $rc -ne 0 ]]; then row "$cov,na,$fb,kmc,bin,,,,,,,,fail"; echo "    [FAIL] kmc bin"; return; fi
+        rc=$?; pdisk=$(peak_disk_stop); rm -rf "$WORK/tmp"
+        if [[ $rc -ne 0 ]]; then row "$cov,na,$fb,kmc,bin,,,,,,,,fail,$pdisk"; echo "    [FAIL] kmc bin"; return; fi
         uniq=$(kmc_num "No. of unique k-mers" "$se")
-        local want; want=$(tsv_bytes_for "${uniq:-0}")
-        if [[ -n "$uniq" ]] && ! room_for "$want"; then
-            dump="skipped"
-            echo "    [skip] kmc_dump: would need ~$(numfmt --to=iec "$want"), free $(numfmt --to=iec "$(free_bytes "$WORK")")"
+        # kmc_dump is the ASCII half of this experiment. The paper no longer
+        # reports ASCII totals, and the dump cost 1.5 h of the last sweep for a
+        # column nothing reads, so it only runs when ascii is asked for.
+        if ! ascii_wanted; then
+            dump=""
         else
-            /usr/bin/time -v -o "$dt" "$KMC_DUMP" "$WORK/out" "$WORK/out.tsv" >/dev/null 2>>"$se"
-            rc=$?; dump=$([[ $rc -eq 0 ]] && wall_of "$dt" || echo "")
-            rm -f "$WORK/out.tsv"
+            local want; want=$(tsv_bytes_for "${uniq:-0}")
+            if [[ -n "$uniq" ]] && ! room_for "$want"; then
+                dump="skipped"
+                echo "    [skip] kmc_dump: would need ~$(numfmt --to=iec "$want"), free $(numfmt --to=iec "$(free_bytes "$WORK")")"
+            else
+                /usr/bin/time -v -o "$dt" "$KMC_DUMP" "$WORK/out" "$WORK/out.tsv" >/dev/null 2>>"$se"
+                rc=$?; dump=$([[ $rc -eq 0 ]] && wall_of "$dt" || echo "")
+                rm -f "$WORK/out.tsv"
+            fi
         fi
         kmer_stats "$cov" "$fb" "$WORK/out"     # before dropping the DB
         rm -f "$WORK/out.kmc_pre" "$WORK/out.kmc_suf"
         wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
         p1=$(se_val "1st stage" "$se"); p2=$(se_val "2nd stage" "$se")
         tot=$(kmc_num "Total no. of k-mers" "$se")
-        row "$cov,na,$fb,kmc,bin,$wall,$rss,$p1,$p2,$dump,$uniq,$tot,ok"
+        row "$cov,na,$fb,kmc,bin,$wall,$rss,$p1,$p2,$dump,$uniq,$tot,ok,$pdisk"
         printf "    [%-4s %-5s] wall=%9ss  p1=%9ss  p2=%9ss  dump=%9ss  RSS=%8sMB\n" kmc bin "$wall" "$p1" "$p2" "$dump" "$rss"
         ;;
       tuna:*)
@@ -313,21 +364,25 @@ run_one() {
             if [[ -n "$est" ]]; then
                 local want; want=$(tsv_bytes_for "$est")
                 if ! room_for "$want"; then
-                    row "$cov,$M,$fb,tuna,ascii,,,,,,,,skipped_space"
+                    row "$cov,${FORCE_M:-auto},$fb,tuna,ascii,,,,,,,,skipped_space,"
                     echo "    [skip] tuna ascii: would need ~$(numfmt --to=iec "$want"), free $(numfmt --to=iec "$(free_bytes "$WORK")")"
                     return
                 fi
             fi
         fi
         local out; [[ $mode == bin ]] && out="$WORK/out.kff" || out="$WORK/out.tsv"
-        /usr/bin/time -v -o "$tf" "$TUNA" -k $K -m $M -t $THREADS -ram $RAM_GB -hp \
-            -w "$WORK/" "$f" "$out" >/dev/null 2>"$se"
-        rc=$?; rm -f "$out"
-        if [[ $rc -ne 0 ]]; then row "$cov,$M,$fb,tuna,$mode,,,,,,,,fail"; echo "    [FAIL] tuna $mode"; return; fi
+        # Own scratch directory, so the sampled peak is tuna's temporary space
+        # and not the output sitting beside it in $WORK.
+        rm -rf "$WORK/t"; mkdir -p "$WORK/t"
+        peak_disk_start "$WORK/t"
+        /usr/bin/time -v -o "$tf" "$TUNA" -k $K "${MFLAG[@]}" -t $THREADS -ram $RAM_GB -hp \
+            -w "$WORK/t/" "$f" "$out" >/dev/null 2>"$se"
+        rc=$?; pdisk=$(peak_disk_stop); rm -f "$out"; rm -rf "$WORK/t"
+        if [[ $rc -ne 0 ]]; then row "$cov,${FORCE_M:-auto},$fb,tuna,$mode,,,,,,,,fail,$pdisk"; echo "    [FAIL] tuna $mode"; return; fi
         wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
         p1=$(se_val phase1 "$se"); p2=$(se_val phase2 "$se")
         uniq=$(se_val unique_kmers "$se"); tot=$(se_val total_kmers "$se")
-        row "$cov,$M,$fb,tuna,$mode,$wall,$rss,$p1,$p2,,$uniq,$tot,ok"
+        row "$cov,${FORCE_M:-auto},$fb,tuna,$mode,$wall,$rss,$p1,$p2,,$uniq,$tot,ok,$pdisk"
         printf "    [%-4s %-5s] wall=%9ss  p1=%9ss  p2=%9ss  RSS=%8sMB  uniq=%s\n" tuna "$mode" "$wall" "$p1" "$p2" "$rss" "$uniq"
         ;;
     esac

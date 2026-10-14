@@ -73,14 +73,15 @@ export LC_ALL=C LANG=C
 : "${DATA_ROOT:=/WORKS/vlevallois/data}"
 
 : "${K:=31}"
-: "${M:=17}"                 # tuna minimizer length, matching tuna's default
 : "${THREADS:=8}"
 : "${RAM_GB:=256}"
 
 : "${TIMEOUT_S:=21600}"      # 6 h per run, all tools
 
 # --- overrides, mainly for side experiments -------------------------------
-# FORCE_M    ignore the per-dataset minimizer length and use this one
+# FORCE_M    pass an explicit -m instead of letting tuna choose from k. Only
+#            works against a -DTUNA_ALL_M=ON build; a default build carries
+#            one m per k and rejects anything else.
 #            everywhere (for choosing m by comparing whole experiments).
 # ONLY_DATASETS space-separated subset of an experiment's datasets to run.
 #            Lets one experiment be split across invocations, for instance to
@@ -105,7 +106,24 @@ export LC_ALL=C LANG=C
 #              read sets. Everything a k-mer histogram can tell you is already
 #              in the binary DB - see scripts/kmer_stats.sh.
 : "${KEEP_OUTPUT:=}"
-: "${FASTK_TIMEOUT_S:=$TIMEOUT_S}"
+
+# MEASURE_DISK  sample peak scratch-directory size while each tool runs, into
+#               the peak_disk_mb column. Off by default: the sampler walks the
+#               scratch tree every DU_INTERVAL seconds, which on a disk-mode
+#               run with tens of thousands of partition files is real I/O and
+#               could move the timings this suite exists to measure. Turn it on
+#               for a dedicated pass when you want RAM and disk side by side.
+: "${MEASURE_DISK:=}"
+: "${DU_INTERVAL:=5}"
+# FastK gets a shorter leash than the others. It has never completed a gallus
+# run, so at the 6 h limit the suite spent about 30 h waiting on runs that
+# were always going to be killed.
+#
+# 2 h is safe for binary output: the longest FastK bin run that ever finished
+# took 5515 s (human3, k=27, 8 GB), so there is 1.3x of headroom. It is NOT
+# safe with ascii: that path peaked at 7184 s on the same input and would be
+# killed here. Raise this if you re-enable ONLY_MODES=ascii.
+: "${FASTK_TIMEOUT_S:=7200}"
 
 WORK="$ROOT/work"; AUX="$ROOT/aux"; LINKS="$ROOT/fastk_links"
 
@@ -142,7 +160,19 @@ bench_init() {
     (( err )) && exit 1
 
     mkdir -p "$ROOT" "$WORK" "$AUX" "$LINKS"
-    [[ -f "$CSV" ]] || echo "dataset,key,label,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status" > "$CSV"
+    local hdr="dataset,key,label,tool,mode,wall_s,rss_mb,phase1_s,phase2_s,dump_s,unique_kmers,total_kmers,status,peak_disk_mb"
+    if [[ -f "$CSV" ]]; then
+        local got; got=$(head -1 "$CSV")
+        if [[ "$got" != "$hdr" ]]; then
+            echo "[error] $CSV was written with a different schema."
+            echo "        expected: $hdr"
+            echo "        found:    $got"
+            echo "        Move it aside, or point ROOT somewhere else."
+            exit 1
+        fi
+    else
+        echo "$hdr" > "$CSV"
+    fi
 
     SCSV="$ROOT/${EXPERIMENT}_kmer_stats.csv"
     HIST="$ROOT/hist/$EXPERIMENT"
@@ -154,9 +184,9 @@ bench_init() {
 
     echo "[bench] experiment : $EXPERIMENT"
     echo "[bench] tools      : $TOOLS_USED"
-    [[ -n "$FORCE_M" ]] && echo "[bench] FORCE_M=$FORCE_M (per-dataset m ignored)"
+    [[ -n "$FORCE_M" ]] && echo "[bench] FORCE_M=$FORCE_M (needs a -DTUNA_ALL_M build)"
     [[ "$MAX_FILES" != 0 ]] && echo "[bench] MAX_FILES=$MAX_FILES"
-    echo "[bench] k=$K m=$M threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s (fastk ${FASTK_TIMEOUT_S}s)"
+    echo "[bench] k=$K m=${FORCE_M:-auto} threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s (fastk ${FASTK_TIMEOUT_S}s)"
     local tbh; tbh=$(tuna_for_k "$K")
     echo "[bench] tuna       : $tbh ($(stat -c %y "$tbh" 2>/dev/null | cut -d. -f1))"
     echo "[bench] output     : $CSV"
@@ -240,6 +270,45 @@ have_run() {
         'NR>1 && $1==d && $2==k && $4==t && $5==m {f=1} END{exit !f}' "$CSV"
 }
 
+# ── Peak scratch usage ───────────────────────────────────────────────────────
+#
+# du in a loop, keeping the maximum. Sampling cannot see a peak that opens and
+# closes between two ticks, so this is a lower bound; with DU_INTERVAL=5 against
+# runs of minutes to hours that is close enough to report. Each tool is pointed
+# at its own scratch directory, not at the shared $WORK, so the figure is the
+# temporary space the tool itself demanded and excludes its output.
+PEAK_DISK_PID=""
+PEAK_DISK_FILE=""
+
+peak_disk_start() {
+    [[ -z "$MEASURE_DISK" ]] && return 0
+    local dir="$1"
+    PEAK_DISK_FILE="$(mktemp)"
+    echo 0 > "$PEAK_DISK_FILE"
+    (
+        local mx=0 v
+        while :; do
+            if [[ -d "$dir" ]]; then
+                v=$(du -s --block-size=1 "$dir" 2>/dev/null | cut -f1)
+                if [[ -n "$v" ]] && (( v > mx )); then mx=$v; echo "$mx" > "$PEAK_DISK_FILE"; fi
+            fi
+            sleep "$DU_INTERVAL"
+        done
+    ) &
+    PEAK_DISK_PID=$!
+}
+
+# Echoes the peak in MB, or nothing when sampling was off.
+peak_disk_stop() {
+    [[ -z "$MEASURE_DISK" || -z "$PEAK_DISK_PID" ]] && { PEAK_DISK_PID=""; return 0; }
+    kill "$PEAK_DISK_PID" 2>/dev/null
+    wait "$PEAK_DISK_PID" 2>/dev/null
+    PEAK_DISK_PID=""
+    local b; b=$(cat "$PEAK_DISK_FILE" 2>/dev/null)
+    rm -f "$PEAK_DISK_FILE"; PEAK_DISK_FILE=""
+    [[ -n "$b" ]] && awk -v x="$b" 'BEGIN{printf "%.0f", x/1048576}'
+}
+
 # rc 124 is what `timeout` returns when it had to kill the process.
 status_of() { [[ "$1" -eq 0 ]] && echo ok || { [[ "$1" -eq 124 ]] && echo timeout || echo fail; }; }
 
@@ -279,8 +348,12 @@ fastk_fof() {
 
 run_tuna() {
     tool_enabled tuna || return 0
-    local ds="$1" key="$2" label="$3" input="$4" mode out tag tf se rc st
-    local mm="${FORCE_M:-$M}"
+    local ds="$1" key="$2" label="$3" input="$4" mode out tag tf se rc st pdisk=""
+    # No -m by default: tuna derives it from k, which is what a user gets and
+    # so what the paper should measure. FORCE_M overrides, for a build that
+    # carries more than one m per k.
+    local mflag=()
+    [[ -n "$FORCE_M" ]] && mflag=(-m "$FORCE_M")
     local tb; tb=$(tuna_for_k "$K")
     if [[ -z "$tb" || ! -x "$tb" ]]; then
         echo "    [error] no tuna binary for k=$K (set TUNA_K$K or TUNA)"
@@ -292,19 +365,20 @@ run_tuna() {
         tag="${ds}_${key}_tuna_${mode}"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"
         [[ $mode == bin ]] && out="$WORK/out.kff" || out="$WORK/out.tsv"
         rm -rf "$WORK/t"; mkdir -p "$WORK/t"
+        peak_disk_start "$WORK/t"
         /usr/bin/time -v -o "$tf" timeout "$TIMEOUT_S" \
-            "$tb" -k "$K" -m "$mm" -t "$THREADS" -ram "$RAM_GB" -hp \
+            "$tb" -k "$K" "${mflag[@]}" -t "$THREADS" -ram "$RAM_GB" -hp \
             -w "$WORK/t/" "$input" "$out" >/dev/null 2>"$se"
-        rc=$?; st=$(status_of "$rc")
+        rc=$?; st=$(status_of "$rc"); pdisk=$(peak_disk_stop)
         if [[ -n "$KEEP_OUTPUT" && $mode == bin && $st == ok ]]; then
             mkdir -p "$KEEP_OUTPUT"
             mv -f "$out" "$KEEP_OUTPUT/${ds}_${key}_tuna.kff" 2>/dev/null
         fi
         rm -f "$out"; rm -rf "$WORK/t"
         if [[ $st != ok ]]; then
-            row "$ds,$key,$label,tuna,$mode,,,,,,,,$st"; echo "    [$st] tuna $mode"; continue
+            row "$ds,$key,$label,tuna,$mode,,,,,,,,$st,$pdisk"; echo "    [$st] tuna $mode"; continue
         fi
-        row "$ds,$key,$label,tuna,$mode,$(wall_of "$tf"),$(rss_of "$tf"),$(se_val phase1 "$se"),$(se_val phase2 "$se"),,$(se_val unique_kmers "$se"),$(se_val total_kmers "$se"),ok"
+        row "$ds,$key,$label,tuna,$mode,$(wall_of "$tf"),$(rss_of "$tf"),$(se_val phase1 "$se"),$(se_val phase2 "$se"),,$(se_val unique_kmers "$se"),$(se_val total_kmers "$se"),ok,$pdisk"
         printf "    [tuna  %-5s] wall=%9ss  p1=%9ss  p2=%9ss  RSS=%8sMB\n" \
             "$mode" "$(wall_of "$tf")" "$(se_val phase1 "$se")" "$(se_val phase2 "$se")" "$(rss_of "$tf")"
     done
@@ -314,7 +388,7 @@ run_tuna() {
 run_kmc() {
     tool_enabled kmc || return 0
     local ds="$1" key="$2" label="$3" input="$4" fmt="$5"
-    local tag tf se dt rc st wall rss p1 p2 uniq tot dump drc dst
+    local tag tf se dt rc st wall rss p1 p2 uniq tot dump drc dst pdisk=""
     local need_bin=1 need_ascii=1
     have_run "$ds" "$key" kmc bin   && need_bin=0
     have_run "$ds" "$key" kmc ascii && need_ascii=0
@@ -324,20 +398,21 @@ run_kmc() {
 
     tag="${ds}_${key}_kmc"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"; dt="$AUX/$tag.dumptime"
     rm -rf "$WORK/kmctmp"; mkdir -p "$WORK/kmctmp"
+    peak_disk_start "$WORK/kmctmp"
     /usr/bin/time -v -o "$tf" timeout "$TIMEOUT_S" \
         "$KMC" -k"$K" -ci1 -cs4294967295 "$fmt" -m"$RAM_GB" -hp -t"$THREADS" \
         "$input" "$WORK/kmcdb" "$WORK/kmctmp" > "$se" 2>&1
-    rc=$?; st=$(status_of "$rc"); rm -rf "$WORK/kmctmp"
+    rc=$?; st=$(status_of "$rc"); pdisk=$(peak_disk_stop); rm -rf "$WORK/kmctmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st"
-        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st"
+        (( need_bin ))   && row "$ds,$key,$label,kmc,bin,,,,,,,,$st,$pdisk"
+        (( need_ascii )) && row "$ds,$key,$label,kmc,ascii,,,,,,,,$st,$pdisk"
         echo "    [$st] kmc"; rm -f "$WORK/kmcdb".kmc_*; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
     p1=$(se_val "1st stage" "$se"); p2=$(se_val "2nd stage" "$se")
     uniq=$(kmc_num "No. of unique k-mers" "$se"); tot=$(kmc_num "Total no. of k-mers" "$se")
     if (( need_bin )); then
-        row "$ds,$key,$label,kmc,bin,$wall,$rss,$p1,$p2,,$uniq,$tot,ok"
+        row "$ds,$key,$label,kmc,bin,$wall,$rss,$p1,$p2,,$uniq,$tot,ok,$pdisk"
         printf "    [kmc   %-5s] wall=%9ss  p1=%9ss  p2=%9ss  RSS=%8sMB\n" bin "$wall" "$p1" "$p2" "$rss"
     fi
     # ASCII = the same binary DB, plus a separately timed kmc_dump.
@@ -346,10 +421,10 @@ run_kmc() {
             "$KMC_DUMP" "$WORK/kmcdb" "$WORK/out.tsv" >/dev/null 2>>"$se"
         drc=$?; dst=$(status_of "$drc"); rm -f "$WORK/out.tsv"
         if [[ $dst != ok ]]; then
-            row "$ds,$key,$label,kmc,ascii,,,,,,,,$dst"; echo "    [$dst] kmc_dump"
+            row "$ds,$key,$label,kmc,ascii,,,,,,,,$dst,$pdisk"; echo "    [$dst] kmc_dump"
         else
             dump=$(wall_of "$dt")
-            row "$ds,$key,$label,kmc,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,$p1,$p2,$dump,$uniq,$tot,ok"
+            row "$ds,$key,$label,kmc,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,$p1,$p2,$dump,$uniq,$tot,ok,$pdisk"
             printf "    [kmc   %-5s] wall=%9ss  (kmc=%ss + dump=%ss)\n" ascii \
                 "$(awk "BEGIN{printf \"%.3f\",$wall+$dump}")" "$wall" "$dump"
         fi
@@ -375,7 +450,7 @@ run_kmc() {
 run_fastk() {
     tool_enabled fastk || return 0
     local ds="$1" key="$2" label="$3" fof="$4"
-    local tag tf se dt rc st wall rss dump drc dst db tmp
+    local tag tf se dt rc st wall rss dump drc dst db tmp pdisk=""
     local need_bin=1 need_ascii=1
     have_run "$ds" "$key" fastk bin   && need_bin=0
     have_run "$ds" "$key" fastk ascii && need_ascii=0
@@ -386,21 +461,22 @@ run_fastk() {
     tag="${ds}_${key}_fastk"; tf="$AUX/$tag.time"; se="$AUX/$tag.stderr"; dt="$AUX/$tag.dumptime"
     db="$WORK/fastk_$tag"; tmp="$WORK/fastktmp_$tag"
     rm -rf "$tmp"; mkdir -p "$tmp"
+    peak_disk_start "$tmp"
     mapfile -t files < "$fof"
     # -t1 makes FastK write the .ktab table; without it only a histogram is
     # produced and there would be nothing for Tabex to convert.
     /usr/bin/time -v -o "$tf" timeout "$FASTK_TIMEOUT_S" \
         "$FASTK" -k"$K" -t1 -T"$THREADS" -M"$RAM_GB" -N"$db" -P"$tmp" "${files[@]}" \
         >/dev/null 2>"$se"
-    rc=$?; st=$(status_of "$rc"); rm -rf "$tmp"
+    rc=$?; st=$(status_of "$rc"); pdisk=$(peak_disk_stop); rm -rf "$tmp"
     if [[ $st != ok ]]; then
-        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st"
-        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st"
+        (( need_bin ))   && row "$ds,$key,$label,fastk,bin,,,,,,,,$st,$pdisk"
+        (( need_ascii )) && row "$ds,$key,$label,fastk,ascii,,,,,,,,$st,$pdisk"
         echo "    [$st] fastk"; rm -f "$db"* ".${db##*/}"* 2>/dev/null; return
     fi
     wall=$(wall_of "$tf"); rss=$(rss_of "$tf")
     if (( need_bin )); then
-        row "$ds,$key,$label,fastk,bin,$wall,$rss,,,,,,ok"
+        row "$ds,$key,$label,fastk,bin,$wall,$rss,,,,,,ok,$pdisk"
         printf "    [fastk %-5s] wall=%9ss  RSS=%8sMB\n" bin "$wall" "$rss"
     fi
     # Tabex crashes on a good share of FastK tables; when it does, only the
@@ -410,10 +486,10 @@ run_fastk() {
             "$TABEX" -A "$db" > "$WORK/out.tsv" 2>>"$se"
         drc=$?; dst=$(status_of "$drc"); rm -f "$WORK/out.tsv"
         if [[ $dst != ok ]]; then
-            row "$ds,$key,$label,fastk,ascii,,,,,,,,$dst"; echo "    [$dst] Tabex"
+            row "$ds,$key,$label,fastk,ascii,,,,,,,,$dst,$pdisk"; echo "    [$dst] Tabex"
         else
             dump=$(wall_of "$dt")
-            row "$ds,$key,$label,fastk,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,,,$dump,,,ok"
+            row "$ds,$key,$label,fastk,ascii,$(awk "BEGIN{printf \"%.3f\",$wall+$dump}"),$rss,,,$dump,,,ok,$pdisk"
             printf "    [fastk %-5s] wall=%9ss  (fastk=%ss + tabex=%ss)\n" ascii \
                 "$(awk "BEGIN{printf \"%.3f\",$wall+$dump}")" "$wall" "$dump"
         fi

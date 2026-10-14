@@ -36,7 +36,7 @@ sweep() {
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; return; }
     total=$(wc -l < "$fof")
     echo ""
-    echo "== $ds  (m=$M, $total files available) =="
+    echo "== $ds  (m=${FORCE_M:-auto}, $total files available) =="
     for n in "${ns[@]}"; do
         (( n > total )) && { echo "  n=$n > $total, skipped"; continue; }
         echo "  n=$n"

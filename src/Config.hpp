@@ -17,9 +17,9 @@ struct PartitionStats {
 
 // The minimizer length tuna uses when -m is not given.
 //
-// Measured by scripts/bench_autom.sh over four regimes (500 bacterial
-// assemblies, one human assembly, a read set and a metagenome) at nine values
-// of k. Summed wall time picks 13 below k=31 and 17 at or above it; that rule
+// Measured over four regimes (500 bacterial assemblies, one human assembly, a
+// read set and a metagenome) at nine values of k, k=21 to k=127. Summed wall
+// time picks 13 below k=31 and 17 at or above it; that rule
 // is within 3.1% of the best m at every k measured and 0.6% on average. The
 // per-k optima are flatter than they look -- at k=63 everything from m=15 to
 // m=25 is within 1% -- so a two-step rule beats fitting each k, which would be

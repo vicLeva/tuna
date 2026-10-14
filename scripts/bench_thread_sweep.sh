@@ -52,7 +52,7 @@ for spec in "${DATASETS[@]}"; do
         fkf="$AUX/fastkfof_${ds}.list"; fastk_fof "$AUX/one_${ds}.list" 1 "$fkf"
     fi
     echo ""
-    echo "== $ds  (m=$M, $fmt) =="
+    echo "== $ds  (m=${FORCE_M:-auto}, $fmt) =="
     for t in $THREAD_LIST; do
         echo "  T=$t"
         THREADS="$t"

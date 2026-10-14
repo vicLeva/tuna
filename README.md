@@ -4,8 +4,8 @@
 It partitions minimizer superkmers, then counts them with a partition-local
 canonical rolling-hash table, keeping memory usage low and throughput high.
 
-It uses [kache-hash](https://github.com/jamshed/kache-hash) as its streaming k-mer hash table.
-Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (SIMD FASTX parser), and minimizer hashing uses a C++ port of [simd-minimizers](https://github.com/rust-seq/simd-minimizers) (canonical ntHash, two-stack sliding window minimum).
+It uses [unordered_dense](https://github.com/martinus/unordered_dense) as its streaming k-mer hash table.
+Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (FASTX parser), and minimizer computing uses a two-stack sliding-window minimum adapted from [simd-minimizers](https://github.com/rust-seq/simd-minimizers), with a regular random minimizer scheme.
 
 ---
 
@@ -14,6 +14,8 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 - [How it works](#how-it-works)
 - [Dependencies](#dependencies)
 - [Installation](#installation)
+  - [Choosing m](#choosing-m)
+  - [k range and compile-time specialisation](#k-range-and-compile-time-specialisation)
 - [Usage](#usage)
 - [Output format](#output-format)
   - [TSV (default)](#tsv-default)
@@ -32,7 +34,7 @@ tuna runs a two-phase pipeline:
 
 1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. tuna estimates the superkmer size up front and keeps phase 1 in memory when it fits the RAM budget; if the budget is reached while running, the partitions held in memory are spilled to disk and counting continues from there, so a run never exceeds its budget. Running with `-dbg` reports when a spill happens. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
 
-2. **Count (Phase 2)** — replays each partition, routing canonical rolling k-mer hashes into a Kache-hash table with increment semantics. This is independent of the shorter partition minimizer, avoiding minimizer-induced bucket skew. Each worker holds one partition table at a time.
+2. **Count (Phase 2)** — replays each partition and inserts its k-mers into a hash table, incrementing the count of each. Identical superkmers are collapsed first, so a repeated one is counted once and its multiplicity added in a single step. Each worker holds one partition table at a time.
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
 
@@ -79,65 +81,64 @@ The `tuna` binary will be at `build/tuna`.
 
 ### Choosing m
 
-You do not. Left out, `-m` is derived from `k`: **13 below `k=31`, 17 at or
-above**, clamped to `k-2` so small k stay valid. Measured across four data
-regimes (bacterial assemblies, a human assembly, a read set, a metagenome) at
-nine values of k, that rule lands within **3.1%** of the best m at every k and
-**0.6%** on average. The per-k optima are flat — at `k=63` every m from 15 to
-25 is within 1% — so a two-step rule beats fitting each k.
+You do not. Left out, `-m` is derived from `k`: **13 or less below `k=31`, 17 at or
+above**. 
 
-A build therefore instantiates one m per k, 28 pairs instead of 270, which is
-most of the build time. `-m` then only accepts the value that k uses. To pick m
-freely, for an m sweep or an experiment:
+A build therefore instantiates one m per k. If for some reason (we do not recommend it) you would want to choose `-m` freely, add the following to the `cmake` command:
 
 ```bash
 cmake .. -DTUNA_ALL_M=ON      # every odd m for every k
 ```
 
-Expect that to be slow and memory-hungry: the whole table lands in one
-translation unit, so it is 270 instantiations against 28. Measured here, the
-default build takes 113 s while the full one was still going after 24 minutes
-at 8.7 GB resident. Build it on a machine with room, and only to sweep m.
-
-The sweep behind the rule is `scripts/bench_autom.sh`.
+Expect the following `make` to be slow and memory-hungry: it will be 270 instantiations against 28.
 
 ### k range and compile-time specialisation
 
-The default build embeds a dispatch table for **odd k in `[11, 63]`, plus
-`k=127`**. You can pass any of those values at runtime with no extra flags.
+The default build accepts **odd k in `[11, 63]`, plus `k=127`**, each carrying
+one minimizer length, `auto_m(k)`. That is 28 template instantiations.
 
-To use **even k**, an odd k not in that table, or any k up to 256, compile with
-explicit `-DFIXED_K` and `-DFIXED_M`:
+**Most users want exactly this and should stop here.** Leave `-m` alone: the
+value tuna picks is within a few percent of the best one, and overriding it
+means building every m, which is ten times the instantiations and by far the
+slowest build.
+
+If the build is still too slow and you know your k in advance, pin it:
 
 ```bash
-cmake .. -DFIXED_K=63  -DFIXED_M=21
-cmake .. -DFIXED_K=127 -DFIXED_M=21
+cmake -S . -B build_k31 -DFIXED_K=31 && cmake --build build_k31 --target tuna -j$(nproc)
+```
+
+One instantiation instead of 28, a smaller binary, and the fastest build.
+The binary then accepts only `k=31`. Use a separate directory per k, which is
+also how you keep several around at once: `build_k31/tuna`, `build_k63/tuna`.
+
+#### Flags summary
+
+| cmake flags | k accepted | m accepted | pairs |
+|---|---|---|---|
+| *(none)* | odd 11–63, 127 | `auto_m(k)` | 28 |
+| `-DFIXED_K=K` | `K` | `auto_m(K)` | 1 |
+| `-DTUNA_ALL_M=ON` | odd 11–63, 127 | any odd m | 270 |
+| `-DFIXED_K=K -DTUNA_ALL_M=ON` | `K` | any odd m | ~12 |
+| `-DFIXED_K=K -DFIXED_M=M` | **any k ≤ 256** | `M` | 1 |
+
+Three notes on that table. The two switches do one thing each and are
+independent: `FIXED_K` narrows which k, `TUNA_ALL_M` widens which m, so
+sweeping m at a single k wants both.
+
+The last row is the exception. The first four pick from a hardcoded list of k,
+and `FIXED_K` can only remove entries from it, never add one — so
+`-DFIXED_K=256` alone builds an empty table and fails at runtime. Giving
+`FIXED_M` too switches to a branch with no table at all, which instantiates
+just the pair you named and so reaches any `k <= 256`, even k included:
+
+```bash
 cmake .. -DFIXED_K=256 -DFIXED_M=31
 ```
 
-This produces a single-instantiation binary locked to that (k, m) pair. Those values become the defaults — `-k` and `-m` at runtime must match or the binary exits with an error. Build is faster and the binary is smaller. The same mechanism works for k ≤ 31 if you want a leaner binary:
-
-```bash
-cmake .. -DFIXED_K=31 -DFIXED_M=17
-```
-
-`-DFIXED_K` and `-DTUNA_ALL_M` are orthogonal: the first narrows which k the
-table carries, the second whether it carries every m or just `auto_m(k)`. An m
-sweep at one k therefore wants both, which is 11 pairs rather than 270:
-
-```bash
-cmake .. -DFIXED_K=31 -DTUNA_ALL_M=ON
-```
-
-If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
-
-```bash
-cmake -S . -B build_k31_m17  -DFIXED_K=31  -DFIXED_M=17  && cmake --build build_k31_m17  --target tuna -j$(nproc)
-cmake -S . -B build_k63_m21  -DFIXED_K=63  -DFIXED_M=21  && cmake --build build_k63_m21  --target tuna -j$(nproc)
-cmake -S . -B build_k127_m25 -DFIXED_K=127 -DFIXED_M=25  && cmake --build build_k127_m25 --target tuna -j$(nproc)
-```
-
-Each directory contains its own `tuna` binary: `build_k31_m17/tuna`, `build_k63_m21/tuna`, etc.
+`FIXED_M` does nothing without `FIXED_K`, and when both are set they win over
+`TUNA_ALL_M`. Whatever the build, `-k` and `-m` at runtime must match what it
+carries, or tuna exits saying which value it has.
 
 <details>
 <summary><strong>Other compile-time options</strong></summary>
@@ -165,8 +166,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
-| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build; any value in `[2, 256]` when compiled with `-DFIXED_K=k` (must match the compile-time value when set). |
-| `-m` | `<int>` | from `k` | Partition minimizer length. Left out, tuna picks it from `k`: **13 below `k=31`, 17 at or above** (clamped to `k-2`). A build carries only that one m per k, so setting `-m` to anything else needs `-DTUNA_ALL_M=ON` or an explicit `-DFIXED_M`. Odd values only. Phase-2 hash routing is independent of this value. |
+| `-k` | `<int>` | `31` | k-mer length. Odd values in `[11, 63]` plus `127` in the default build. Any value in `[2, 256]`, even ones included, needs a build with both `-DFIXED_K=k` and `-DFIXED_M=m`; `-k` must then match it. See [k range](#k-range-and-compile-time-specialisation). |
 | `-t` | `<int>` | `1` | Number of threads. Compressed phase 1 pipelines decompression, parsing, and partitioning; phase 2 parallelizes over partitions. |
 | `-ci` | `<int>` | `1` | Minimum count to report |
 | `-cx` | `<int>` | `max` | Maximum count to report |
@@ -181,6 +181,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 
 | Flag | Argument | Default | Description |
 |------|----------|---------|-------------|
+| `-m` | `<int>` | from `k` | Partition minimizer length, normally left alone: tuna derives it from `k` (**13 below `k=31`, 17 at or above**, clamped to `k-2`), within a few percent of the best value. A build carries only that one m per k, so another value needs `-DTUNA_ALL_M=ON` or `-DFIXED_M` — see [Choosing m](#choosing-m). Odd values only. |
 | `-n` | `<int>` | auto | Number of partitions. Auto-tuned to ~2 MB input/partition when omitted |
 | `-hp` | — | off | Hide progress messages (phase timings are always emitted to stderr) |
 | `-kt` | — | off | Keep temporary partition files after the run |
