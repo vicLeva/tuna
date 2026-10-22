@@ -90,6 +90,11 @@ export LC_ALL=C LANG=C
 # MAX_FILES  cap on how many files a dataset contributes, where the
 #            experiment iterates over files.
 : "${FORCE_M:=}"
+# The -m argument every script passes to tuna: nothing at all by default, so
+# tuna derives m from k, which is what a user gets and so what the paper
+# measures. FORCE_M fills it in, for a -DTUNA_ALL_M build.
+MFLAG=()
+[[ -n "$FORCE_M" ]] && MFLAG=(-m "$FORCE_M")
 : "${ONLY_TOOLS:=}"
 : "${ONLY_DATASETS:=}"
 : "${MAX_FILES:=0}"
@@ -349,11 +354,6 @@ fastk_fof() {
 run_tuna() {
     tool_enabled tuna || return 0
     local ds="$1" key="$2" label="$3" input="$4" mode out tag tf se rc st pdisk=""
-    # No -m by default: tuna derives it from k, which is what a user gets and
-    # so what the paper should measure. FORCE_M overrides, for a build that
-    # carries more than one m per k.
-    local mflag=()
-    [[ -n "$FORCE_M" ]] && mflag=(-m "$FORCE_M")
     local tb; tb=$(tuna_for_k "$K")
     if [[ -z "$tb" || ! -x "$tb" ]]; then
         echo "    [error] no tuna binary for k=$K (set TUNA_K$K or TUNA)"
@@ -367,7 +367,7 @@ run_tuna() {
         rm -rf "$WORK/t"; mkdir -p "$WORK/t"
         peak_disk_start "$WORK/t"
         /usr/bin/time -v -o "$tf" timeout "$TIMEOUT_S" \
-            "$tb" -k "$K" "${mflag[@]}" -t "$THREADS" -ram "$RAM_GB" -hp \
+            "$tb" -k "$K" "${MFLAG[@]}" -t "$THREADS" -ram "$RAM_GB" -hp \
             -w "$WORK/t/" "$input" "$out" >/dev/null 2>"$se"
         rc=$?; st=$(status_of "$rc"); pdisk=$(peak_disk_stop)
         if [[ -n "$KEEP_OUTPUT" && $mode == bin && $st == ok ]]; then

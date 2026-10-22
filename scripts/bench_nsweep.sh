@@ -47,7 +47,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/bench_common.sh"
 
 # name : fof : tuna m
-: "${DATASETS:=gallus:$DATA_ROOT/dataset_reads_gallus/fof.list:21 human3:$DATA_ROOT/dataset_reads_human3/fof.list:21}"
+: "${DATASETS:=gallus:$DATA_ROOT/dataset_reads_gallus/fof.list human3:$DATA_ROOT/dataset_reads_human3/fof.list}"
 : "${NS:=auto 32 64 128 256 512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288 1048576 2097152}"
 : "${DBG_NS:=$NS}"          # every n by default; narrow it to sample fewer points
 
@@ -67,7 +67,7 @@ err=0
 [[ -f "$PCSV" ]] || echo "dataset,n,n_parts,parts_nonempty,uniq_mean,uniq_median,uniq_min,uniq_max,inserted_mean,init_sz_mean,init_cap_mean,cap_mean,load_mean,parts_grown,n_resizes_total,parts_resized" > "$PCSV"
 
 echo "[bench] experiment : nsweep"
-echo "[bench] k=$K m=$M threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s"
+echo "[bench] k=$K m=${FORCE_M:-auto} threads=$THREADS ram=${RAM_GB}GB timeout=${TIMEOUT_S}s"
 echo "[bench] tuna       : $TUNA ($(stat -c %y "$TUNA" 2>/dev/null | cut -d. -f1))"
 echo "[bench] timings    : $CSV"
 echo "[bench] table stats: $PCSV"
@@ -76,15 +76,15 @@ have_run()  { awk -F, -v d="$1" -v n="$2" 'NR>1 && $1==d && $2==n {f=1} END{exit
 have_stat() { awk -F, -v d="$1" -v n="$2" 'NR>1 && $1==d && $2==n {f=1} END{exit !f}' "$PCSV"; }
 in_dbg_ns() { case " $DBG_NS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-# args: <dataset> <fof> <m> <n> <dbg flag: "" or "-dbg"> <out dir: "" or path>
+# args: <dataset> <fof> <n> <dbg flag: "" or "-dbg"> <out dir: "" or path>
 # Fills globals: WALL P1 P2 NP UNIQ TOT ST
 run_once() {
-    local ds="$1" fof="$2" mm="$3" n="$4" dbg="$5" out="$6" nopt=""
+    local ds="$1" fof="$2" n="$3" dbg="$4" out="$5" nopt=""
     [[ "$n" != auto ]] && nopt="-n $n"
     local tag="${ds}_n${n}${dbg:+_dbg}"; local tf="$AUX/$tag.time" se="$AUX/$tag.stderr"
     rm -rf "$WORK/t"; mkdir -p "$WORK/t"
     /usr/bin/time -v -o "$tf" timeout "$TIMEOUT_S" \
-        "$TUNA" -k "$K" -m "$mm" -t "$THREADS" -ram "$RAM_GB" $nopt -hp $dbg \
+        "$TUNA" -k "$K" "${MFLAG[@]}" -t "$THREADS" -ram "$RAM_GB" $nopt -hp $dbg \
         -w "$WORK/t/" "@$fof" "$WORK/out.kff" >/dev/null 2>"$se"
     local rc=$?; ST=$(status_of "$rc")
     if [[ -n "$out" ]]; then
@@ -100,18 +100,17 @@ run_once() {
 }
 
 for spec in $DATASETS; do
-    IFS=: read -r ds fof mm <<< "$spec"
+    IFS=: read -r ds fof <<< "$spec"
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; continue; }
-    mm="${FORCE_M:-$mm}"
     echo ""
-    echo "== $ds  (m=$mm) =="
+    echo "== $ds  (m=${FORCE_M:-auto}) =="
 
     for n in $NS; do
         # ---- pass 1: timing ----
         if have_run "$ds" "$n"; then
             echo "    [time]  n=$n already measured"
         else
-            run_once "$ds" "$fof" "$mm" "$n" "" ""
+            run_once "$ds" "$fof" "$n" "" ""
             if [[ $ST != ok ]]; then
                 echo "$ds,$n,,,,,,,,$ST" >> "$CSV"
                 echo "    [time]  [$ST] n=$n"
@@ -129,7 +128,7 @@ for spec in $DATASETS; do
             continue
         fi
         out="$DBG/${ds}_n${n}"
-        run_once "$ds" "$fof" "$mm" "$n" "-dbg" "$out"
+        run_once "$ds" "$fof" "$n" "-dbg" "$out"
         if [[ $ST != ok || ! -s "$out/debug_table_stats.csv" ]]; then
             echo "$ds,$n,,,,,,,,,,,,,," >> "$PCSV"
             echo "    [stats] [$ST] n=$n"

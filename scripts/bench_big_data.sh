@@ -34,7 +34,7 @@ for spec in "${DATASETS[@]}"; do
     [[ -f "$fof" ]] || { echo "  [skip] $ds: no fof at $fof"; continue; }
     n=$(wc -l < "$fof")
     echo ""
-    echo "== $ds  (k=$K, m=${FORCE_M:-$M}, ram=${RAM_GB}GB, $fmt, $n files) =="
+    echo "== $ds  (k=$K, m=${FORCE_M:-auto}, ram=${RAM_GB}GB, $fmt, $n files) =="
     fkf="$AUX/fastkfof_${ds}.list"; fastk_fof "$fof" "$n" "$fkf"
     run_tuna  "$ds" "$n" "" "@$fof"
     run_kmc   "$ds" "$n" "" "@$fof" "$fmt"
