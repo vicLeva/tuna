@@ -5,7 +5,7 @@ It partitions minimizer superkmers, then counts them with a partition-local
 canonical rolling-hash table, keeping memory usage low and throughput high.
 
 It uses [unordered_dense](https://github.com/martinus/unordered_dense) as its streaming k-mer hash table.
-Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (FASTX parser), and minimizer computing uses a two-stack sliding-window minimum adapted from [simd-minimizers](https://github.com/rust-seq/simd-minimizers), with a regular random minimizer scheme.
+Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helicase) (FASTX parser), and minimizers are computed with a two-stack sliding-window minimum over canonical m-mers, under a regular random minimizer scheme.
 
 ---
 
@@ -294,34 +294,39 @@ For a full walkthrough: CMake setup, FetchContent, container customisation, thre
 
 ## Benchmarks
 
-All numbers below were measured at `k=31`, `m=21` (the default at the time; the
-default is now `m=17`), 8 threads, with a 256 GB memory budget, on a GenOuest
-node (4x8 Xeon E5-2660 at 2.20 GHz, 1.5 TB RAM, CentOS 7), against
+All numbers below were measured at `k=31`, 8 threads, with a 256 GB memory
+budget, on a GenOuest node (two 32-core Xeon Gold 6338N at 2.20 GHz, 48 MB of
+L3 per socket, 1 TB of RAM, Debian 12), against
 [KMC 3.2.4](https://github.com/refresh-bio/KMC) and
 [FastK](https://github.com/thegenemyers/FASTK). Every tool was asked to report
 all k-mers from a count of one upwards, so the three produce the same set of
-counts.
+counts, and every run writes the tool's own binary format. tuna chose `m`
+itself, which is 17 at `k=31`.
 
 ### Datasets
 
 | dataset | organism | type | files | where to get it |
 |---|---|---|---|---|
-| Ecoli | *E. coli* | assemblies (plain FASTA) | 3682 | [Zenodo 6577997](https://zenodo.org/records/6577997) |
-| Salmonella | *S. enterica* | assemblies (gz) | 10000 | [ENA2018-bacteria-661k](http://ftp.ebi.ac.uk/pub/databases/ENA2018-bacteria-661k/) |
+| Ecoli | *E. coli* | assemblies (plain FASTA) | 3500 | [Zenodo 6577997](https://zenodo.org/records/6577997) |
+| Salmonella | *S. enterica* | assemblies (gz) | 25000 | [ENA2018-bacteria-661k](http://ftp.ebi.ac.uk/pub/databases/ENA2018-bacteria-661k/) |
 | Gut | gut MAGs | assemblies (gz) | 10000 | [HumGut](https://arken.nmbu.no/~larssn/humgut/) |
 | Human | *H. sapiens* | assemblies (gz) | 60 | [HPP Year 1 Assemblies](https://github.com/human-pangenomics/HPP_Year1_Assemblies) |
-| Tara | Tara Oceans (sea water) | reads (gz) | 10 | 6 ENA runs from [PRJEB4352](https://www.ebi.ac.uk/ena/browser/view/PRJEB4352), listed below |
+| Tara | Tara Oceans (sea water) | reads (gz) | 12 | 6 ENA runs from [PRJEB4352](https://www.ebi.ac.uk/ena/browser/view/PRJEB4352), listed below |
 | Gallus | *G. gallus* | reads (gz) | 12 | ENA `SRR105788`, `SRR105789`, `SRR105792`, `SRR105794`, `SRR197985`, `SRR197986` (paired) |
 | Human3 | *H. sapiens* | reads (gz) | 36 | ENA `ERR174324`-`ERR174341` (paired) |
 | HumanR | *H. sapiens* | reads (gz) | 1 | ENA `SRR622461`, forward reads only |
 
-The per-file experiments use the first 100 files of Ecoli, Salmonella and Gut,
-and the first 10 of Human and Tara. Gallus and Human3 are counted whole, in a
-single run over the entire collection. HumanR drives the coverage sweep.
+The *files* column is how many files each experiment counts, which for Ecoli,
+Salmonella and Gut is a subset of a much larger public collection. The per-file
+experiment uses the first 100 files of Ecoli, Salmonella and Gut and the first
+10 of Human and Tara, and reports a median over them. The per-collection
+experiment counts every file of the column in a single run. Gallus and Human3
+are only ever counted whole. HumanR drives the coverage sweep.
 
 The Tara files are surface-water samples, size fraction QQSS, from stations 7,
 23, 30 and 11 of the Tara Oceans expedition. They come from six sequencing runs
-of four samples, of which the benchmark uses ten files:
+of four samples. The ten files named below are the ones the per-file
+experiment uses, the collection run taking twelve from the same six runs:
 
 | ENA run | sample | station | files used |
 |---|---|---|---|
@@ -356,29 +361,46 @@ skipped, so an interrupted run continues where it stopped.
 
 ### Results
 
-Median wall time per file, each file counted in its own run. *binary* is each
-tool writing its own compact format (KFF for tuna, native databases for the
-others), *ASCII* is the whole cost of obtaining a plain-text table, including
-the separate conversion pass KMC and FastK each require.
+Median wall time per file, each file counted in its own run, each tool writing
+its own compact format (KFF for tuna, native databases for the others).
 
-| dataset | tuna (bin) | KMC3 (bin) | FastK (bin) | tuna (ASCII) | KMC3 (ASCII) | FastK (ASCII) |
-|---|---|---|---|---|---|---|
-| Ecoli | **0.29 s** | 0.57 s | 0.44 s | **0.41 s** | 1.22 s | 1.11 s |
-| Salmonella | **0.23 s** | 0.59 s | 0.42 s | **0.34 s** | 1.22 s | 1.08 s |
-| Gut | **0.14 s** | 0.44 s | 0.26 s | **0.20 s** | 0.74 s | 0.56 s |
-| Human | **31.2 s** | 39.3 s | 105.6 s | **77.9 s** | 229.8 s | failed |
-| Tara | **35.1 s** | 40.6 s | 128.6 s | **76.7 s** | 192.8 s | 289.0 s |
+| dataset | tuna | KMC3 | FastK |
+|---|---|---|---|
+| Ecoli | **0.22 s** | 0.58 s | 0.37 s |
+| Salmonella | **0.21 s** | 0.59 s | 0.41 s |
+| Gut | **0.12 s** | 0.44 s | 0.23 s |
+| Human | **27.5 s** | 33.8 s | 104.5 s |
+| Tara | **33.4 s** | 37.6 s | 127.3 s |
 
-FastK's `Tabex` conversion step segfaults on every Human file, so it has no
-ASCII result there.
+The same collections counted in a single run over all of their files, which is
+what counting a collection rather than its samples costs:
 
-Whole collections counted in a single run, binary output:
+| dataset | files | tuna | KMC3 | FastK |
+|---|---|---|---|---|
+| Ecoli | 3500 | **29.6 s** | 127.4 s | 62.9 s |
+| Salmonella | 25000 | **5.3 min** | 15.9 min | failed |
+| Gut | 10000 | **1.8 min** | 2.8 min | 4.8 min |
+| Human | 60 | **7.2 min** | 24.6 min | 11.2 min |
+| Tara | 12 | 8.0 min | **5.9 min** | timeout |
 
-| dataset | input | tuna | KMC3 | FastK | tuna RSS | KMC3 RSS | FastK RSS |
-|---|---|---|---|---|---|---|---|
-| Gallus | 22.3 GB | **2.7 min** | 3.5 min | timeout | **43 GB** | 238 GB | - |
-| Human3 | 572 GB | **60.0 min** | 66.4 min | 71.2 min | **3 GB** | 239 GB | 192 GB |
+KMC fills the budget it is given on every one of them, about 238 GB, where tuna
+peaks between 4.8 and 62 GB and writes nothing at all to disk on Ecoli, Gut and
+Tara, counting them from end to end in memory.
 
-Both FastK runs on Gallus exceeded the six-hour limit. On Human3 the input no
-longer fits the memory budget, so tuna switches to its disk pipeline and counts
-20.9 billion distinct k-mers in 3 GB of RAM, while still finishing first.
+Tara is the one collection where sorting wins. Its 12 read sets hold 22.5
+billion distinct k-mers at an abundance of 1.6, so the tables stay out of cache
+and there is next to nothing for deduplication to collapse, which is exactly
+the case where a sort-based counter is expected to come out ahead.
+
+The two largest collections, counted whole:
+
+| dataset | input | tuna | KMC3 | FastK | tuna RSS | KMC3 RSS | FastK RSS | tuna disk | KMC3 disk | FastK disk |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gallus | 24.0 GB | **2.5 min** | 3.5 min | timeout | **34.9 GB** | 238.5 GB | - | **0 GB** | 24.2 GB | - |
+| Human3 | 614 GB | **59.0 min** | 67.1 min | 71.2 min | **3.8 GB** | 238.9 GB | 192.1 GB | 707 GB | 523 GB | 510 GB |
+
+Both FastK runs on Gallus exceeded the six-hour limit. Gallus fits the memory
+budget, so tuna counts it without touching the disk at all. Human3 does not:
+tuna switches to its disk pipeline and counts 20.9 billion distinct k-mers in
+3.8 GB of RAM, trading that for the temporary data in the last columns, which
+all three tools write by the hundreds of gigabytes.
