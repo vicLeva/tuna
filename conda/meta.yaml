@@ -10,6 +10,9 @@ source:
   - url: https://github.com/Kmer-File-Format/kff-cpp-api/archive/refs/heads/main.tar.gz
     sha256: a28867c3503c37b0dce5498fb3d3148b88e30196ea2404ff60627619ab8d6a9e
     folder: kff_src
+  - url: https://github.com/martinus/unordered_dense/archive/refs/tags/v4.10.0.tar.gz
+    sha256: 3a3ab0abd80cbfd6b8f86becf9f82fc0961230abcea2d34a8b1035c59d5dd24d
+    folder: unordered_dense_src
 
 build:
   number: 0
