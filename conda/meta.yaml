@@ -6,7 +6,7 @@ package:
 
 source:
   - url: https://github.com/vicLeva/tuna/archive/refs/tags/v{{ version }}.tar.gz
-    sha256: bae0f299a00dec3da89388d048de2358bb7f919cce6776346c091c06b7e6d913
+    sha256: 736ca0da6119d9e163d8c6f3ab1cc7ff6a50fd4f65f45170f147f812a6de538d
   - url: https://github.com/Kmer-File-Format/kff-cpp-api/archive/refs/heads/main.tar.gz
     sha256: a28867c3503c37b0dce5498fb3d3148b88e30196ea2404ff60627619ab8d6a9e
     folder: kff_src
