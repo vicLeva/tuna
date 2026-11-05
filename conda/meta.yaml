@@ -1,4 +1,4 @@
-{% set version = "1.5.0" %}
+{% set version = "1.5.1" %}
 
 package:
   name: tuna-kmer
@@ -13,6 +13,9 @@ source:
   - url: https://github.com/martinus/unordered_dense/archive/refs/tags/v4.10.0.tar.gz
     sha256: 3a3ab0abd80cbfd6b8f86becf9f82fc0961230abcea2d34a8b1035c59d5dd24d
     folder: unordered_dense_src
+  - url: https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.2.2.tar.gz
+    sha256: fcb41dd59a3f17002aeb1bb21f04696c9b721404890bb945c5ab39d2cb69654c
+    folder: zlib_ng_src
 
 build:
   number: 0
@@ -25,8 +28,6 @@ requirements:
     - {{ stdlib('c') }}
     - cmake >=3.17
     - make
-  host:
-    - zlib  # conda-forge zlib is backed by zlib-ng in compat mode — same performance
   run:
     - libgcc-ng   # [linux]
     - libstdcxx-ng  # [linux]

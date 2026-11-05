@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.17)
-project(tuna VERSION 1.5.0 LANGUAGES CXX C)
+project(tuna VERSION 1.5.1 LANGUAGES CXX C)
 
 # Default to Release if no build type is specified.
 # Only set when tuna is the top-level project — do not override the parent's choice.
@@ -96,6 +96,12 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         OUTPUT_VARIABLE L1_CACHE_LINE_SIZE
     )
 endif()
+# getconf and sysctl are absent in some build containers, and an empty value
+# here expands to -DL1_CACHE_LINE_SIZE= and fails the compile. 64 is right on
+# every x86-64 and on Intel Macs.
+if(NOT L1_CACHE_LINE_SIZE)
+    set(L1_CACHE_LINE_SIZE 64)
+endif()
 # ── Compile flags ──────────────────────────────────────────────────────────────
 #
 # TUNA_SIMD_FLAGS   — instruction-set flags required to compile tuna's SIMD
@@ -118,8 +124,20 @@ else()
 endif()
 set(TUNA_PRIVATE_FLAGS -Wall -Wextra -Wno-unused-function ${CONSTEXPR_FLAG})
 
+# -march=native tunes for the machine doing the build. That is what you want
+# when you build and run on the same machine, and wrong for a binary that will
+# be shipped elsewhere: gcc emits every instruction the builder supports, and
+# the result dies with SIGILL on any narrower CPU. Turn this off when
+# packaging, and the floor becomes TUNA_SIMD_FLAGS, which is what tuna's
+# headers actually require.
+# Usage: cmake .. -DTUNA_MARCH_NATIVE=OFF
+option(TUNA_MARCH_NATIVE "Tune for the build machine's CPU (off for redistributable builds)" ON)
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    list(APPEND TUNA_PRIVATE_FLAGS -funroll-loops -march=native -fomit-frame-pointer)
+    list(APPEND TUNA_PRIVATE_FLAGS -funroll-loops -fomit-frame-pointer)
+    if(TUNA_MARCH_NATIVE)
+        list(APPEND TUNA_PRIVATE_FLAGS -march=native)
+    endif()
 endif()
 
 # ── Targets ────────────────────────────────────────────────────────────────────
