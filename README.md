@@ -32,9 +32,9 @@ Phase 1 parsing uses a C++ port of [helicase](https://github.com/imartayan/helic
 
 tuna runs a two-phase pipeline:
 
-1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. tuna estimates the superkmer size up front and keeps phase 1 in memory when it fits the RAM budget; if the budget is reached while running, the partitions held in memory are spilled to disk and counting continues from there, so a run never exceeds its budget. Running with `-dbg` reports when a spill happens. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
+1. **Partition (Phase 1)** — overlaps gzip decompression, FASTX parsing, and minimizer iteration. Whenever the minimizer changes, the current packed superkmer is flushed to a binary partition in memory or on disk. When k-mers are counted canonically, each superkmer is stored in its canonical orientation (the smaller of its packed bases and their reverse complement), so the same locus read on either strand produces the same record and the two collapse in phase 2; `-nsc` turns that off. tuna estimates the superkmer size up front and keeps phase 1 in memory when it fits the RAM budget; if the budget is reached while running, the partitions held in memory are spilled to disk and counting continues from there, so a run never exceeds its budget. Running with `-dbg` reports when a spill happens. The number of partitions is auto-tuned from input size or set explicitly with `-n`.
 
-2. **Count (Phase 2)** — replays each partition and inserts its k-mers into a hash table, incrementing the count of each. Identical superkmers are collapsed first, so a repeated one is counted once and its multiplicity added in a single step. Each worker holds one partition table at a time.
+2. **Count (Phase 2)** — replays each partition and inserts its k-mers into a hash table, incrementing the count of each. Identical superkmers are collapsed first, so a repeated one is counted once and its multiplicity added in a single step; canonical storage in phase 1 means a superkmer and its reverse complement collapse together, which is where most of the redundancy in a read set lies. Each worker holds one partition table at a time.
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
 
@@ -188,6 +188,7 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-co` | — | off | Count only: skip k-mer serialization while still reporting total and distinct k-mer counts |
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
+| `-nsc` | — | off | Store superkmers in the orientation they were read rather than canonically, disabling cross-strand superkmer deduplication. Counts are unaffected either way; this only changes how much work phase 2 can skip. No effect with `-b`, where the strands are counted apart and the two orientations must stay distinct |
 
 </details>
 

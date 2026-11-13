@@ -56,6 +56,8 @@ void print_usage(const char* prog)
         "\n"
         "  -b          disable canonical k-mers: count each strand independently\n"
         "              (default: forward and reverse-complement are merged into one count)\n"
+        "  -nsc        do not store superkmers canonically (disables cross-strand\n"
+        "              superkmer deduplication; no effect with -b)\n"
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -co         count only: skip output writing after counting (for benchmarking)\n"
@@ -157,6 +159,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.work_dir = v;
         } else if (arg == "-b") {
             cfg.canonical = false;
+        } else if (arg == "-nsc") {
+            cfg.canon_superkmers = false;
         } else if (arg == "-dbg") {
             cfg.debug_stats = true;
         } else if (arg == "-kff") {

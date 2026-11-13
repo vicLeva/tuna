@@ -58,6 +58,11 @@ struct Config {
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
     bool         canonical     = true;  // count canonical k-mers (lex-min of k-mer and RC); set false with -b
+    // Store every superkmer in its canonical orientation (lex-min of the packed
+    // record and its reverse complement) so a superkmer and its twin on the
+    // other strand become byte-identical and collapse in the phase-2 dedup map.
+    // Only meaningful when canonical is true; -nsc turns it off for A/B runs.
+    bool         canon_superkmers = true;
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
     SuperkmerDedupMode dedup_mode = SuperkmerDedupMode::Auto;
 };

@@ -17,6 +17,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -44,6 +45,40 @@ using sk_hdr_t = std::conditional_t<(2u * k - m <= 255u), uint8_t, uint16_t>;
 // Compatibility sentinel: rolling-hash routing needs no minimizer coordinate.
 template <uint16_t k, uint16_t m>
 static constexpr sk_hdr_t<k, m> sk_no_min = std::numeric_limits<sk_hdr_t<k, m>>::max();
+
+
+// Reverses the order of the 32 two-bit groups packed in a 64-bit word.
+// Swap 2-bit pairs inside each nibble, nibbles inside each byte, then the bytes.
+inline uint64_t sk_reverse_bases64(uint64_t x) noexcept
+{
+    x = ((x & 0x3333333333333333ULL) << 2) | ((x >> 2) & 0x3333333333333333ULL);
+    x = ((x & 0x0F0F0F0F0F0F0F0FULL) << 4) | ((x >> 4) & 0x0F0F0F0F0F0F0F0FULL);
+    return __builtin_bswap64(x);
+}
+
+
+// Canonical orientation of up to 64 bases held in two stored-order words:
+// replaces (w0, w1) with the lexicographically smaller of the packed bases and
+// their reverse complement, and clears everything past base len-1.
+//
+// Bases are complemented with ~ (3 - x == x ^ 3) and reordered by reversing all
+// 64 two-bit groups of the pair; the bases past the record reverse into the high
+// bits, which the shift then discards.
+inline void sk_canonicalize_words(uint64_t& w0, uint64_t& w1, unsigned len) noexcept
+{
+    using u128 = unsigned __int128;
+    const unsigned bits = 2u * len;                      // len <= 64, so bits <= 128
+    const u128 keep = (bits >= 128u) ? ~u128(0) : (~u128(0) << (128u - bits));
+    const uint64_t b0 = __builtin_bswap64(w0);           // base 0 in the top bits
+    const uint64_t b1 = __builtin_bswap64(w1);
+    const u128 f = ((static_cast<u128>(b0) << 64) | b1) & keep;
+    u128 r = (static_cast<u128>(~sk_reverse_bases64(b1)) << 64)
+           |  static_cast<u128>(~sk_reverse_bases64(b0));
+    r <<= (128u - bits);
+    const u128 best = (r < f) ? r : f;
+    w0 = __builtin_bswap64(static_cast<uint64_t>(best >> 64));
+    w1 = __builtin_bswap64(static_cast<uint64_t>(best));
+}
 
 
 // ─── Writer ───────────────────────────────────────────────────────────────────
@@ -189,6 +224,7 @@ struct SuperkmerWriter
     // LOW/HIGH_MASKS[0] are set so a byte-aligned slice (shift == 0) takes the
     // same arithmetic, with the high term masked away rather than branched
     // around.
+    template <bool canon = false>
     void append_packed(const uint8_t* packed, size_t base_offset, hdr_t len, hdr_t min_pos)
     {
         (void)min_pos;
@@ -224,8 +260,18 @@ struct SuperkmerWriter
 
         const uint64_t lm = LOW_MASKS[q], hm = HIGH_MASKS[q];
         if (__builtin_expect(packed_bytes <= OVERWRITE_SLACK, 1)) {
-            const uint64_t o0 = ((a0 & lm) << shift) | ((b0 & hm) >> (8u - shift));
-            const uint64_t o1 = ((a1 & lm) << shift) | ((b1 & hm) >> (8u - shift));
+            uint64_t o0 = ((a0 & lm) << shift) | ((b0 & hm) >> (8u - shift));
+            uint64_t o1 = ((a1 & lm) << shift) | ((b1 & hm) >> (8u - shift));
+            if constexpr (canon) {
+                // packed_bytes <= 16 means len <= 64, so the record is entirely
+                // in these two words: canonicalise here rather than reading the
+                // record back after the store, which the tail mask below would
+                // turn into a store-forwarding stall.
+                sk_canonicalize_words(o0, o1, static_cast<unsigned>(len));
+                std::memcpy(out,     &o0, sizeof(o0));
+                std::memcpy(out + 8, &o1, sizeof(o1));
+                return;                      // the keep mask already cleared the tail
+            }
             std::memcpy(out,     &o0, sizeof(o0));
             std::memcpy(out + 8, &o1, sizeof(o1));
         } else {
@@ -244,6 +290,103 @@ struct SuperkmerWriter
 
         out[packed_bytes - 1] &= TAIL_MASKS[len & 3u];
 
+        // Over 64 bases: too long for the two-word path, canonicalise in place.
+        if constexpr (canon) canonicalize_last_long(len, packed_bytes, out);
+    }
+
+    // Out-of-line path for records over 64 bases: unreachable at small k, but
+    // the common case once 2k-m passes 64, so it is not marked cold. Byte at a
+    // time, and compared before materialising. See canonicalize_last.
+    [[gnu::noinline]]
+    void canonicalize_last_long(hdr_t len, size_t nb, uint8_t* fwd) noexcept
+    {
+        // Reverses the four 2-bit groups within a byte: g0g1g2g3 -> g3g2g1g0.
+        static constexpr auto REV2 = [] {
+            std::array<uint8_t, 256> t{};
+            for (size_t b = 0; b < 256; ++b)
+                t[b] = static_cast<uint8_t>(((b & 0x03u) << 6) | ((b & 0x0cu) << 2) |
+                                            ((b & 0x30u) >> 2) | ((b & 0xc0u) >> 6));
+            return t;
+        }();
+        // Clears the unused low bases of the final byte: index is len % 4.
+        static constexpr uint8_t TAIL_MASKS[4] = {0xff, 0xc0, 0xf0, 0xfc};
+        // A record can reach hdr_t's maximum length, not just 2k-m.
+        static constexpr size_t SCRATCH_BYTES =
+            (static_cast<size_t>(std::numeric_limits<hdr_t>::max()) + 3u) / 4u;
+        const unsigned tail = TAIL_MASKS[static_cast<unsigned>(len) & 3u];
+
+        // Padding bases sit in the low bits of the final byte; reversing moves
+        // them to the front, so the reversed bytes shift left to drop them.
+        const unsigned sh = 2u * ((4u - (static_cast<unsigned>(len) & 3u)) & 3u);
+
+        // Byte i of the reverse complement, from the two bytes it draws on.
+        auto rc_byte = [&](size_t i) -> uint8_t {
+            const unsigned hi = REV2[fwd[nb - 1 - i]] ^ 0xffu;
+            if (!sh) return static_cast<uint8_t>(hi);
+            const unsigned lo = (i + 1 < nb)
+                ? static_cast<unsigned>(REV2[fwd[nb - 2 - i]] ^ 0xffu) : 0u;
+            return static_cast<uint8_t>((hi << sh) | (lo >> (8u - sh)));
+        };
+
+        size_t i = 0;
+        for (; i < nb; ++i) {
+            unsigned r = rc_byte(i);
+            if (i + 1 == nb) r &= tail;
+            if (r != fwd[i]) {
+                if (r > fwd[i]) return;      // stored orientation is the smaller one
+                break;
+            }
+        }
+        if (i == nb) return;                 // the two orientations are identical
+
+        uint8_t rc[SCRATCH_BYTES];
+        for (size_t j = 0; j < nb; ++j) rc[j] = rc_byte(j);
+        rc[nb - 1] &= tail;
+        std::memcpy(fwd, rc, nb);
+    }
+
+    // ── Canonical storage ─────────────────────────────────────────────────
+    //
+    // Replace the record just appended with the lexicographically smaller of its
+    // packed bases and their reverse complement. A superkmer and its twin on the
+    // other strand then become byte-identical, so the phase-2 deduplication map
+    // collapses them into one replay instead of two. On read sets, where both
+    // strands of the same locus are sequenced, that is where the duplicates are.
+    //
+    // Why this is sound, and only in canonical counting mode:
+    //   - routing is by canonical minimizer (minimizer_window.hpp), which is the
+    //     same for a superkmer and its reverse complement, so twins already share
+    //     a partition and no record changes file;
+    //   - the record stores no minimizer coordinate, only length plus bases, and
+    //     reverse complement preserves length, so no stored offset is invalidated;
+    //   - phase 2 walks the bases forward and canonicalises every k-mer as it is
+    //     inserted, and canon(rc(x)) == canon(x), so the multiset of counted
+    //     k-mers is unchanged.
+    // Under -b the two strands are counted apart and collapsing them would merge
+    // counts that must stay separate, so the caller must not call this.
+    //
+    // Must be called immediately after an append, before any further append or
+    // flush: it rewrites the bytes at the tail of the buffer.
+    [[gnu::always_inline]]
+    inline void canonicalize_last(hdr_t len) noexcept
+    {
+        const size_t nb  = (static_cast<size_t>(len) + 3u) / 4u;
+        uint8_t* const fwd = reinterpret_cast<uint8_t*>(raw_ + sz_) - nb;
+
+        // Fast path: up to 64 bases fit in two 64-bit words, and the buffer
+        // always has OVERWRITE_SLACK readable and writable bytes past the
+        // record, so both words can be loaded and stored whole.
+        if (__builtin_expect(len <= 64u, 1)) {
+            uint64_t w0, w1;
+            std::memcpy(&w0, fwd,     sizeof(w0));
+            std::memcpy(&w1, fwd + 8, sizeof(w1));
+            sk_canonicalize_words(w0, w1, static_cast<unsigned>(len));
+            std::memcpy(fwd,     &w0, sizeof(w0));
+            std::memcpy(fwd + 8, &w1, sizeof(w1));
+            return;
+        }
+
+        canonicalize_last_long(len, nb, fwd);
     }
 
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }

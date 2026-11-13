@@ -216,9 +216,9 @@ public:
 //
 // FlushFn: void(std::vector<SuperkmerWriter<k,m>>&, size_t partition_id)
 // Called after each append; O(1) per superkmer.
-template <uint16_t k, uint16_t m, uint16_t partition_m,
+template <uint16_t k, uint16_t m, uint16_t partition_m, bool canon_sk,
           typename PartitionFn, typename FlushFn>
-void extract_superkmers_from_actg(
+void extract_superkmers_impl(
     const char* const                    seq,
     const size_t                         seq_len,
     PartitionFn&&                        partition_fn,
@@ -273,7 +273,8 @@ void extract_superkmers_from_actg(
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
             const auto min_pos = sk_no_min<k, m>;
-            writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
+            writers[pid].template append_packed<canon_sk>(
+                packed_buf.data(), sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             ++sk_count;
             prev_hash    = new_hash;
@@ -284,9 +285,38 @@ void extract_superkmers_from_actg(
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
     const auto min_pos = sk_no_min<k, m>;
-    writers[pid].append_packed(packed_buf.data(), sk_start, sk_len, min_pos);
+    writers[pid].template append_packed<canon_sk>(
+        packed_buf.data(), sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     ++sk_count;
+}
+
+
+// Thin dispatcher: picks the canonical or plain superkmer writer once per
+// sequence, so the inner loop carries no test and the plain path keeps exactly
+// the instruction sequence it had before canonical storage existed.
+template <uint16_t k, uint16_t m, uint16_t partition_m,
+          typename PartitionFn, typename FlushFn>
+inline void extract_superkmers_from_actg(
+    const char* const                    seq,
+    const size_t                         seq_len,
+    PartitionFn&&                        partition_fn,
+    MinimizerWindow<k, partition_m>&     min_it,
+    std::vector<SuperkmerWriter<k, m>>&  writers,
+    uint64_t&                            kmer_count,
+    uint64_t&                            sk_count,
+    FlushFn&&                            flush_fn,
+    std::vector<uint8_t>&                packed_buf,
+    const bool                           canon_sk)
+{
+    if (canon_sk)
+        extract_superkmers_impl<k, m, partition_m, true>(
+            seq, seq_len, std::forward<PartitionFn>(partition_fn), min_it, writers,
+            kmer_count, sk_count, std::forward<FlushFn>(flush_fn), packed_buf);
+    else
+        extract_superkmers_impl<k, m, partition_m, false>(
+            seq, seq_len, std::forward<PartitionFn>(partition_fn), min_it, writers,
+            kmer_count, sk_count, std::forward<FlushFn>(flush_fn), packed_buf);
 }
 
 
@@ -310,6 +340,9 @@ PartitionStats partition_kmers_gz_pc_impl(
     size_t                      n_threads,          // ≥ 2 (1 producer + rest consumers)
     size_t                      write_budget_per_thread)
 {
+    // Cross-strand superkmer deduplication: store each superkmer in its
+    // canonical orientation. Only valid when k-mers are counted canonically.
+    const bool canon_sk = cfg.canonical && cfg.canon_superkmers;
     using Batch = ActgBatch;
 
     constexpr size_t MAX_QUEUE   = 32;       // max batches in flight
@@ -389,7 +422,7 @@ PartitionStats partition_kmers_gz_pc_impl(
                     extract_superkmers_from_actg<k, m, partition_m>(
                         chunk, chunk_len, partition_fn,
                         state.min_it, state.writers, state.kmers, state.superkmers,
-                        flush_fn, state.packed_buf);
+                        flush_fn, state.packed_buf, canon_sk);
                     ++state.seqs;
                 }
                 {
@@ -594,7 +627,7 @@ PartitionStats partition_kmers_gz_pc_impl(
                     extract_superkmers_from_actg<k, m, partition_m>(
                         chunk, chunk_len, partition_fn,
                         min_it, writers, local_kmers, local_superkmers, flush_fn,
-                        packed_buf);
+                        packed_buf, canon_sk);
                     ++local_seqs;
                 }
                 {
@@ -683,6 +716,9 @@ PartitionStats partition_kmers_impl(
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
+    // Cross-strand superkmer deduplication: store each superkmer in its
+    // canonical orientation. Only valid when k-mers are counted canonically.
+    const bool canon_sk = cfg.canonical && cfg.canon_superkmers;
     const size_t n_files      = cfg.input_files.size();
     const size_t n_threads_req = static_cast<size_t>(cfg.num_threads);
 
@@ -728,7 +764,7 @@ PartitionStats partition_kmers_impl(
                     if (stop.load(std::memory_order_relaxed)) return;
                     extract_superkmers_from_actg<k, m, partition_m>(
                         chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers,
-                        flush_fn, packed_buf);
+                        flush_fn, packed_buf, canon_sk);
                     ++local_seqs;
                 });
             }
@@ -772,6 +808,9 @@ PartitionStats partition_kmers_mem_impl(
     PartitionFn               partition_fn,
     uint64_t                  spill_limit_bytes)
 {
+    // Cross-strand superkmer deduplication: store each superkmer in its
+    // canonical orientation. Only valid when k-mers are counted canonically.
+    const bool canon_sk = cfg.canonical && cfg.canon_superkmers;
     const size_t n_files      = cfg.input_files.size();
     const size_t n_threads_req = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts      = cfg.num_partitions;
@@ -930,7 +969,7 @@ PartitionStats partition_kmers_mem_impl(
                             extract_superkmers_from_actg<k, m, partition_m>(
                                 chunk, chunk_len, partition_fn,
                                 min_it, writers, local_kmers, local_superkmers, flush_fn,
-                                packed_buf);
+                                packed_buf, canon_sk);
                             ++local_seqs;
                         }
                         {
@@ -994,7 +1033,7 @@ PartitionStats partition_kmers_mem_impl(
                     if (stop.load(std::memory_order_relaxed)) return;
                     extract_superkmers_from_actg<k, m, partition_m>(
                         chunk, len, partition_fn, min_it, writers, local_kmers, local_superkmers,
-                        flush_fn, packed_buf);
+                        flush_fn, packed_buf, canon_sk);
                     ++local_seqs;
                 });
             }
