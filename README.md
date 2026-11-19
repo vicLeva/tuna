@@ -1,6 +1,9 @@
-# tuna
+[![CI](https://github.com/vicLeva/tuna/actions/workflows/ci.yml/badge.svg)](https://github.com/vicLeva/tuna/actions/workflows/ci.yml)
+[![install with bioconda](https://img.shields.io/conda/dn/bioconda/tuna-kmer.svg?style=flag&logo=anaconda&logoColor=lightgray&labelColor=rgb(40,47,56)&color=rgb(68,190,80)&label=Install%20with%20bioconda)](http://bioconda.github.io/recipes/tuna-kmer/README.html)
 
-**tuna** is a fast, streaming k-mer counter for FASTA/FASTQ input.
+# Tuna
+
+**Tuna** is a fast, streaming k-mer counter for FASTA/FASTQ input.
 It partitions minimizer superkmers, then counts them with a partition-local
 canonical rolling-hash table, keeping memory usage low and throughput high.
 
