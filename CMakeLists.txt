@@ -28,11 +28,16 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(kff_src)
-configure_file(
-    ${kff_src_SOURCE_DIR}/kff_io.hpp.in
-    ${CMAKE_BINARY_DIR}/kff_io.hpp
-    @ONLY
-)
+# kff_io.hpp was generated from a template until upstream 5992b05 (Nov 2026),
+# which ships it as a normal header carrying its own version macros. Configure
+# it only when the template is what is on disk, so both layouts build.
+if(EXISTS ${kff_src_SOURCE_DIR}/kff_io.hpp.in)
+    configure_file(
+        ${kff_src_SOURCE_DIR}/kff_io.hpp.in
+        ${CMAKE_BINARY_DIR}/kff_io.hpp
+        @ONLY
+    )
+endif()
 add_library(kff_io STATIC ${kff_src_SOURCE_DIR}/kff_io.cpp)
 target_compile_options(kff_io PRIVATE -w)
 target_include_directories(kff_io SYSTEM PUBLIC
